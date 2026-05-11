@@ -1,0 +1,13 @@
+# Python bytecode caches (from imported skill scripts under skills/*/scripts/)
+__pycache__/
+*.pyc
+*.pyo
+
+# Plan-mode working state — all of it (active + archive). Not part of the
+# plugin source. Archives are useful locally but accumulate over time and
+# don't belong in the published repo.
+.temp/
+
+# OS scratch
+.DS_Store
+Thumbs.db

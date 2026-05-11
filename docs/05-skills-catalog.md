@@ -1,0 +1,294 @@
+# 05 — Skills catalog
+
+v2 ships **nine core skills**. They split into one orchestrator
+(`conductor`), one infrastructure skill (`persistent-plans`), one
+dispatch skill (`codex-dispatch`), and six discipline skills that
+shape *how* work is done independent of *what* is being done.
+
+This document is the catalog. For each skill: one-line description,
+triggers (when the skill should fire), anti-triggers (when it should
+not), and the responsibilities the skill owns.
+
+The full skill prompts live in the implementation repo (see
+`08-plugin-layout.md`). This doc is the contract.
+
+---
+
+## 1. `conductor`
+
+**One-line**: The top-level orchestrator skill. Reminds the main
+Claude thread that it is in dispatch-only mode and routes work to
+sub-agents, Codex, or other skills.
+
+**Triggers**
+- Any non-trivial coding task arrives in the main thread.
+- The session starts and a plan is active (the `session-start` hook
+  surfaces this, and the conductor skill picks it up).
+- The user says "let's work on X", "implement Y", "refactor Z", or
+  similar.
+
+**Anti-triggers**
+- Pure conversational questions ("what does this code do?").
+- Trivial one-line edits where the conductor skill's overhead beats
+  the change.
+- Sessions that are explicitly about meta-work (writing docs in this
+  spec repo, for example).
+
+**Responsibilities**
+- Enforce the dispatch-only rule from `02-conductor.md`.
+- Choose the right skill for each phase: `brainstorming` for
+  ambiguous design, `writing-plans` for plan drafting, `refactoring`
+  for restructuring, etc.
+- Drive the four-phase loop from `04-execution-loop.md`.
+- Maintain the TaskList that mirrors `progress.json`.
+
+---
+
+## 2. `engineering-discipline`
+
+**One-line**: The behavioral baseline for any code change — read
+imports before editing, track blast radius, no type shortcuts, verify
+after every change.
+
+**Triggers**
+- Any task that writes, edits, refactors, ports, or migrates code.
+- Bug fixes, even one-line ones.
+- Dependency bumps and config changes.
+
+**Anti-triggers**
+- Pure questions, explanations, or code reading without edits.
+- Pure documentation tasks with no source-file changes.
+- Conversations that don't touch code.
+
+**Responsibilities**
+- Force the executor (Codex or sub-agent) to identify consumers
+  before editing shared types/utilities.
+- Forbid `any` / `as any` / silent type assertions.
+- Require post-change verification (type-check, lint, tests) and
+  surface any skipped checks explicitly.
+- Catch silent scope cuts ("I'll do X" → only does part of X).
+
+---
+
+## 3. `persistent-plans`
+
+**One-line**: The infrastructure skill that owns the plan files on
+disk and the resumption protocol.
+
+**Triggers**
+- About to start any non-trivial task (creates a plan).
+- Resuming after a compaction (reads the active plan).
+- The user says "continue", "where were we", or similar.
+
+**Anti-triggers**
+- Pure read-only questions.
+- Tasks the user has explicitly tagged "no plan" / "just do it".
+
+**Responsibilities**
+- Locate / create the plan directory at
+  `.temp/plan-mode/active/<planId>/`.
+- Read `plan.json` + `progress.json` at the top of every resumed
+  session.
+- Recreate the TaskList from `progress.json`.
+- Apply the resumption protocol from `04-execution-loop.md`.
+- Move completed plans to `archive/`.
+
+---
+
+## 4. `writing-plans`
+
+**One-line**: Draft `plan.json`, `progress.json`, and `masterPlan.md`
+from a completed discovery, then drive the Orbit review.
+
+**Triggers**
+- Discovery is complete and the user wants to commit to a plan.
+- The user says "write the plan", "let's plan this", "draft a
+  plan.json".
+- An existing plan has been invalidated and needs a re-draft.
+
+**Anti-triggers**
+- Discovery is incomplete (route to `brainstorming` or `Explore`).
+- The user says "just do it" / "no plan".
+- Mid-execution (use `persistent-plans` to update progress instead).
+
+**Responsibilities**
+- Enforce TDD-granularity steps (one component / one behavior).
+- Set `dependsOn` correctly to form a valid DAG.
+- Generate the `progress[]` checklist on each step.
+- Write a tight, human-readable `masterPlan.md`.
+- Drive Orbit review and flip `frozen` to true on approval.
+
+---
+
+## 5. `codex-dispatch`
+
+**One-line**: Invoke Codex through the direction-locked wrappers and
+parse the bounded Summary / Verdict / Findings contract block.
+
+**Triggers**
+- A plan step with `owner: codex-impl` is on the frontier.
+- A step's executor needs verification (`run-codex-verify.sh`).
+- The conductor needs an out-of-band Codex check (rare).
+
+**Anti-triggers**
+- The step's `owner` is `claude-impl` or `manual`.
+- Tasks that don't go through the plan system (free-form
+  conversation).
+
+**Responsibilities**
+- Choose `run-codex-impl.sh` vs `run-codex-verify.sh` based on the
+  step's owner — never mix.
+- Build the prompt from `step.description`, `step.acceptanceCriteria`,
+  and `step.files`.
+- Parse the contract block out of stdout. Reject and retry once if
+  the block is missing.
+- Write the parsed verdict, findings, and files-touched into
+  `progress.json`.
+- Never read raw Codex stream output or treat unparsed text as
+  authoritative.
+
+---
+
+## 6. `refactoring`
+
+**One-line**: Multi-file restructuring, renaming across files,
+extracting helpers, splitting modules.
+
+**Triggers**
+- Renames that span more than one file.
+- Moving / splitting modules.
+- Extracting shared logic from duplicates.
+- The user says "refactor X", "extract Y", "move Z into ...".
+
+**Anti-triggers**
+- Single-variable renames within one function.
+- Formatting-only changes.
+- Adding new features (use `writing-plans` instead).
+- Bug fixes (use `systematic-debugging`).
+
+**Responsibilities**
+- Discover all consumers before editing (delegated to `Explore`).
+- Plan the change in stages so the codebase compiles between
+  stages.
+- Run type-check / lint / tests after each stage, not just at the
+  end.
+- Flag any code paths that the refactor leaves stranded.
+
+---
+
+## 7. `test-driven-development`
+
+**One-line**: Enforce a red-green-refactor rhythm for new behavior.
+
+**Triggers**
+- Writing a new feature or function with testable behavior.
+- The user asks "let's TDD this" or invokes a step whose
+  `progress[]` starts with "Write failing tests".
+- New behavior in a project that already has test infrastructure.
+
+**Anti-triggers**
+- Fixing a bug in already-tested code (use `systematic-debugging`).
+- Writing characterization tests for legacy untested code.
+- Refactoring without behavior change.
+- Projects with no test infrastructure (suggest adding it first).
+
+**Responsibilities**
+- Block writing implementation before a failing test exists.
+- Verify the test fails for the right reason (red).
+- Verify the test passes after implementation (green).
+- Recommend a refactor pass after green.
+- Encode this rhythm into the step's `progress[]` items.
+
+---
+
+## 8. `systematic-debugging`
+
+**One-line**: Four-phase debugging — investigate, identify pattern,
+form hypotheses, fix — to prevent guess-and-check thrashing.
+
+**Triggers**
+- A reported bug, test failure, or unexpected behavior.
+- The user says "this doesn't work", "X is broken", "fix the bug
+  where ...".
+- A verifier returns FAIL with concrete findings.
+
+**Anti-triggers**
+- Learning a new API (use exploration).
+- Refactoring for clarity (use `refactoring`).
+- Performance optimization without a regression to investigate.
+- New-feature work (use `test-driven-development` /
+  `writing-plans`).
+
+**Responsibilities**
+- Phase 1 — Investigate: reproduce, narrow inputs, identify the
+  smallest failing case.
+- Phase 2 — Pattern: explain the symptom in terms of code paths.
+- Phase 3 — Hypotheses: list candidate root causes; pick the most
+  likely.
+- Phase 4 — Fix: change the code; verify the fix; verify no
+  regressions.
+
+---
+
+## 9. `brainstorming`
+
+**One-line**: Collaborative dialogue to turn a vague design question
+into a concrete proposal before any code is written.
+
+**Triggers**
+- Ambiguous user requests ("how should we approach X?", "what's the
+  best way to ...?").
+- Multiple plausible designs with non-obvious tradeoffs.
+- New features where the data model is unclear.
+- Pre-discovery, when the conductor isn't sure what to explore.
+
+**Anti-triggers**
+- Implementation planning of an already-decided design (use
+  `writing-plans`).
+- Debugging (use `systematic-debugging`).
+- Refactoring of code whose target shape is clear.
+- Pure codebase questions ("where is X defined?").
+
+**Responsibilities**
+- Ask one question at a time, multiple choice where possible.
+- Surface tradeoffs honestly; offer a recommendation but accept
+  redirection.
+- Converge on a single approach the user has bought into.
+- Hand off to `writing-plans` (or directly to execution for small
+  changes) with a one-paragraph design summary.
+
+---
+
+## Auxiliary skills
+
+In addition to the nine core skills above, v2 ships eight auxiliary
+skills covering the craft-specific work the orchestrator routes to.
+Each lives in `skills/<name>/SKILL.md` and follows the same harness
+frontmatter convention (`name`, `description`); each is listed in
+`plugin.json`.
+
+| Skill | One-line | Routing |
+|---|---|---|
+| `doc-coauthoring` | Collaborative authoring of RFCs, ADRs, runbooks, API docs, and other prose artifacts | Claude-only (Claude-only skill set in the routing matrix) |
+| `frontend-design` | Distinctive production-grade frontend interfaces — landing pages, dashboards, design-system work | Claude-only |
+| `svg-art` | Hand-coded SVG artwork — patterns, illustrations, decorative backgrounds, filter effects | Claude-only |
+| `immersive-frontend` | Award-winning WebGL / Three.js / scroll-driven 3D experiences | Claude-only |
+| `mcp-builder` | Building production-quality MCP servers that expose APIs/databases/services as LLM tools | Codex-default with Claude-side design |
+| `react-native-mobile` | Premium native-feeling React Native mobile apps; dual-installable (Claude for UI/UX, Codex for code-heavy) | Conditional — see RN-mobile Routing Directive in `docs/09-routing-matrix.md` |
+| `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Codex-default with Claude design for test plans |
+| `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Claude-only (meta) |
+
+### Codex-side skill bodies (`codex-skills/`)
+
+For the dual-install pattern (currently `react-native-mobile`), Codex
+also gets its own copy of the skill body at
+`codex-skills/<name>/SKILL.md`. The routing matrix at
+`docs/09-routing-matrix.md` decides which side gets which step:
+UI/UX/animation work goes to Claude; data-flow / native modules /
+code-heavy work goes to Codex. The two SKILL.md files keep the same
+wording about the split so both sides see the same rule.
+
+`codex-skills/` is loaded by `codex exec` separately from the Claude
+Code plugin manifest; it is not part of `plugin.json`'s `skills`
+array, but the manifest grants read on `codex-skills/**` so the
+wrappers and the user can inspect them.

@@ -1,0 +1,151 @@
+# AGENTS.md
+
+This file documents the agents at work in the **`orchestration` plugin
+(v2.0.0)** for Claude Code. It follows the public
+[AGENTS.md](https://agents.md) convention: a single file that names the
+actors and their responsibilities so any session — human or model — can
+pick up the system without re-deriving it.
+
+The plugin defines **three roles**. Each has a different read budget, a
+different write budget, and a different escalation path. Confusing them
+is the most common source of bugs in orchestrated systems, so they are
+spelled out here.
+
+---
+
+## 1. Conductor (the main Claude thread)
+
+The conductor is the Claude Code session the user is talking to. It is
+**dispatch-only**: it plans, it routes work to specialists, and it consumes
+bounded summaries. It does not read raw artifacts, does not run long file
+sweeps itself, and does not implement large changes inline.
+
+**May read**
+- `plan.json` (immutable plan definition)
+- `progress.json` (mutable step state, results, deviations)
+- `masterPlan.md` (human-facing proposal)
+- Sub-agent return messages (already bounded by the sub-agent's prompt)
+- Codex Summary / Verdict / Findings blocks (bounded by prompt contract)
+- Small targeted file reads (≤ 200 lines, when surgical context is needed)
+
+**Must not read**
+- Raw exploration dumps from sub-agents (the sub-agent summarizes)
+- Raw Codex `stdout` or stream files (use the parsed contract block)
+- Full `git diff` outputs (ask for a bounded summary instead)
+- Files larger than ~500 lines without a specific question in mind
+
+**Tools it owns**
+- `Agent` (dispatching sub-agents)
+- `Skill` (invoking discipline skills)
+- `TaskCreate` / `TaskList` family (tracking work)
+- `Read` / `Edit` / `Write` for small, surgical edits and the plan files
+- The Codex wrapper scripts (`run-codex-impl.sh`, `run-codex-verify.sh`)
+
+See `docs/02-conductor.md` for the full spec.
+
+---
+
+## 2. Sub-agents (Explore, general-purpose, Plan)
+
+Sub-agents are Claude instances spawned by the conductor via the `Agent`
+tool. They have a fresh context, a focused prompt, and they return **one
+message** to the conductor. That return message is the contract: it must
+be self-contained and bounded.
+
+**Explore** — Read-only search agent. Use for "where is X defined?",
+"which files import Y?", grep-style sweeps, and codebase questions that
+would otherwise blow the conductor's context. Returns: list of file paths,
+line numbers, brief code citations.
+
+**general-purpose** — Multi-step research and code-writing agent. Use when
+a task needs both investigation and changes, or when the conductor wants a
+sub-agent to implement a self-contained chunk. Returns: summary of what was
+done plus the paths touched.
+
+**Plan** — Architecture/design agent. Use to draft an implementation
+strategy for a non-trivial change before the conductor commits to a plan.
+Returns: a structured plan proposal (steps, file lists, tradeoffs).
+
+Sub-agents may freely read raw files, run long greps, and follow many
+threads — the bounding happens in their **return** message, not in their
+exploration.
+
+---
+
+## 3. Codex (impl and verify)
+
+Codex (`codex exec` CLI) is the third role: a separate model that runs
+under a strict direction lock. The conductor invokes Codex through one of
+two wrapper scripts, never directly:
+
+- `run-codex-impl.sh` — Codex implements a step. Reads the step
+  description and acceptance criteria; writes code; returns a Summary +
+  Verdict + Findings block.
+- `run-codex-verify.sh` — Codex verifies a step the conductor (or a
+  sub-agent) just implemented. Reads the diff and acceptance criteria;
+  returns Summary + Verdict (PASS / FINDINGS / FAIL) + Findings[].
+
+The wrappers exist so impl and verify can never be confused at the call
+site. Each script pins its system prompt, captures Codex's last message
+via `-o` (`--output-last-message`), and enforces the contract shape
+Codex must return.
+
+There are **no receipts, no HMAC sidecars, no digester sub-agent** in v2.
+The bound on Codex output is enforced by the prompt contract: the wrapper
+asks for a fixed shape, the conductor parses that shape, anything else is
+truncated or ignored. See `docs/06-codex-integration.md`.
+
+---
+
+## Escalation and handoff
+
+- Conductor → Sub-agent: when work would require reading too much, or
+  exploring too widely, to fit in the main thread budget.
+- Conductor → Codex: when a step is well-defined enough to implement or
+  verify against acceptance criteria.
+- Sub-agent → Conductor: every sub-agent terminates with one summary
+  message. No multi-turn dialogue.
+- Codex → Conductor: one bounded Summary/Verdict/Findings block per call.
+
+If any role exceeds its read budget, the orchestration is broken. The
+remedy is always the same: push the reading down into a sub-agent or Codex,
+and keep the conductor's window clean.
+
+---
+
+## Implementation surfaces
+
+The plugin's code lives at the repo root, alongside the design spec
+(`docs/`). Each role's behavior is enforced by the corresponding files:
+
+- **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
+  skills plus 8 auxiliary skills (`doc-coauthoring`, `frontend-design`,
+  `svg-art`, `immersive-frontend`, `mcp-builder`, `react-native-mobile`,
+  `webapp-testing`, `skill-review-standard`). The conductor invokes them
+  via the `Skill` tool; the harness loads them from the paths listed in
+  `plugin.json`.
+- **Codex-side skill bodies** — `codex-skills/<skill>/SKILL.md` for the
+  dual-install pattern. Currently only `react-native-mobile` ships a
+  Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
+  decides which side of a dual-install skill gets a given step.
+- **Codex wrappers** — `scripts/run-codex-impl.sh` (IMPLEMENT-direction)
+  and `scripts/run-codex-verify.sh` (VERIFY-direction). Both pin their
+  direction header in-script — the prompt body cannot override.
+- **Plan + contract utilities** — `scripts/plan-utils.sh` (read/write
+  plan files atomically) and `scripts/parse-contract.sh` (extract the
+  Codex contract block).
+- **Hooks** — `hooks/session-start.sh` (active-plan notice on session
+  open) and `hooks/post-compact.sh` (resumption notice after
+  compaction). Both read-only, always exit 0.
+- **Schemas** — `schemas/plan.schema.json` and
+  `schemas/progress.schema.json` describe the plan files the conductor
+  reads.
+- **Templates** — `templates/masterPlan.template.md` is the starter
+  for `writing-plans`.
+- **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
+
+The full design spec sits under `docs/01-philosophy.md` …
+`docs/08-plugin-layout.md`. Read `docs/02-conductor.md` for the
+conductor's full contract, `docs/06-codex-integration.md` for the
+wrapper prompt contract, and `docs/05-skills-catalog.md` for each
+skill's responsibilities.

@@ -1,0 +1,50 @@
+{
+  "name": "orchestration",
+  "version": "2.0.0",
+  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
+  "author": "claude.codice@miospot.com",
+  "license": "MIT",
+  "skills": [
+    "skills/conductor/SKILL.md",
+    "skills/engineering-discipline/SKILL.md",
+    "skills/persistent-plans/SKILL.md",
+    "skills/writing-plans/SKILL.md",
+    "skills/codex-dispatch/SKILL.md",
+    "skills/refactoring/SKILL.md",
+    "skills/test-driven-development/SKILL.md",
+    "skills/systematic-debugging/SKILL.md",
+    "skills/brainstorming/SKILL.md",
+    "skills/doc-coauthoring/SKILL.md",
+    "skills/frontend-design/SKILL.md",
+    "skills/svg-art/SKILL.md",
+    "skills/immersive-frontend/SKILL.md",
+    "skills/mcp-builder/SKILL.md",
+    "skills/react-native-mobile/SKILL.md",
+    "skills/webapp-testing/SKILL.md",
+    "skills/skill-review-standard/SKILL.md"
+  ],
+  "hooks": {
+    "session-start": "hooks/session-start.sh",
+    "post-compact": "hooks/post-compact.sh"
+  },
+  "permissions": {
+    "read": [
+      ".temp/plan-mode/**",
+      "scripts/**",
+      "schemas/**",
+      "templates/**",
+      "codex-skills/**",
+      "docs/**"
+    ],
+    "write": [
+      ".temp/plan-mode/active/**",
+      ".temp/plan-mode/archive/**"
+    ],
+    "bash": [
+      "scripts/run-codex-impl.sh",
+      "scripts/run-codex-verify.sh",
+      "scripts/plan-utils.sh",
+      "scripts/parse-contract.sh"
+    ]
+  }
+}

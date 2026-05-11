@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orchestration.claude/schemas/plan.schema.json",
+  "title": "Plan",
+  "description": "Immutable v2 orchestration plan definition.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "planId",
+    "title",
+    "createdAt",
+    "createdBy",
+    "frozen",
+    "context",
+    "steps"
+  ],
+  "properties": {
+    "planId": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "createdBy": {
+      "type": "string"
+    },
+    "approvedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "approvedVia": {
+      "type": "string"
+    },
+    "frozen": {
+      "type": "boolean"
+    },
+    "context": {
+      "$ref": "#/$defs/context"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rootDir",
+        "branch"
+      ],
+      "properties": {
+        "rootDir": {
+          "$ref": "#/$defs/path"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "discoveryRef": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "acceptanceCriteria",
+        "files",
+        "dependsOn",
+        "owner"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "owner": {
+          "enum": [
+            "codex-impl",
+            "claude-impl",
+            "manual"
+          ]
+        },
+        "skill": {
+          "type": "string"
+        },
+        "estimateMinutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "progress": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
