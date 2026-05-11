@@ -126,8 +126,20 @@ The minimum the harness needs:
 
 Optional fields the schema allows:
 
-- `mcpServers` — map of MCP server name → invocation. v2 does not
-  ship an MCP server; this stays omitted.
+- `mcpServers` — map of MCP server name → invocation. v2 declares
+  one entry, `orbit`, invoked via the `orbit-mcp` command (assumed
+  on `PATH`). Orbit surfaces `masterPlan.md` for human review before
+  the conductor flips `plan.json.frozen` to `true`, and provides the
+  review-state primitives the conductor uses during the plan-mode
+  handoff. Shape:
+
+  ```json
+  "mcpServers": {
+    "orbit": {
+      "command": "orbit-mcp"
+    }
+  }
+  ```
 
 Fields the harness does **not** read from `plugin.json`:
 

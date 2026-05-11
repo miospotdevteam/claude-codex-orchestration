@@ -102,41 +102,97 @@ Claude-only skill, write a one-line `routingJustification` in the
 step description so the conductor can audit it later. A `claude-impl`
 step without justification is a planning bug.
 
-## The plan-mode handoff
+## The full draft → review → handoff flow
 
-Planning fills the conductor's context with discovery details. To
-enter execution with a clean window:
+Planning has two integrated mechanisms that must run in order:
+**Orbit review** (the user sees the plan) and **the plan-mode handoff**
+(execution starts in a clean context window). Run them in this order:
 
-1. Enter plan mode (`EnterPlanMode`).
-2. Inside plan mode, write the three files to disk.
-3. Exit plan mode (`ExitPlanMode`).
-4. The harness compacts; the next turn starts with a small context.
-5. `post-compact` hook re-injects the active plan path and frontier.
-6. Execution begins from a clean slate — read `plan.json` +
-   `progress.json` only.
+### 1. Draft the three files (frozen:false)
 
-Without this trick, the next phase often inherits a context full of
-exploration notes that bloat every Codex dispatch.
+Write `plan.json` (with `frozen: false`), `progress.json`, and
+`masterPlan.md` under `.temp/plan-mode/active/<planId>/`. Don't
+initialize `progress.steps[*].status` yet — initialization happens
+on approval (step 4 below).
 
-## Approval
+### 2. Open Orbit review on `masterPlan.md`
 
-Default flow:
+The plugin declares `orbit` as an MCP server. Call the Orbit tools
+in this sequence:
 
-1. Write the three files (`frozen: false` while drafting).
-2. Invoke Orbit on `masterPlan.md` for human review.
-3. User accepts → set `approvedAt` to now, `approvedVia: "orbit"`,
-   `frozen: true`. Initialize `progress.json` (every step `pending`,
-   `currentFrontier` = the no-dep roots).
-4. User requests changes → loop back, edit the draft, re-submit.
+```
+orbit_await_review( file: "<plan-dir>/masterPlan.md" )
+```
 
-Fallback if Orbit is unavailable or the user prefers
-conversational approval:
+This presents the file to the user, blocks until they verdict it,
+and returns the verdict.
 
-- Walk the user through `masterPlan.md` in the chat.
-- On verbal "ack" / "yes" / "go", set `approvedVia: "conversational"`
-  and flip `frozen: true`.
+While waiting (or after a verdict), the conductor may also call:
 
-Record the approval mode in `plan.json.approvedVia` either way.
+- `orbit_get_review_state` — check current review status.
+- `orbit_list_threads` / `orbit_list_blocks` — read the user's
+  comments and blocking remarks.
+- `orbit_reply` / `orbit_resolve_thread` — respond to threads and
+  mark them resolved as you address them.
+- `orbit_load_artifact` — load referenced artifacts the user
+  attached to the review.
+
+### 3. Iterate on changes, or accept
+
+**If the user requests changes** (Orbit returns a `request_changes`
+verdict or non-empty blocking threads):
+
+- Read every blocking thread via `orbit_list_threads`.
+- Edit `plan.json` and/or `masterPlan.md` in place (still
+  `frozen: false`).
+- Reply to each addressed thread via `orbit_reply` and
+  `orbit_resolve_thread`.
+- Loop back to `orbit_await_review` for another round.
+
+**If the user accepts** (Orbit returns an `approve` verdict):
+
+- Set `plan.json.approvedAt` to now (UTC ISO-8601 with `Z`).
+- Set `plan.json.approvedVia` to `"orbit"`.
+- Flip `plan.json.frozen` to `true`.
+- Initialize `progress.json` via
+  `scripts/plan-utils.sh init-progress <plan-dir>` so every step is
+  `pending` and `currentFrontier` is the set of root steps.
+
+### 4. Plan-mode handoff (clear context before execution)
+
+Once `frozen: true`, the conductor's window is still full of
+discovery context. Clear it before dispatching:
+
+1. `EnterPlanMode` — opens the harness's plan-mode buffer.
+2. Inside plan mode, write a tiny resumption scratchpad pointing at
+   the plan dir (one line is enough — the plan files on disk are
+   the source of truth; this scratchpad just survives the
+   compaction summary).
+3. `ExitPlanMode` — harness compacts the prior context away.
+4. `post-compact` hook fires automatically, re-injecting the active
+   plan path and the runnable frontier as an action-oriented notice.
+5. The conductor's next turn starts with a clean window: it reads
+   `plan.json` + `progress.json`, mirrors progress into the
+   TaskList, and begins dispatching the frontier via `codex-dispatch`.
+
+Without this handoff, every Codex dispatch in the execute phase
+inherits a context full of discovery prose and bloats unnecessarily.
+
+### Conversational fallback (no Orbit)
+
+If `orbit-mcp` isn't available (the user skipped the install prereq
+or it's broken), the conductor degrades gracefully:
+
+- Walk the user through `masterPlan.md` in chat. Quote the Goal +
+  Approach + Steps sections inline.
+- On verbal "ack" / "yes" / "go" / "looks good", treat that as
+  approval.
+- Set `plan.json.approvedVia` to `"conversational"`, otherwise the
+  flow is identical (flip `frozen`, initialize progress, do the
+  plan-mode handoff).
+
+Record the approval mode in `plan.json.approvedVia` so a future
+session can audit which path was taken.
 
 ## What stays out of plan.json
 

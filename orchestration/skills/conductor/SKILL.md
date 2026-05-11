@@ -83,18 +83,35 @@ should break if I get this wrong?".
 
 **Output**: the three plan files (`plan.json`, `progress.json`,
 `masterPlan.md`) under `.temp/plan-mode/active/<planId>/`. The
-`writing-plans` skill drives this phase.
+`writing-plans` skill drives this phase end-to-end (drafting,
+Orbit review, plan-mode handoff).
 
-**Approval**: `masterPlan.md` goes through Orbit review or
-conversational approval. On approval, `plan.json.frozen` → `true`,
-and `progress.json` initializes via `scripts/plan-utils.sh
-init-progress`.
+The integrated draft → review → handoff flow:
 
-**Plan-mode handoff**: planning fills the context with discovery
-details. Before execution: `EnterPlanMode` → write the three files →
-`ExitPlanMode` → harness compacts → `post-compact` hook re-injects
-the active plan path and frontier → execution starts from a clean
-window reading only the plan files.
+1. **Draft** the three files (`plan.json.frozen: false`).
+2. **Orbit review**: call `orbit_await_review` on
+   `masterPlan.md`. The plugin's `orbit` MCP server exposes
+   `orbit_await_review`, `orbit_get_review_state`,
+   `orbit_list_threads`, `orbit_list_blocks`, `orbit_reply`,
+   `orbit_resolve_thread`, and `orbit_load_artifact`. Iterate if
+   the user requests changes; loop back to `orbit_await_review`
+   after each round of edits.
+3. **Approval**: on `approve` verdict, set `approvedAt`,
+   `approvedVia: "orbit"`, `frozen: true`. Initialize
+   `progress.json` via
+   `scripts/plan-utils.sh init-progress <plan-dir>`.
+4. **Plan-mode handoff**: `EnterPlanMode` → write a one-line
+   scratchpad pointing at the plan dir → `ExitPlanMode` → harness
+   compacts → `post-compact` hook re-injects the plan path +
+   runnable frontier → execution begins in a clean window.
+
+If `orbit-mcp` is unavailable, fall back to conversational
+approval (walk the user through `masterPlan.md` in chat; on verbal
+ack, set `approvedVia: "conversational"`). The plan-mode handoff
+runs the same way in either case.
+
+See `writing-plans` for the full Orbit-tool sequence and the
+fallback details.
 
 ### Phase 3 — Execute
 

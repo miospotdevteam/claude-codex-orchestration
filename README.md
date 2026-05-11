@@ -66,6 +66,11 @@ Prerequisites:
 - Claude Code CLI installed and authenticated.
 - `codex` CLI (`codex exec`) installed and authenticated — the impl and
   verify wrappers shell out to it.
+- `orbit-mcp` on `PATH` — the plugin declares an `orbit` MCP server
+  used to surface `masterPlan.md` for human review before execution
+  and to coordinate the plan-mode handoff (`EnterPlanMode` →
+  compaction → fresh execution window). On macOS: `brew install
+  orbit-mcp` (or follow Orbit's own install docs).
 - `jq` on `PATH` — used by the plan helpers, the contract parser, and
   the hooks.
 

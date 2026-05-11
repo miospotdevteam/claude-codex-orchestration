@@ -1,6 +1,6 @@
 ---
 name: codex-dispatch
-description: Invoke Codex through the direction-locked wrappers (`scripts/run-codex-impl.sh`, `scripts/run-codex-verify.sh`) and parse the bounded Summary / Verdict / Findings contract block. Use whenever a plan step with `owner: codex-impl` is on the frontier, when a step's executor needs verification, or when the conductor needs an out-of-band Codex check. The wrapper's identity locks the direction (impl vs verify); never read raw Codex stdout — only the JSON emitted by `scripts/parse-contract.sh`. Do NOT use for `claude-impl` / `manual` steps, for free-form conversation, or for any Codex call that bypasses the wrappers.
+description: Invoke Codex through the plugin's direction-locked wrappers (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`, `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`) and parse the bounded Summary / Verdict / Findings contract block. Use whenever a plan step with `owner: codex-impl` is on the frontier, when a step's executor needs verification, or when the conductor needs an out-of-band Codex check. The wrapper's identity locks the direction (impl vs verify); never read raw Codex stdout — only the JSON emitted by `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh` that the wrapper prints. Do NOT use for `claude-impl` / `manual` steps, for free-form conversation, or for any Codex call that bypasses the wrappers.
 allowed-tools: Read, Bash, Edit, Write
 ---
 
@@ -14,10 +14,10 @@ correctness hazard.
 
 ## When this fires
 
-- A plan step with `owner: "codex-impl"` reaches the runnable frontier
-  → use `scripts/run-codex-impl.sh`.
+- A plan step with `owner: "codex-impl"` reaches the runnable
+  frontier → use `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`.
 - A step (any owner) has been implemented and needs verification →
-  use `scripts/run-codex-verify.sh`.
+  use `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`.
 - The conductor needs an out-of-band Codex check (rare; e.g. a quick
   sanity scan before approving a plan) → use the verify wrapper with
   a synthetic step block.
@@ -72,10 +72,108 @@ For verify calls, append the diff after a `---DIFF---` sentinel line,
 or pass `--diff-file <path>` (see `run-codex-verify.sh` header for
 the convention).
 
+## Calling the wrappers (the exact invocation)
+
+The conductor invokes the wrappers via the `Bash` tool. All paths
+resolve through `${CLAUDE_PLUGIN_ROOT}` — Claude Code substitutes
+this at runtime to the plugin's installed location (typically
+`~/.claude/plugins/marketplaces/claude-codex-orchestration/orchestration`).
+Do **not** hard-code an absolute path; the env var is the contract.
+
+### IMPLEMENT call (codex-impl steps)
+
+```bash
+PLAN_DIR='.temp/plan-mode/active/<planId>'
+STEP_ID='step-N'
+ROOT_DIR="$(pwd)"   # the project the user is working in, not the plugin root
+SKILL='test-driven-development'  # optional; only if step.skill is set
+
+render_step_block | "${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh" \
+  --plan-id "<planId>" \
+  --step-id "$STEP_ID" \
+  --root-dir "$ROOT_DIR" \
+  --skill "$SKILL"
+```
+
+`render_step_block` is whatever produces the prose block above; in
+practice the conductor builds it inline with `jq` reads from
+`plan.json` and pipes the heredoc-formatted result.
+
+The wrapper's stdout on success is **only** the parsed contract JSON.
+Capture it with command substitution:
+
+```bash
+RESULT_JSON="$(render_step_block | "${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh" \
+  --plan-id "<planId>" \
+  --step-id "$STEP_ID" \
+  --root-dir "$ROOT_DIR" \
+  --skill "$SKILL")"
+
+VERDICT="$(jq -r .verdict   <<<"$RESULT_JSON")"
+SUMMARY="$(jq -r .summary   <<<"$RESULT_JSON")"
+FINDINGS_JSON="$(jq -c .findings <<<"$RESULT_JSON")"
+FILES_JSON="$(jq -c .filesTouched <<<"$RESULT_JSON")"
+```
+
+### VERIFY call (after any impl finishes)
+
+Two ways to pass the diff. Pick whichever fits:
+
+**A) diff in a file** — preferred when the diff is large or you
+already have it on disk:
+
+```bash
+DIFF_FILE='/tmp/step-N.diff'   # however you produced it
+
+render_step_block | "${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh" \
+  --plan-id "<planId>" \
+  --step-id "$STEP_ID" \
+  --root-dir "$ROOT_DIR" \
+  --diff-file "$DIFF_FILE"
+```
+
+**B) diff on stdin after a `---DIFF---` sentinel** — fine when
+inlining is easier:
+
+```bash
+{
+  render_step_block
+  printf '\n---DIFF---\n'
+  cat "$DIFF_FILE"
+} | "${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh" \
+    --plan-id "<planId>" \
+    --step-id "$STEP_ID" \
+    --root-dir "$ROOT_DIR"
+```
+
+### After the call — write the verdict back
+
+Always go through `plan-utils.sh`. Atomic writes; no jq one-offs:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
+  "$PLAN_DIR" "$STEP_ID" \
+  "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON"
+
+# Then flip status — done on PASS/FINDINGS, in_progress/blocked on FAIL.
+case "$VERDICT" in
+  PASS|FINDINGS)
+    "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
+      set-step-status "$PLAN_DIR" "$STEP_ID" done ;;
+  FAIL)
+    "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
+      set-step-status "$PLAN_DIR" "$STEP_ID" blocked ;;
+esac
+```
+
+After every status change, recompute the frontier with
+`plan-utils.sh compute-frontier "$PLAN_DIR"` and dispatch the next
+batch.
+
 ## Parallel dispatch with the file-overlap guard
 
 The conductor computes the runnable frontier via
-`scripts/plan-utils.sh compute-frontier`. The default is to dispatch
+`${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh compute-frontier`. The default is to dispatch
 **every step on the frontier in parallel**: one assistant message
 with N Bash tool calls (or N background commands), one per step.
 
@@ -98,7 +196,8 @@ and the user's mental model legible.
 ## Reading the result
 
 Each wrapper emits **one** thing to stdout on success: the JSON
-output of `scripts/parse-contract.sh`, shaped like:
+output of `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh`, shaped
+like:
 
 ```json
 {
@@ -109,10 +208,11 @@ output of `scripts/parse-contract.sh`, shaped like:
 }
 ```
 
-Read this JSON. Write it into `progress.json` via:
+Read this JSON. Write it into `progress.json` via the plan-utils
+helper (full bash example in "Calling the wrappers" above):
 
 ```bash
-scripts/plan-utils.sh record-verdict \
+"${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
   "$PLAN_DIR" "$STEP_ID" \
   "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON"
 ```
@@ -176,11 +276,11 @@ Codex verdict handling:
 
 ## Failure surface
 
-- **Direction confusion** — picking `run-codex-impl.sh` for a
-  verification call would produce edits where the conductor expected
-  a read-only check. The script identity prevents this from being
-  possible if the wrappers are chosen by step.owner, not by prompt
-  content.
+- **Direction confusion** — picking
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh` for a verification
+  call would produce edits where the conductor expected a read-only
+  check. The script identity prevents this from being possible if the
+  wrappers are chosen by `step.owner`, not by prompt content.
 - **Skipped file-overlap guard** — two parallel steps both edit
   `src/auth/session.ts`. The second commit silently overwrites the
   first. Always check overlap before parallelizing.
