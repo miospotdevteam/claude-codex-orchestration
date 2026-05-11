@@ -238,3 +238,66 @@ must be cheap to maintain. We expect to clear that bar rarely.
 
 See `08-plugin-layout.md` for where the hook scripts live in the
 plugin tree.
+
+---
+
+## Hook declaration (`hooks/hooks.json`)
+
+Claude Code learns which scripts to fire on which events from
+`hooks/hooks.json`. The schema is event-keyed: each top-level key is
+a Claude Code event name (e.g. `SessionStart`, `PostCompact`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) and the
+value is an array of handler-group objects. Each handler-group may
+include a `matcher` (regex-style filter on event sub-types or tool
+names) and a `hooks` array of command entries.
+
+v2's `hooks/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
+            "async": false,
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post-compact.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Three things to note:
+
+1. **`${CLAUDE_PLUGIN_ROOT}`** is the path Claude Code resolves at
+   runtime to the plugin's installation directory. Use it for every
+   in-plugin command path; never hard-code absolute paths.
+2. **The `SessionStart` matcher is `startup|resume|clear`** — and
+   intentionally **not** `compact`. Compaction is handled by the
+   `PostCompact` event below, so the session-start notice doesn't
+   fire twice on a compaction event.
+3. **`async: false` on `SessionStart`** ensures the notice is
+   injected before the user's first turn. The `PostCompact` handler
+   can run async (default); the resumption notice arrives ahead of
+   the conductor's next message either way.
+
+If a third event is ever proposed, the bar from earlier in this doc
+applies: it must do something a skill or wrapper cannot, it must be
+read-only, and it must be cheap to maintain.

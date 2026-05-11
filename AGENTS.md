@@ -118,12 +118,17 @@ and keep the conductor's window clean.
 The plugin's code lives at the repo root, alongside the design spec
 (`docs/`). Each role's behavior is enforced by the corresponding files:
 
+- **Manifests** — `.claude-plugin/plugin.json` is the minimal plugin
+  manifest (name + description). `.claude-plugin/marketplace.json`
+  declares this repo as a one-plugin marketplace so it can be
+  installed via `claude plugin marketplace add` +
+  `claude plugin install`.
 - **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
   skills plus 8 auxiliary skills (`doc-coauthoring`, `frontend-design`,
   `svg-art`, `immersive-frontend`, `mcp-builder`, `react-native-mobile`,
   `webapp-testing`, `skill-review-standard`). The conductor invokes them
-  via the `Skill` tool; the harness loads them from the paths listed in
-  `plugin.json`.
+  via the `Skill` tool; the harness auto-discovers them by scanning
+  `skills/<name>/SKILL.md` (no manifest list needed).
 - **Codex-side skill bodies** — `codex-skills/<skill>/SKILL.md` for the
   dual-install pattern. Currently only `react-native-mobile` ships a
   Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
@@ -136,7 +141,9 @@ The plugin's code lives at the repo root, alongside the design spec
   Codex contract block).
 - **Hooks** — `hooks/session-start.sh` (active-plan notice on session
   open) and `hooks/post-compact.sh` (resumption notice after
-  compaction). Both read-only, always exit 0.
+  compaction). Both read-only, always exit 0. Event mapping lives in
+  `hooks/hooks.json`: `SessionStart` (matcher `startup|resume|clear`)
+  fires `session-start.sh`; `PostCompact` fires `post-compact.sh`.
 - **Schemas** — `schemas/plan.schema.json` and
   `schemas/progress.schema.json` describe the plan files the conductor
   reads.

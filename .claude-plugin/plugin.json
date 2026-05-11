@@ -1,0 +1,4 @@
+{
+  "name": "orchestration",
+  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates."
+}

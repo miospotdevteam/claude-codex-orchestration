@@ -1,21 +1,28 @@
 # 08 — Plugin layout
 
 This document specifies the **target directory tree**, the
-**`plugin.json` metadata**, and the **per-artifact source docs** so
-anyone working on the plugin knows exactly which doc informs which
-file.
+**plugin and marketplace manifests**, and the **per-artifact source
+docs** so anyone working on the plugin knows exactly which doc
+informs which file.
 
 The implementation lives at the root of **this repository**,
 alongside `docs/`. The layout below is what should be at the repo
-root.
+root. The repository doubles as a **one-plugin marketplace**: it
+ships a `.claude-plugin/marketplace.json` so that
+`claude plugin marketplace add miospotdevteam/claude-codex-orchestration`
+makes the plugin installable in one step.
 
 ## Directory tree
 
 ```
 orchestration/
-├── plugin.json                          ← plugin metadata
+├── .claude-plugin/                      ← marketplace + plugin manifests
+│   ├── marketplace.json                 ← marketplace metadata (this repo as marketplace)
+│   └── plugin.json                      ← minimal plugin manifest (name, description)
 ├── README.md                            ← usage / install
-├── AGENTS.md                            ← same convention as this spec
+├── AGENTS.md                            ← three-role contract
+├── LICENSE                              ← MIT
+├── install.sh                           ← conditional uninstall + install via claude CLI
 │
 ├── skills/                              ← one subdirectory per skill
 │   ├── conductor/                       ← core: top-level orchestrator
@@ -41,9 +48,10 @@ orchestration/
 │   └── react-native-mobile/
 │       └── SKILL.md
 │
-├── hooks/                               ← exactly two hook scripts
-│   ├── session-start.sh
-│   └── post-compact.sh
+├── hooks/                               ← event handlers + manifest
+│   ├── hooks.json                       ← maps event names → handler scripts
+│   ├── session-start.sh                 ← SessionStart handler (read-only)
+│   └── post-compact.sh                  ← PostCompact handler (read-only)
 │
 ├── scripts/                             ← codex wrappers + utilities
 │   ├── run-codex-impl.sh
@@ -69,112 +77,158 @@ orchestration/
 
 Notes on shape:
 
+- **`.claude-plugin/` holds both manifests.** Claude Code's plugin
+  schema places metadata under `.claude-plugin/` rather than at the
+  repo root. A single-plugin repo can declare both the marketplace
+  and the plugin in the same `.claude-plugin/` directory by setting
+  the plugin's `source` to `"."`.
+- **Skills are auto-discovered.** There is no `skills` array in
+  `plugin.json`. The harness scans `skills/<name>/SKILL.md` from the
+  plugin root and loads whatever it finds.
 - **One directory per skill.** Each skill is self-contained in its
-  own folder. `SKILL.md` is the canonical file the Claude Code
-  harness loads. If a skill grows references (cheat sheets, example
-  prompts), they live in that skill's folder.
+  own folder. `SKILL.md` is the canonical file. References, scripts,
+  and other supporting files live alongside it.
 - **No `lib/` for shared skill code.** v1 had a shared `lib/` that
   encouraged skills to import each other's logic and tangled them.
   v2 skills only reference each other by name in prose, not by
   shared code.
-- **Two hooks, both at the top level of `hooks/`.** No
-  subdirectories, no `pre-edit/` placeholder dirs. The minimum is
-  the minimum.
+- **Hooks declared in `hooks/hooks.json`.** The two `.sh` files are
+  the actual handlers; the JSON file is how Claude Code learns which
+  events to fire them on. See `07-hooks.md` for the full event-mapping
+  contract.
 - **`scripts/` holds the wrappers and a small set of helpers.**
   `plan-utils.sh` provides idempotent read/write of `plan.json` and
   `progress.json` so the conductor doesn't reinvent jq invocations.
   `parse-contract.sh` extracts the contract block from raw Codex
   output and is used by both Codex wrappers.
 
-## `plugin.json` metadata
+## `.claude-plugin/plugin.json` (plugin manifest)
 
-The top-level manifest the Claude Code harness loads. Shape:
+The minimum the harness needs:
 
 ```json
 {
   "name": "orchestration",
-  "version": "2.0.0",
-  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
-  "author": "<implementer>",
-  "license": "MIT",
-  "skills": [
-    "skills/conductor/SKILL.md",
-    "skills/engineering-discipline/SKILL.md",
-    "skills/persistent-plans/SKILL.md",
-    "skills/writing-plans/SKILL.md",
-    "skills/codex-dispatch/SKILL.md",
-    "skills/refactoring/SKILL.md",
-    "skills/test-driven-development/SKILL.md",
-    "skills/systematic-debugging/SKILL.md",
-    "skills/brainstorming/SKILL.md"
-  ],
-  "hooks": {
-    "session-start": "hooks/session-start.sh",
-    "post-compact": "hooks/post-compact.sh"
+  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates."
+}
+```
+
+Optional fields the schema allows:
+
+- `mcpServers` — map of MCP server name → invocation. v2 does not
+  ship an MCP server; this stays omitted.
+
+Fields the harness does **not** read from `plugin.json`:
+
+- `skills` — auto-discovered from `skills/<name>/SKILL.md`.
+- `hooks` — declared in `hooks/hooks.json` (see below).
+- `permissions` — handled by Claude Code's settings system, not the
+  plugin manifest.
+- `version`, `author`, `license` — repo-level metadata, expressed in
+  `LICENSE` and (for git workflows) git tags.
+
+## `.claude-plugin/marketplace.json` (marketplace manifest)
+
+The marketplace metadata. For this repo (a one-plugin marketplace):
+
+```json
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-codex-orchestration",
+  "description": "Conductor-mode orchestrator for Claude Code: persistent plans, direction-locked Codex impl/verify, bounded prompt-contract I/O, read-only hooks.",
+  "owner": {
+    "name": "Miospot Dev Team"
   },
-  "permissions": {
-    "read": [
-      ".temp/plan-mode/**",
-      "scripts/**",
-      "schemas/**",
-      "templates/**"
+  "plugins": [
+    {
+      "name": "orchestration",
+      "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
+      "source": ".",
+      "category": "development"
+    }
+  ]
+}
+```
+
+The `source: "."` means the marketplace root IS the plugin root —
+the only entry in the `plugins` array points back at this same repo.
+
+## `hooks/hooks.json` (hook manifest)
+
+Maps Claude Code event names to handler scripts via the
+`${CLAUDE_PLUGIN_ROOT}` variable Claude Code resolves at runtime:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
+            "async": false,
+            "timeout": 10
+          }
+        ]
+      }
     ],
-    "write": [
-      ".temp/plan-mode/active/**",
-      ".temp/plan-mode/archive/**"
-    ],
-    "bash": [
-      "scripts/run-codex-impl.sh",
-      "scripts/run-codex-verify.sh",
-      "scripts/plan-utils.sh",
-      "scripts/parse-contract.sh"
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post-compact.sh",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-The exact field names depend on the harness's plugin schema at the
-time of implementation; the structure above is the **intent**. Two
-points the implementer must honor regardless of schema:
+Two points of nuance:
 
-1. **Hooks declared as exactly the two above.** No `pre-edit`, no
-   `pre-write`, no `pre-bash`. Anyone adding a hook must justify
-   against `01-philosophy.md`.
-2. **Write permissions scoped to `.temp/plan-mode/`.** The plugin
-   does not write outside the plan area; it asks the user (or
-   Codex via the wrappers) to do so.
+1. **The `SessionStart` matcher excludes `compact`** — `PostCompact`
+   handles that case. (v1 used a single `SessionStart` handler with
+   `compact` in its matcher; v2 splits them so each script has a
+   single clear responsibility.)
+2. **No `pre-*` hooks.** v2 ships exactly two events. Anyone proposing
+   a third hook (especially `PreToolUse`, `PostToolUse`, `Stop`)
+   must justify against `01-philosophy.md` first.
 
 ## Per-artifact source docs
 
-Cross-reference: which doc(s) inform which file. Implementers
-should read the listed doc before writing the file.
+Cross-reference: which doc(s) inform which file.
 
-| Artifact                                    | Read first                              |
-|---------------------------------------------|-----------------------------------------|
-| `README.md`                                 | This repo's `README.md`, `01-philosophy.md` |
-| `AGENTS.md`                                 | This repo's `AGENTS.md`, `02-conductor.md` |
-| `plugin.json`                               | `08-plugin-layout.md` (this doc), `07-hooks.md` |
-| `skills/conductor/SKILL.md`                 | `02-conductor.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
-| `skills/engineering-discipline/SKILL.md`    | `01-philosophy.md`, `05-skills-catalog.md` |
-| `skills/persistent-plans/SKILL.md`          | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
-| `skills/writing-plans/SKILL.md`             | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
-| `skills/codex-dispatch/SKILL.md`            | `06-codex-integration.md`, `05-skills-catalog.md` |
-| `skills/refactoring/SKILL.md`               | `05-skills-catalog.md`, `01-philosophy.md` |
-| `skills/test-driven-development/SKILL.md`   | `05-skills-catalog.md` |
-| `skills/systematic-debugging/SKILL.md`      | `05-skills-catalog.md` |
-| `skills/brainstorming/SKILL.md`             | `05-skills-catalog.md` |
-| `hooks/session-start.sh`                    | `07-hooks.md`, `03-plan-format.md` |
-| `hooks/post-compact.sh`                     | `07-hooks.md`, `04-execution-loop.md` |
-| `scripts/run-codex-impl.sh`                 | `06-codex-integration.md` |
-| `scripts/run-codex-verify.sh`               | `06-codex-integration.md` |
-| `scripts/plan-utils.sh`                     | `03-plan-format.md` |
-| `scripts/parse-contract.sh`                 | `06-codex-integration.md` |
-| `schemas/plan.schema.json`                  | `03-plan-format.md` |
-| `schemas/progress.schema.json`              | `03-plan-format.md` |
-| `templates/masterPlan.template.md`          | `03-plan-format.md` |
-| `tests/hooks/*.test.sh`                     | `07-hooks.md` |
-| `tests/scripts/parse-contract.test.sh`      | `06-codex-integration.md` |
-| `tests/scripts/plan-utils.test.sh`          | `03-plan-format.md` |
+| Artifact                                       | Read first                                                |
+|------------------------------------------------|-----------------------------------------------------------|
+| `README.md`                                    | This repo's `README.md`, `01-philosophy.md`               |
+| `AGENTS.md`                                    | This repo's `AGENTS.md`, `02-conductor.md`                |
+| `.claude-plugin/plugin.json`                   | `08-plugin-layout.md` (this doc)                          |
+| `.claude-plugin/marketplace.json`              | `08-plugin-layout.md` (this doc)                          |
+| `install.sh`                                   | `08-plugin-layout.md` (this doc), the `claude plugin` CLI |
+| `hooks/hooks.json`                             | `07-hooks.md`, `08-plugin-layout.md`                      |
+| `hooks/session-start.sh`                       | `07-hooks.md`, `03-plan-format.md`                        |
+| `hooks/post-compact.sh`                        | `07-hooks.md`, `04-execution-loop.md`                     |
+| `skills/conductor/SKILL.md`                    | `02-conductor.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
+| `skills/engineering-discipline/SKILL.md`       | `01-philosophy.md`, `05-skills-catalog.md`                |
+| `skills/persistent-plans/SKILL.md`             | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
+| `skills/writing-plans/SKILL.md`                | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md`, `09-routing-matrix.md` |
+| `skills/codex-dispatch/SKILL.md`               | `06-codex-integration.md`, `05-skills-catalog.md`         |
+| Other `skills/*/SKILL.md` (core and auxiliary) | `05-skills-catalog.md` (+ skill-specific docs)            |
+| `scripts/run-codex-impl.sh`                    | `06-codex-integration.md`                                 |
+| `scripts/run-codex-verify.sh`                  | `06-codex-integration.md`                                 |
+| `scripts/plan-utils.sh`                        | `03-plan-format.md`                                       |
+| `scripts/parse-contract.sh`                    | `06-codex-integration.md`                                 |
+| `schemas/plan.schema.json`                     | `03-plan-format.md`                                       |
+| `schemas/progress.schema.json`                 | `03-plan-format.md`                                       |
+| `templates/masterPlan.template.md`             | `03-plan-format.md`                                       |
+| `tests/hooks/*.test.sh`                        | `07-hooks.md`                                             |
+| `tests/scripts/parse-contract.test.sh`         | `06-codex-integration.md`                                 |
+| `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
 
 ## Implementation order
 
@@ -192,16 +246,20 @@ A sensible build sequence:
    thin and similar. Reuse `plan-utils.sh`.
 6. **`skills/`** — write `conductor`, `persistent-plans`, and
    `codex-dispatch` first (they wire everything together), then the
-   discipline skills (`engineering-discipline`, `writing-plans`,
-   `refactoring`, `test-driven-development`, `systematic-debugging`,
-   `brainstorming`).
-7. **`plugin.json`** and **`README.md`** last, when everything else
-   is testable.
+   discipline skills.
+7. **`.claude-plugin/plugin.json`**, **`hooks/hooks.json`**, and
+   **`.claude-plugin/marketplace.json`** — the manifests. Trivial
+   once the rest is solid.
+8. **`README.md`**, **`AGENTS.md`**, **`install.sh`** — last, when
+   everything else is testable.
 
 ## What the implementer should NOT add
 
 To keep v2 from regressing into v1:
 
+- **No `skills` array in `plugin.json`.** Skills are auto-discovered.
+- **No fabricated `permissions` block in `plugin.json`.** The schema
+  doesn't read it; permissions are a Claude Code settings concern.
 - **No `receipts/` directory.** No HMAC sidecars. No
   `claude-review-*.md` siblings.
 - **No `digester/` skill.** Codex output is parsed directly; no

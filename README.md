@@ -36,9 +36,13 @@ receipts and signatures.
 
 ```
 orchestration/
-├── plugin.json            ← plugin metadata
+├── .claude-plugin/        ← marketplace + plugin manifests
+│   ├── marketplace.json   ← declares this repo as a one-plugin marketplace
+│   └── plugin.json        ← minimal plugin manifest (name, description)
 ├── README.md              ← you are here
 ├── AGENTS.md              ← the three roles (conductor, sub-agents, Codex)
+├── LICENSE                ← MIT
+├── install.sh             ← conditional uninstall + install via claude CLI
 ├── .claude/
 │   └── CLAUDE.md          ← context for any Claude session editing this repo
 ├── docs/                  ← the design spec (markdown only)
@@ -46,13 +50,14 @@ orchestration/
 │   ├── 02-conductor.md    ← conductor-mode spec; what main thread may read
 │   ├── 03-plan-format.md  ← plan.json + progress.json + masterPlan.md
 │   ├── 04-execution-loop.md ← Discovery → Plan → Execute → Verify
-│   ├── 05-skills-catalog.md ← the 9 core v2 skills
+│   ├── 05-skills-catalog.md ← the 9 core + 8 auxiliary v2 skills
 │   ├── 06-codex-integration.md ← codex exec, direction lock, prompt contract
 │   ├── 07-hooks.md        ← session-start and post-compact (read-only)
-│   └── 08-plugin-layout.md ← target directory tree + build order
+│   ├── 08-plugin-layout.md ← directory tree, manifests, build order
+│   └── 09-routing-matrix.md ← step → owner/skill assignment rules
 ├── skills/                ← 9 core + 8 auxiliary skills (see docs/05-skills-catalog.md)
 ├── codex-skills/          ← Codex-side bodies for dual-install skills
-├── hooks/                 ← exactly two read-only hooks
+├── hooks/                 ← hooks.json (event mapping) + two read-only handler scripts
 ├── scripts/               ← codex wrappers + plan/contract helpers
 ├── schemas/               ← JSON schemas for plan + progress files
 ├── templates/             ← starter templates (e.g. masterPlan)
@@ -69,28 +74,43 @@ Prerequisites:
 - `jq` on `PATH` — used by the plan helpers, the contract parser, and
   the hooks.
 
-Install steps (Claude Code plugin):
+### One-liner install (recommended)
 
-```
-# Clone this repo to a stable path
+Clone this repo somewhere stable, then run `install.sh`:
+
+```bash
 git clone https://github.com/miospotdevteam/claude-codex-orchestration.git \
   ~/projects/claude-codex-orchestration
+cd ~/projects/claude-codex-orchestration
+bash install.sh
+```
 
-# Install as a Claude Code plugin
-#   In Claude Code, plugins are added via the /plugin command. Open any
-#   Claude Code session and run:
-#
-#       /plugin add ~/projects/claude-codex-orchestration
-#       /reload-plugins
-#
-#   If your version of Claude Code uses a different mechanism (e.g. a
-#   `plugins` entry in settings.json), point it at the absolute path to
-#   the clone. The harness loads plugin.json from the path you give it.
+`install.sh` is idempotent: it uninstalls any existing `orchestration`
+plugin, adds (or updates) the marketplace, and installs the latest
+version. Safe to re-run after upgrading.
+
+### Manual install (if you prefer)
+
+```bash
+# Add this repo as a Claude Code marketplace
+claude plugin marketplace add miospotdevteam/claude-codex-orchestration
+
+# Install the plugin from the marketplace
+claude plugin install orchestration@claude-codex-orchestration
 ```
 
 After install, start a Claude Code session in any project. The
-`session-start` hook injects a one-line notice if an active plan
+`SessionStart` hook injects a one-line notice if an active plan
 already exists; otherwise the `conductor` skill is on standby.
+
+### Upgrade
+
+```bash
+claude plugin marketplace update claude-codex-orchestration
+claude plugin update orchestration
+```
+
+Or simply re-run `bash install.sh` from the clone.
 
 ## Usage
 
