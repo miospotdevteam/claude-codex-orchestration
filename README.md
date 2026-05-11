@@ -35,33 +35,28 @@ receipts and signatures.
 ## Repository layout
 
 ```
-orchestration/
-├── .claude-plugin/        ← marketplace + plugin manifests
-│   ├── marketplace.json   ← declares this repo as a one-plugin marketplace
-│   └── plugin.json        ← minimal plugin manifest (name, description)
-├── README.md              ← you are here
-├── AGENTS.md              ← the three roles (conductor, sub-agents, Codex)
-├── LICENSE                ← MIT
-├── install.sh             ← conditional uninstall + install via claude CLI
+claude-codex-orchestration/      ← repo root = marketplace root
+├── .claude-plugin/
+│   └── marketplace.json         ← marketplace metadata (this repo as marketplace)
+├── README.md                    ← you are here
+├── AGENTS.md                    ← the three roles (conductor, sub-agents, Codex)
+├── LICENSE                      ← MIT
+├── install.sh                   ← conditional uninstall + install via claude CLI
 ├── .claude/
-│   └── CLAUDE.md          ← context for any Claude session editing this repo
-├── docs/                  ← the design spec (markdown only)
-│   ├── 01-philosophy.md   ← why we rebuilt; principles
-│   ├── 02-conductor.md    ← conductor-mode spec; what main thread may read
-│   ├── 03-plan-format.md  ← plan.json + progress.json + masterPlan.md
-│   ├── 04-execution-loop.md ← Discovery → Plan → Execute → Verify
-│   ├── 05-skills-catalog.md ← the 9 core + 8 auxiliary v2 skills
-│   ├── 06-codex-integration.md ← codex exec, direction lock, prompt contract
-│   ├── 07-hooks.md        ← session-start and post-compact (read-only)
-│   ├── 08-plugin-layout.md ← directory tree, manifests, build order
-│   └── 09-routing-matrix.md ← step → owner/skill assignment rules
-├── skills/                ← 9 core + 8 auxiliary skills (see docs/05-skills-catalog.md)
-├── codex-skills/          ← Codex-side bodies for dual-install skills
-├── hooks/                 ← hooks.json (event mapping) + two read-only handler scripts
-├── scripts/               ← codex wrappers + plan/contract helpers
-├── schemas/               ← JSON schemas for plan + progress files
-├── templates/             ← starter templates (e.g. masterPlan)
-└── tests/                 ← hook + script tests
+│   └── CLAUDE.md                ← context for any Claude session editing this repo
+├── docs/                        ← the design spec (markdown only)
+│   ├── 01-philosophy.md … 09-routing-matrix.md
+│
+└── orchestration/               ← plugin root (marketplace source: "./orchestration")
+    ├── .claude-plugin/
+    │   └── plugin.json          ← minimal plugin manifest (name, description)
+    ├── skills/                  ← 9 core + 8 auxiliary skills
+    ├── codex-skills/            ← Codex-side bodies for dual-install skills
+    ├── hooks/                   ← hooks.json + two read-only handler scripts
+    ├── scripts/                 ← codex wrappers + plan/contract helpers
+    ├── schemas/                 ← JSON schemas for plan + progress files
+    ├── templates/               ← starter templates (e.g. masterPlan)
+    └── tests/                   ← hook + script tests
 ```
 
 ## Install
@@ -152,6 +147,7 @@ purpose.
 Run the four test suites against the helpers and hooks:
 
 ```bash
+cd orchestration
 bash tests/scripts/parse-contract.test.sh    # 9 contract-block parsing cases
 bash tests/scripts/plan-utils.test.sh        # 6 plan-file helper cases
 bash tests/hooks/session-start.test.sh       # 5 session-start hook cases
@@ -164,14 +160,15 @@ and clean up after themselves. Each exits non-zero on any failure.
 Syntax / lint checks for the shell scripts:
 
 ```bash
+cd orchestration
 bash -n scripts/*.sh hooks/*.sh tests/scripts/*.test.sh tests/hooks/*.test.sh
 shellcheck scripts/*.sh hooks/*.sh    # optional but recommended
 ```
 
-JSON validity:
+JSON validity (from repo root):
 
 ```bash
-jq -e . plugin.json schemas/*.json
+jq -e . .claude-plugin/marketplace.json orchestration/.claude-plugin/plugin.json orchestration/hooks/hooks.json orchestration/schemas/*.json
 ```
 
 ## Contributing / dev

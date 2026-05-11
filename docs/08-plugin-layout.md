@@ -5,74 +5,85 @@ This document specifies the **target directory tree**, the
 docs** so anyone working on the plugin knows exactly which doc
 informs which file.
 
-The implementation lives at the root of **this repository**,
-alongside `docs/`. The layout below is what should be at the repo
-root. The repository doubles as a **one-plugin marketplace**: it
-ships a `.claude-plugin/marketplace.json` so that
+The repository is a **one-plugin marketplace**: the marketplace
+manifest lives at the repo root under `.claude-plugin/`, and the
+plugin itself lives in the `orchestration/` subdirectory. This split
+matches Claude Code's plugin-source convention — the marketplace's
+`plugins[].source` is a relative path to a subdirectory (Claude Code
+does **not** accept `.` as a same-dir marker; it must be a real
+subdir like `./orchestration`).
+
 `claude plugin marketplace add miospotdevteam/claude-codex-orchestration`
-makes the plugin installable in one step.
+clones this repo into Claude Code's marketplace cache;
+`claude plugin install orchestration@claude-codex-orchestration`
+then installs the plugin from the `orchestration/` subdir.
 
 ## Directory tree
 
 ```
-orchestration/
-├── .claude-plugin/                      ← marketplace + plugin manifests
-│   ├── marketplace.json                 ← marketplace metadata (this repo as marketplace)
-│   └── plugin.json                      ← minimal plugin manifest (name, description)
+claude-codex-orchestration/              ← repo root = marketplace root
+├── .claude-plugin/
+│   └── marketplace.json                 ← marketplace metadata
 ├── README.md                            ← usage / install
 ├── AGENTS.md                            ← three-role contract
 ├── LICENSE                              ← MIT
 ├── install.sh                           ← conditional uninstall + install via claude CLI
+├── docs/                                ← design spec (markdown only)
+│   ├── 01-philosophy.md … 09-routing-matrix.md
 │
-├── skills/                              ← one subdirectory per skill
-│   ├── conductor/                       ← core: top-level orchestrator
-│   ├── engineering-discipline/          ← core: behavioral baseline
-│   ├── persistent-plans/                ← core: plan I/O + resumption
-│   ├── writing-plans/                   ← core: draft plan files
-│   ├── codex-dispatch/                  ← core: wrapper routing
-│   ├── refactoring/                     ← core: multi-file restructuring
-│   ├── test-driven-development/         ← core: red-green-refactor
-│   ├── systematic-debugging/            ← core: four-phase debugging
-│   ├── brainstorming/                   ← core: design dialogue
-│   ├── doc-coauthoring/                 ← auxiliary: prose authoring
-│   ├── frontend-design/                 ← auxiliary: UI / design system
-│   ├── svg-art/                         ← auxiliary: hand-coded SVG
-│   ├── immersive-frontend/              ← auxiliary: WebGL / 3D / scroll
-│   ├── mcp-builder/                     ← auxiliary: MCP server dev
-│   ├── react-native-mobile/             ← auxiliary: RN apps (dual-install)
-│   ├── webapp-testing/                  ← auxiliary: Playwright / E2E
-│   └── skill-review-standard/           ← auxiliary: skill QA gate
-│       (each skill dir contains SKILL.md and optional references/, scripts/)
-│
-├── codex-skills/                        ← Codex-side bodies for dual-install skills
-│   └── react-native-mobile/
-│       └── SKILL.md
-│
-├── hooks/                               ← event handlers + manifest
-│   ├── hooks.json                       ← maps event names → handler scripts
-│   ├── session-start.sh                 ← SessionStart handler (read-only)
-│   └── post-compact.sh                  ← PostCompact handler (read-only)
-│
-├── scripts/                             ← codex wrappers + utilities
-│   ├── run-codex-impl.sh
-│   ├── run-codex-verify.sh
-│   ├── plan-utils.sh                    ← read/write helpers for plan files
-│   └── parse-contract.sh                ← extract the contract block
-│
-├── schemas/                             ← JSON schemas for plan files
-│   ├── plan.schema.json
-│   └── progress.schema.json
-│
-├── templates/                           ← starter templates
-│   └── masterPlan.template.md
-│
-└── tests/                               ← hook + script tests
-    ├── hooks/
-    │   ├── session-start.test.sh
-    │   └── post-compact.test.sh
-    └── scripts/
-        ├── parse-contract.test.sh
-        └── plan-utils.test.sh
+└── orchestration/                       ← plugin root (source: "./orchestration")
+    ├── .claude-plugin/
+    │   └── plugin.json                  ← minimal plugin manifest (name, description)
+    │
+    ├── skills/                          ← one subdirectory per skill
+    │   ├── conductor/                   ← core: top-level orchestrator
+    │   ├── engineering-discipline/      ← core: behavioral baseline
+    │   ├── persistent-plans/            ← core: plan I/O + resumption
+    │   ├── writing-plans/               ← core: draft plan files
+    │   ├── codex-dispatch/              ← core: wrapper routing
+    │   ├── refactoring/                 ← core: multi-file restructuring
+    │   ├── test-driven-development/     ← core: red-green-refactor
+    │   ├── systematic-debugging/        ← core: four-phase debugging
+    │   ├── brainstorming/               ← core: design dialogue
+    │   ├── doc-coauthoring/             ← auxiliary: prose authoring
+    │   ├── frontend-design/             ← auxiliary: UI / design system
+    │   ├── svg-art/                     ← auxiliary: hand-coded SVG
+    │   ├── immersive-frontend/          ← auxiliary: WebGL / 3D / scroll
+    │   ├── mcp-builder/                 ← auxiliary: MCP server dev
+    │   ├── react-native-mobile/         ← auxiliary: RN apps (dual-install)
+    │   ├── webapp-testing/              ← auxiliary: Playwright / E2E
+    │   └── skill-review-standard/       ← auxiliary: skill QA gate
+    │       (each skill dir contains SKILL.md and optional references/, scripts/)
+    │
+    ├── codex-skills/                    ← Codex-side bodies for dual-install skills
+    │   └── react-native-mobile/
+    │       └── SKILL.md
+    │
+    ├── hooks/                           ← event handlers + manifest
+    │   ├── hooks.json                   ← maps event names → handler scripts
+    │   ├── session-start.sh             ← SessionStart handler (read-only)
+    │   └── post-compact.sh              ← PostCompact handler (read-only)
+    │
+    ├── scripts/                         ← codex wrappers + utilities
+    │   ├── run-codex-impl.sh
+    │   ├── run-codex-verify.sh
+    │   ├── plan-utils.sh                ← read/write helpers for plan files
+    │   └── parse-contract.sh            ← extract the contract block
+    │
+    ├── schemas/                         ← JSON schemas for plan files
+    │   ├── plan.schema.json
+    │   └── progress.schema.json
+    │
+    ├── templates/                       ← starter templates
+    │   └── masterPlan.template.md
+    │
+    └── tests/                           ← hook + script tests
+        ├── hooks/
+        │   ├── session-start.test.sh
+        │   └── post-compact.test.sh
+        └── scripts/
+            ├── parse-contract.test.sh
+            └── plan-utils.test.sh
 ```
 
 Notes on shape:
@@ -143,15 +154,20 @@ The marketplace metadata. For this repo (a one-plugin marketplace):
     {
       "name": "orchestration",
       "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
-      "source": ".",
+      "source": "./orchestration",
       "category": "development"
     }
   ]
 }
 ```
 
-The `source: "."` means the marketplace root IS the plugin root —
-the only entry in the `plugins` array points back at this same repo.
+`source` is a **relative path to a real subdirectory** containing the
+plugin (with its own `.claude-plugin/plugin.json` inside). Claude
+Code does not accept `"."` or `""` as the source — it must be a
+proper subdir like `./orchestration`. If you only have one plugin in
+the repo, that's why this layout has both a repo-root
+`.claude-plugin/` (marketplace) and a subdir `.claude-plugin/`
+(plugin).
 
 ## `hooks/hooks.json` (hook manifest)
 

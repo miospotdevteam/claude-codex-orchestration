@@ -118,11 +118,12 @@ and keep the conductor's window clean.
 The plugin's code lives at the repo root, alongside the design spec
 (`docs/`). Each role's behavior is enforced by the corresponding files:
 
-- **Manifests** — `.claude-plugin/plugin.json` is the minimal plugin
-  manifest (name + description). `.claude-plugin/marketplace.json`
-  declares this repo as a one-plugin marketplace so it can be
-  installed via `claude plugin marketplace add` +
-  `claude plugin install`.
+- **Manifests** — `.claude-plugin/marketplace.json` at the repo root
+  declares this repo as a one-plugin marketplace pointing at
+  `./orchestration` as the plugin source. `orchestration/.claude-plugin/plugin.json`
+  is the minimal plugin manifest (name + description). Claude Code
+  requires the plugin to live in a real subdirectory — `"source": "."`
+  in marketplace.json is rejected as "unsupported".
 - **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
   skills plus 8 auxiliary skills (`doc-coauthoring`, `frontend-design`,
   `svg-art`, `immersive-frontend`, `mcp-builder`, `react-native-mobile`,
