@@ -12,6 +12,30 @@ of two wrappers whose script identity is the source of truth for the
 direction (IMPLEMENT vs VERIFY). Anything outside this contract is a
 correctness hazard.
 
+## Hard rule: every `codex-impl` step gets a Claude-session-dispatched verify
+
+**Every `codex-impl` step gets a Claude-session-dispatched verify via
+`run-codex-verify.sh`. Codex never calls the bridge directly.**
+
+BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
+`claude-bridge` MCP call-back tools (`verify_step`,
+`frontend_implement`, `attack_plan`). The contract is:
+
+1. Codex emits the bounded contract block parseable by
+   `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh` (Summary /
+   Verdict / Findings / FilesTouched).
+2. The conductor (Claude) dispatches
+   `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` through this
+   skill to verify the step.
+3. The conductor reads only the parsed JSON from the wrapper; it
+   never reads raw Codex stdout, and Codex never reaches back into
+   Claude through a bridge tool.
+
+If a plan step, prose template, or sub-agent prompt tries to make
+Codex call `verify_step`, `frontend_implement`, or `attack_plan`,
+that is a bug — re-render the prompt to use the contract-block flow
+instead.
+
 ## When this fires
 
 - A plan step with `owner: "codex-impl"` reaches the runnable

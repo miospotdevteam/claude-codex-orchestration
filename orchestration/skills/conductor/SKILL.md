@@ -11,6 +11,84 @@ central invariant is that **the conductor dispatches; it does not do
 the heavy work itself**. This skill is the contract for that
 invariant.
 
+## Hard rule: Codex verification is Claude-session-dispatched
+
+**Every `codex-impl` step gets a Claude-session-dispatched verify via
+`run-codex-verify.sh`. Codex never calls the bridge directly.**
+
+BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
+`claude-bridge` MCP call-back tools (`verify_step`,
+`frontend_implement`, `attack_plan`). The conductor MUST NOT instruct
+Codex to call any of those tools. The contract is:
+
+1. Codex emits the bounded contract block defined by
+   `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh`.
+2. The conductor (this Claude session) dispatches
+   `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` via the
+   `codex-dispatch` skill to verify the step.
+3. The conductor reads only the parsed JSON from the wrapper; it
+   never reads raw Codex stdout.
+
+This rule applies to every step with `owner: codex-impl`, and to
+`claude-impl` steps that need a verifier pass after the
+`general-purpose` sub-agent finishes. Any prose, plan template, or
+sub-agent prompt that asks Codex to call a bridge MCP tool is a bug —
+re-dispatch with the contract-block instruction instead.
+
+## Hard rule: always fix findings and re-verify
+
+**On every FAIL or FINDINGS verdict from Codex (or any verifier), the
+conductor MUST fix the findings and re-run the verifier. Do not
+accept findings, do not "mark done with findings", do not defer to a
+follow-up step.** The loop is: dispatch → verify → if not PASS, fix
++ re-verify → repeat until PASS.
+
+Concretely:
+
+- **FINDINGS verdict** → dispatch a fix-up sub-agent (Opus, per the
+  rule below), then re-dispatch `run-codex-verify.sh` on the same
+  step. Do not record the step as `done` with FINDINGS.
+- **FAIL verdict** → same loop. The findings array is the spec for
+  the fix-up sub-agent.
+- **Surface progress to the user between iterations** (one-sentence
+  status), but do not stop to ask "should I fix?" — fixing is the
+  default. Only pause if the user pre-empted the loop, the findings
+  reveal a design question that needs their judgment, or three
+  iterations have not converged.
+- A step's `progress.json` verdict is overwritten on each re-verify;
+  only the final PASS verdict is the durable record.
+
+The previous "FAIL → surface and ask" failure-mode line is
+superseded: ask only when the loop fails to converge or the findings
+require user judgment beyond mechanical fixing. Routine findings are
+the conductor's job, not the user's.
+
+## Hard rule: implementation sub-agents run on Opus
+
+**Every Claude sub-agent the conductor dispatches for implementation
+work MUST be invoked with `model: "opus"` on the `Agent` tool.** No
+silent defaults; no Sonnet/Haiku fallback for execution. The
+conductor's own model is whatever the user is running, but every
+`general-purpose` (and equivalent) implementation dispatch is
+Opus-locked.
+
+Concretely:
+
+- `owner: claude-impl` step → `Agent(subagent_type: "general-purpose",
+  model: "opus", ...)`.
+- Refactoring sub-agents, multi-file edit sub-agents, TDD
+  implementation sub-agents → `model: "opus"`.
+- Read-only sub-agents (`Explore`, `Plan`) MAY default to whatever
+  the agent definition specifies; the rule is about *implementation*
+  dispatches.
+- Codex dispatches (`codex-impl` / verify) are unaffected — Codex is
+  a separate model under `codex-dispatch`'s wrappers, not a Claude
+  sub-agent.
+
+Any implementation dispatch that omits `model: "opus"` is a bug.
+Self-correct by re-dispatching with the override before consuming the
+sub-agent's result.
+
 ## The dispatch-only rule
 
 > Plan, dispatch, decide. Do not investigate large codebases inline,
