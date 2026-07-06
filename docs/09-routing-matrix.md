@@ -20,6 +20,73 @@ Claude-only skill list (or the RN-mobile Routing Directive).
 
 ---
 
+## Decision Axes
+
+Every routing decision reduces to two axes. Name them; the scorecard
+and the conductor's escalation both read from them.
+
+- **Intelligence** — how hard a problem the model carries
+  *unsupervised*: depth of reasoning, holding a spec in one pass,
+  tracking blast radius across many files. Drives backend logic,
+  migrations, debugging, and large refactors.
+- **Taste** — judgment about the shape of the artifact a human will
+  read or maintain: API / SDK surface, UI / UX, naming, copy, and
+  writing code that is idiomatic *for its language* (not
+  TypeScript-as-Python or Rust-as-paranoid-C++). Drives frontend,
+  public interfaces, docs, and product copy.
+
+**Cost** is not a third selection axis — it is the tiebreak (see the
+policy below). One fact about cost is load-bearing, though: on a Codex
+subscription (the plugin's expected setup), **GPT-5.5 via the Codex
+wrappers is effectively free at the margin** and runs *off the
+conductor's context*. That is why Codex is the default implementer —
+not because it has the most taste, but because it is intelligent,
+cheap, and off-context. Reach for it liberally on bulk mechanical work.
+
+---
+
+## Model Scorecard
+
+The conductor reaches five models. Route by the axis the step is
+*bottlenecked* on, then escalate per the policy below.
+
+| Model | Reached via | Intelligence | Taste | Route here for |
+|---|---|---|---|---|
+| **Fable 5** | `Agent(model: "fable")` | highest | highest | The hardest *and* most user-facing implementation; end-to-end multi-step work that needs both axes at once — the "steer everything" tier. |
+| **Opus 4.8** | `Agent(model: "opus")` | high | high | Default Claude-side implementation floor; strong all-rounder when a step needs real taste but is not the top of the pile. |
+| **Sonnet 5** | `Agent(model: "sonnet")` | mid | mid | Cheap, read-heavy scouting and mechanical Claude-side work where taste does not ship. Never the default for code that lands. |
+| **Codex / GPT-5.5** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
+| **Haiku** | — | low | low | **Never for real work.** Not an execution or verification tier. |
+
+The Claude tiers (Fable / Opus / Sonnet) are selected via the `model`
+field on the `Agent` tool. Codex is reached only through the
+direction-locked wrappers, which never take a `-m` flag (see *Machine
+defaults* at the bottom of this doc).
+
+---
+
+## Escalation & Tiebreak Policy
+
+The scorecard gives defaults, not limits. The conductor applies four
+rules on top of it:
+
+1. **Defaults, not limits.** A lower tier's output that does not meet
+   the bar is re-dispatched to a higher tier *without asking*. Judge
+   the output, not the price tag — escalating costs less than shipping
+   mediocre work.
+2. **Taste escalation is a first-class move.** Codex is the default
+   implementer, but when the artifact is user-facing (SDK, public API,
+   UI, copy), route the *design* to a Claude tier first, or add a
+   Claude taste-pass after Codex. This is the `dual-pass` and "Claude
+   reviews Codex integration impact" rows made explicit.
+3. **Tiebreak for anything that ships: intelligence > taste > cost.**
+   Cost decides only when intelligence and taste do not. It never
+   blocks the right model for work that lands.
+4. **Never route real work to Haiku**, and never let Sonnet own code
+   that ships — Sonnet is for cheap read-heavy scouting only.
+
+---
+
 ## How to Use This Table
 
 When creating a plan, classify each step by its **task category** (left
@@ -121,8 +188,11 @@ These rules override the table above:
    - the step's `skill` is one of `{brainstorming, writing-plans,
      doc-coauthoring}`.
 
-   Every other `claude-impl` step dispatches to an Opus subagent.
-   Every `codex-impl` step dispatches via `run-codex-impl.sh`.
+   Every other `claude-impl` step dispatches to a Claude subagent whose
+   model is chosen per the Model Scorecard above (Opus is the floor;
+   Fable for the hardest / highest-taste work; Sonnet only for cheap
+   read-heavy scouting). Every `codex-impl` step dispatches via
+   `run-codex-impl.sh`.
 
 7. **User can override any assignment.** During Orbit plan review, the
    user may change any step's `owner` and `mode`. The routing matrix
@@ -233,11 +303,20 @@ subagent** in v2. See `docs/01-philosophy.md` for the rationale.
 
 ---
 
-## Machine defaults — never downgrade
+## Machine defaults — Codex side; scorecard governs the Claude side
 
-Default models are configured at the machine level (Claude Code on
-the conductor side; `codex` on the impl/verify side). Dispatch
-scripts and skill prompts MUST NOT pass `--model` / `-m` flags that
-downgrade these defaults. `scripts/run-codex-impl.sh` and
-`scripts/run-codex-verify.sh` already invoke `codex exec` without a
-`-m`/`--model` flag; do not add one.
+Two model-selection regimes coexist, and they must not be confused:
+
+- **Conductor + Codex — machine defaults, never downgrade.** The
+  conductor's own thread runs the user's configured model, and `codex`
+  runs its machine default on the impl/verify side. The Codex wrappers
+  MUST NOT pass `--model` / `-m`: `scripts/run-codex-impl.sh` and
+  `scripts/run-codex-verify.sh` invoke `codex exec` without one, and no
+  caller adds it.
+- **Claude-side implementation sub-agents — scorecard, not lock.** The
+  conductor selects each implementation sub-agent's model via the
+  `Agent` tool's `model` field per the Model Scorecard above (Opus
+  floor, Fable escalation, Sonnet for cheap read-heavy). This is
+  deliberate *tier selection*, not a downgrade — the "never downgrade"
+  rule governs the Codex wrappers and the conductor's own thread, never
+  the choice of Claude tier for a dispatched sub-agent.

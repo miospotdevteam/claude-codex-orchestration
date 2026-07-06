@@ -45,8 +45,8 @@ follow-up step.** The loop is: dispatch → verify → if not PASS, fix
 
 Concretely:
 
-- **FINDINGS verdict** → dispatch a fix-up sub-agent (Opus, per the
-  rule below), then re-dispatch `run-codex-verify.sh` on the same
+- **FINDINGS verdict** → dispatch a fix-up sub-agent (at the scorecard
+  tier, per the rule below), then re-dispatch `run-codex-verify.sh` on the same
   step. Do not record the step as `done` with FINDINGS.
 - **FAIL verdict** → same loop. The findings array is the spec for
   the fix-up sub-agent.
@@ -63,31 +63,39 @@ superseded: ask only when the loop fails to converge or the findings
 require user judgment beyond mechanical fixing. Routine findings are
 the conductor's job, not the user's.
 
-## Hard rule: implementation sub-agents run on Opus
+## Hard rule: implementation sub-agent model follows the scorecard
 
 **Every Claude sub-agent the conductor dispatches for implementation
-work MUST be invoked with `model: "opus"` on the `Agent` tool.** No
-silent defaults; no Sonnet/Haiku fallback for execution. The
-conductor's own model is whatever the user is running, but every
-`general-purpose` (and equivalent) implementation dispatch is
-Opus-locked.
+work MUST carry an explicit `model` on the `Agent` tool, chosen per the
+routing matrix's Model Scorecard.** No silent defaults for execution.
+The conductor's own model is whatever the user is running; the tiers
+below govern *dispatched* implementation sub-agents.
 
-Concretely:
+The tiers:
 
-- `owner: claude-impl` step → `Agent(subagent_type: "general-purpose",
-  model: "opus", ...)`.
-- Refactoring sub-agents, multi-file edit sub-agents, TDD
-  implementation sub-agents → `model: "opus"`.
-- Read-only sub-agents (`Explore`, `Plan`) MAY default to whatever
-  the agent definition specifies; the rule is about *implementation*
+- **Opus is the floor and the default.** `owner: claude-impl` step →
+  `Agent(subagent_type: "general-purpose", model: "opus", ...)` unless a
+  rule below moves it. Refactoring, multi-file edit, and TDD
+  implementation sub-agents default here too.
+- **Escalate to Fable** (`model: "fable"`) for the hardest *and* most
+  user-facing implementation — work that needs top intelligence and top
+  taste at once (public SDK/API surface, the flagship UI, an end-to-end
+  multi-step build). Escalate without asking when a lower tier's output
+  does not meet the bar: judge the output, not the price tag.
+- **Sonnet** (`model: "sonnet"`) is permitted ONLY for cheap,
+  read-heavy scouting or mechanical Claude-side work where taste does
+  not ship. It is never the owner of code that lands.
+- **Never Haiku** for execution or verification.
+- Read-only sub-agents (`Explore`, `Plan`) MAY default to whatever the
+  agent definition specifies; this rule governs *implementation*
   dispatches.
-- Codex dispatches (`codex-impl` / verify) are unaffected — Codex is
-  a separate model under `codex-dispatch`'s wrappers, not a Claude
-  sub-agent.
+- Codex dispatches (`codex-impl` / verify) are unaffected — Codex is a
+  separate model under `codex-dispatch`'s wrappers, not a Claude
+  sub-agent, and its wrappers never take a `-m` flag.
 
-Any implementation dispatch that omits `model: "opus"` is a bug.
-Self-correct by re-dispatching with the override before consuming the
-sub-agent's result.
+Any implementation dispatch that omits an explicit `model`, uses Haiku,
+or defaults to Sonnet for shipping code is a bug. Self-correct by
+re-dispatching at the right tier before consuming the result.
 
 ## The dispatch-only rule
 
