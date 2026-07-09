@@ -1,9 +1,10 @@
 # 09 — Routing Matrix
 
 Canonical task-type routing table for assigning `owner` and (in v2's
-plan vocabulary) `owner` value `claude-impl` / `codex-impl` / `manual`
-to each plan step. Consumed by the `writing-plans` skill during plan
-creation and by the `codex-dispatch` skill during execution.
+plan vocabulary) `owner` value `claude-impl` / `codex-impl` /
+`grok-impl` / `manual` to each plan step. Consumed by the
+`writing-plans` skill during plan creation and by the `codex-dispatch`
+skill during execution.
 
 See also: `docs/05-skills-catalog.md` for the v2 skill catalog,
 `docs/06-codex-integration.md` for the bounded Codex contract,
@@ -43,11 +44,24 @@ conductor's context*. That is why Codex is the default implementer —
 not because it has the most taste, but because it is intelligent,
 cheap, and off-context. Reach for it liberally on bulk mechanical work.
 
+**Orchestrator economics.** The conductor seat gets the strongest
+available model (Fable) because orchestration is *few-tokens* work when
+delegation holds: the conductor reads only bounded contract blocks and
+sub-agent summaries, never raw artifacts, so its tier price is a small
+share of total spend. Bad routing decisions are the expensive failure
+mode, not the conductor's per-token rate. Empirical grounding:
+Anthropic's multi-agent research system — an Opus lead orchestrating
+Sonnet subagents — outperformed single-agent Opus by 90.2%, and the
+orchestrator's token share of the run was small. A lean, cache-stable
+conductor context bills mostly *cached* input, cheapening the seat
+further. **Sonnet 5 is the sanctioned economy conductor** for routine
+sessions where the strongest seat is not warranted.
+
 ---
 
 ## Model Scorecard
 
-The conductor reaches five models. Route by the axis the step is
+The conductor reaches six models. Route by the axis the step is
 *bottlenecked* on, then escalate per the policy below.
 
 | Model | Reached via | Intelligence | Taste | Route here for |
@@ -56,12 +70,28 @@ The conductor reaches five models. Route by the axis the step is
 | **Opus 4.8** | `Agent(model: "opus")` | high | high | Default Claude-side implementation floor; strong all-rounder when a step needs real taste but is not the top of the pile. |
 | **Sonnet 5** | `Agent(model: "sonnet")` | mid | mid | Cheap, read-heavy scouting and mechanical Claude-side work where taste does not ship. Never the default for code that lands. |
 | **Codex / GPT-5.5** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
+| **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations — the *second* off-context implementer; also the independent cross-family verifier for `codex-impl` steps. |
 | **Haiku** | — | low | low | **Never for real work.** Not an execution or verification tier. |
 
 The Claude tiers (Fable / Opus / Sonnet) are selected via the `model`
-field on the `Agent` tool. Codex is reached only through the
-direction-locked wrappers, which never take a `-m` flag (see *Machine
-defaults* at the bottom of this doc).
+field on the `Agent` tool. Codex and Grok are each reached only through
+their direction-locked wrappers; callers never supply a model to either
+wrapper pair (see *Machine defaults* at the bottom of this doc).
+
+### grok-impl vs codex-impl
+
+Both are off-context external implementers; the routing question is
+*which lane*. **Codex remains the default external implementer.** A step
+is routed `grok-impl` in three cases:
+
+- **Parallel capacity** — the Codex lane is saturated and a step is
+  otherwise runnable; Grok is the second lane.
+- **Bulk sweeps** — mechanical work where a second lane doubles
+  throughput (splitting a large sweep across both lanes).
+- **Explicit routing** — the plan author routes the step `grok-impl`
+  outright.
+
+Absent one of these, `codex-impl` is the default.
 
 ---
 
@@ -203,7 +233,27 @@ These rules override the table above:
    actively-used dispatch script (or a hook lib those wrappers source)
    MUST be dispatched ALONE — never in a parallel batch alongside other
    dispatches that use those scripts. This rule is enforced by the
-   `codex-dispatch` skill ("Parallel Step Execution" section).
+   `codex-dispatch` skill ("Parallel dispatch with the file-overlap
+   guard" section).
+
+9. **Every dispatch carries an explicit model and announces itself.**
+   Every `Agent` tool dispatch — implementation, scouting, verification
+   — MUST carry an explicit `model` chosen per the Model Scorecard;
+   inheriting the session model is a routing bug. Scouts (`Explore` /
+   `Plan`) default to `sonnet` *explicitly*, never implicitly. Each
+   dispatch also emits a one-line user-visible announcement of the form:
+
+   ```
+   → <step-id> · <owner> · <model> · <skill>
+   ```
+
+   In addition, the `Agent` tool's `description` parameter MUST embed
+   the step id and model, format `<step-id> · <model> · <short title>`
+   (e.g. `step-01 · opus · docs/09 routing`): the harness's task panel
+   below the user's input field renders the description, so embedding
+   the model there is what makes the fleet's model composition visible
+   live. This complements the `→` announcement line; it does not
+   replace it.
 
 ---
 
@@ -298,6 +348,14 @@ work produce a bounded contract block parsed by
   conductor read pattern. The conductor never reads raw Codex
   prose.
 
+**Cross-family verification.** The verifier should be a *different*
+model family than the implementer. When the Grok lane is configured
+(the `grok` CLI is installed and authenticated), `codex-impl` steps are
+verified via `run-grok-verify.sh`, while `grok-impl` and `claude-impl`
+steps are verified via `run-codex-verify.sh`. **Fallback:** whenever the
+`grok` binary is unavailable (wrapper exit code 4), verification falls
+back to `run-codex-verify.sh` — the pre-Grok behavior.
+
 There are **no signed receipts, no HMAC sidecars, no digester
 subagent** in v2. See `docs/01-philosophy.md` for the rationale.
 
@@ -312,7 +370,15 @@ Two model-selection regimes coexist, and they must not be confused:
   runs its machine default on the impl/verify side. The Codex wrappers
   MUST NOT pass `--model` / `-m`: `scripts/run-codex-impl.sh` and
   `scripts/run-codex-verify.sh` invoke `codex exec` without one, and no
-  caller adds it.
+  caller adds it. The Grok wrappers pin `-m grok-build` in-script —
+  the subscription's Grok 4.5-backed coding model — because the CLI
+  default is user-configurable (`~/.grok/config.toml`) and the raw
+  `grok-4.5` model id bills xAI API credits instead of the subscription
+  pool. The verify wrapper additionally enforces read-only via
+  `--deny 'Write' --deny 'Edit' --deny 'Bash'`. The invariant is the
+  same for both pairs:
+  **callers never supply a model to either wrapper pair**; the model is
+  the wrapper's business, not the conductor's.
 - **Claude-side implementation sub-agents — scorecard, not lock.** The
   conductor selects each implementation sub-agent's model via the
   `Agent` tool's `model` field per the Model Scorecard above (Opus

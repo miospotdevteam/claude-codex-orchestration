@@ -10,6 +10,10 @@ This document specifies the wrappers, the prompt contract, and the
 parsing rules. It explicitly does **not** specify receipts, sidecars,
 or digesters — v2 has none of those.
 
+Scope note: this document specifies the Codex lane; the Grok lane is
+specified in `docs/10-grok-integration.md`, and cross-family verification
+policy lives in `docs/09-routing-matrix.md`.
+
 ## Why wrappers, not direct invocation
 
 v1 let the conductor build Codex prompts ad-hoc. Two failure modes

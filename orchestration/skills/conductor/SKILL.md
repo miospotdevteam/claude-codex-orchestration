@@ -11,29 +11,42 @@ central invariant is that **the conductor dispatches; it does not do
 the heavy work itself**. This skill is the contract for that
 invariant.
 
-## Hard rule: Codex verification is Claude-session-dispatched
+## Hard rule: verification is cross-family and Claude-session-dispatched
 
-**Every `codex-impl` step gets a Claude-session-dispatched verify via
-`run-codex-verify.sh`. Codex never calls the bridge directly.**
+**Every implementation step gets a Claude-session-dispatched verify
+whose model family differs from the implementer's. The verifier
+wrapper never calls the bridge directly.**
+
+The cross-family policy:
+
+- `codex-impl` steps are verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` when the Grok lane
+  is configured; the implementer is Codex, so the verifier is Grok.
+- `grok-impl` and `claude-impl` steps are verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`; the implementer
+  is Grok or Claude, so the verifier is Codex.
+- The invariant: the verifier is always a **different model family**
+  than the implementer.
+- If a grok wrapper exits 4 (the grok binary is unavailable), fall
+  back to `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` and note
+  the fallback in the step's `progress.json` `deviations`.
 
 BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
 `claude-bridge` MCP call-back tools (`verify_step`,
 `frontend_implement`, `attack_plan`). The conductor MUST NOT instruct
-Codex to call any of those tools. The contract is:
+Codex or Grok to call any of those tools. The contract is:
 
-1. Codex emits the bounded contract block defined by
+1. The verifier emits the bounded contract block defined by
    `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh`.
-2. The conductor (this Claude session) dispatches
-   `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` via the
-   `codex-dispatch` skill to verify the step.
+2. The conductor (this Claude session) dispatches the cross-family
+   verify wrapper via the `codex-dispatch` skill to verify the step.
 3. The conductor reads only the parsed JSON from the wrapper; it
-   never reads raw Codex stdout.
+   never reads raw wrapper stdout.
 
-This rule applies to every step with `owner: codex-impl`, and to
-`claude-impl` steps that need a verifier pass after the
-`general-purpose` sub-agent finishes. Any prose, plan template, or
-sub-agent prompt that asks Codex to call a bridge MCP tool is a bug —
-re-dispatch with the contract-block instruction instead.
+This rule applies to every implementation step. Any prose, plan
+template, or sub-agent prompt that asks Codex or Grok to call a bridge
+MCP tool is a bug — re-dispatch with the contract-block instruction
+instead.
 
 ## Hard rule: always fix findings and re-verify
 
@@ -65,11 +78,11 @@ the conductor's job, not the user's.
 
 ## Hard rule: implementation sub-agent model follows the scorecard
 
-**Every Claude sub-agent the conductor dispatches for implementation
-work MUST carry an explicit `model` on the `Agent` tool, chosen per the
-routing matrix's Model Scorecard.** No silent defaults for execution.
-The conductor's own model is whatever the user is running; the tiers
-below govern *dispatched* implementation sub-agents.
+**Every Claude sub-agent the conductor dispatches MUST carry an
+explicit `model` on the `Agent` tool — including read-only scouts —
+chosen per the routing matrix's Model Scorecard.** No silent defaults,
+anywhere. The conductor's own model is whatever the user is running;
+the tiers below govern *dispatched* sub-agents.
 
 The tiers:
 
@@ -86,16 +99,47 @@ The tiers:
   read-heavy scouting or mechanical Claude-side work where taste does
   not ship. It is never the owner of code that lands.
 - **Never Haiku** for execution or verification.
-- Read-only sub-agents (`Explore`, `Plan`) MAY default to whatever the
-  agent definition specifies; this rule governs *implementation*
-  dispatches.
+- Read-only scouts (`Explore`, `Plan`) MUST carry an explicit
+  `model: "sonnet"` — cheap read-heavy scouting is exactly Sonnet's
+  lane. They never inherit the agent definition's default silently.
 - Codex dispatches (`codex-impl` / verify) are unaffected — Codex is a
   separate model under `codex-dispatch`'s wrappers, not a Claude
   sub-agent, and its wrappers never take a `-m` flag.
 
-Any implementation dispatch that omits an explicit `model`, uses Haiku,
-or defaults to Sonnet for shipping code is a bug. Self-correct by
-re-dispatching at the right tier before consuming the result.
+Any dispatch that omits an explicit `model`, uses Haiku, or defaults to
+Sonnet for shipping code is a bug. Silent session-model inheritance is
+a bug anywhere — scouts included. Self-correct by re-dispatching at the
+right tier before consuming the result.
+
+## Hard rule: announce every dispatch
+
+**Every dispatch — an `Agent` tool call OR a wrapper script — emits one
+user-visible line before it fires.** Exact format:
+
+```
+→ <step-id> · <owner> · <model> · <skill>
+```
+
+- Omit the `· <skill>` segment when the step has no `skill`.
+- For `Agent` dispatches, `<model>` is the explicit `model` from the
+  scorecard rule above.
+- For wrapper dispatches (`run-codex-*.sh`, `run-grok-*.sh`),
+  `<model>` is pinned in-script (Codex: machine default, no flag; Grok:
+  `-m grok-build`); callers never pass one. Announcement examples stay
+  `codex machine default` and `grok-build`.
+
+For `Agent` dispatches, the tool's `description` parameter MUST also
+embed the step id and model, format `<step-id> · <model> · <short
+title>` (e.g. `step-02 · opus · conductor skill`). The harness task
+panel renders the description under the user's input field, so this is
+what makes each sub-agent's model visible live — it complements the
+`→` announcement line and the durable `progress.json` dispatch record.
+
+The line is for the user's live visibility only. The **durable**
+record is the `dispatch` object written into `progress.json` when the
+step flips to `in_progress`: `{executor, model, startedAt}`. The
+announcement line is transient; the `dispatch` object is the audit
+trail.
 
 ## The dispatch-only rule
 
@@ -224,9 +268,14 @@ The conductor:
 
 Per-step routing:
 
-- `owner: codex-impl` → `codex-dispatch` with `run-codex-impl.sh`.
+- `owner: codex-impl` → `codex-dispatch` with `run-codex-impl.sh`;
+  verified cross-family via `run-grok-verify.sh`.
+- `owner: grok-impl` → `codex-dispatch` with `run-grok-impl.sh` (the
+  `codex-dispatch` skill owns both wrapper lanes); verified
+  cross-family via `run-codex-verify.sh`.
 - `owner: claude-impl` → dispatch `general-purpose` sub-agent to
-  implement, then `codex-dispatch` with `run-codex-verify.sh`.
+  implement, then `codex-dispatch` with `run-codex-verify.sh`
+  (Codex verifies Claude — a different family).
 - `owner: manual` → flip `blocked` with a note; continue with the
   rest of the frontier.
 
@@ -320,6 +369,7 @@ re-fetched. The plan files contain everything.
 | `general-purpose` sub-agent | One message: summary of work + paths touched |
 | `Plan` sub-agent | One message: structured plan proposal (steps, file lists, tradeoffs) |
 | Codex (via wrappers) | One parsed JSON: `{summary, verdict, findings, filesTouched}` |
+| Grok (via wrappers) | One parsed JSON: `{summary, verdict, findings, filesTouched}` |
 | Hook (`session-start` / `post-compact`) | Short markdown notice (≤ 12 lines) |
 
 Anything outside these shapes is a bug. Re-dispatch with a tighter

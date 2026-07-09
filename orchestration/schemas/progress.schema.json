@@ -42,6 +42,30 @@
       "type": "string",
       "minLength": 1
     },
+    "dispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executor",
+        "model"
+      ],
+      "properties": {
+        "executor": {
+          "enum": [
+            "codex",
+            "grok",
+            "claude"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
     "stepProgress": {
       "type": "object",
       "additionalProperties": false,
@@ -70,8 +94,12 @@
           "enum": [
             "codex-impl",
             "claude-impl",
+            "grok-impl",
             "manual"
           ]
+        },
+        "dispatch": {
+          "$ref": "#/$defs/dispatch"
         },
         "verdict": {
           "enum": [

@@ -8,9 +8,10 @@ This document is the spec for that invariant. It defines the dispatch
 rule, the allowed read set, the forbidden read set, and the bounded
 outputs the conductor consumes.
 
-See also: `AGENTS.md` (the three roles), `04-execution-loop.md` (how the
+See also: `AGENTS.md` (the roles), `04-execution-loop.md` (how the
 conductor drives the runtime), `06-codex-integration.md` (the bounded
-Codex contract).
+Codex lane), `10-grok-integration.md` (the Grok lane), and
+`09-routing-matrix.md` (cross-family verification policy).
 
 ## The dispatch-only rule
 
@@ -24,10 +25,11 @@ Concretely:
   goes to an `Explore` sub-agent. The sub-agent returns one summary
   message.
 - **Implementation that touches more than ~3 files or requires sustained
-  context** goes to Codex (`run-codex-impl.sh`) or to a `general-purpose`
-  sub-agent.
-- **Verification of a non-trivial change** goes to Codex
-  (`run-codex-verify.sh`). The conductor reads the parsed Verdict.
+  context** goes to Codex (`run-codex-impl.sh`), Grok
+  (`run-grok-impl.sh`; see `10-grok-integration.md`), or to a
+  `general-purpose` sub-agent.
+- **Verification of a non-trivial change** follows the cross-family policy
+  in `09-routing-matrix.md`. The conductor reads the parsed Verdict.
 
 Surgical operations the conductor *does* handle directly:
 
@@ -56,10 +58,10 @@ exists because it is **bounded by construction**.
 4. **Sub-agent return messages.** The sub-agent's prompt instructs it
    to return a single bounded summary. The conductor reads that
    summary, not the sub-agent's intermediate work.
-5. **Codex Summary / Verdict / Findings blocks.** Bounded by the
-   wrapper's prompt contract — see `06-codex-integration.md`. The
-   conductor parses the contract block from Codex's stdout and ignores
-   anything else.
+5. **Codex/Grok Summary / Verdict / Findings blocks.** Bounded by the
+   wrapper's prompt contract — see `06-codex-integration.md` and
+   `10-grok-integration.md`. The conductor parses the contract block
+   and ignores anything else.
 6. **Targeted small file reads (≤ 200 lines)** when the conductor has a
    specific question and knows the path. Reading a config, a type
    definition, or a single function is fine.
@@ -68,25 +70,26 @@ exists because it is **bounded by construction**.
 ## What the conductor MUST NOT read
 
 These categories blow the context budget and should always be pushed
-down to a sub-agent or Codex.
+down to a sub-agent or an external wrapper lane.
 
 1. **Raw exploration dumps.** If a sub-agent's prompt would naturally
    produce a long list of grep matches, that lives inside the sub-agent.
    The conductor reads only the synthesized summary.
-2. **Raw Codex `stdout` / stream files.** Codex may emit verbose
-   reasoning, tool traces, or partial drafts. The conductor reads only
-   the parsed Summary / Verdict / Findings block (see contract below).
+2. **Raw Codex/Grok `stdout` / stream files.** External wrappers may
+   emit verbose reasoning, tool traces, or partial drafts. The conductor
+   reads only the parsed Summary / Verdict / Findings block (see
+   contract below).
    The raw stream may be written to disk for debugging but is not part
    of the conductor's read set.
 3. **Full `git diff` output** for non-trivial changes. The conductor
-   either trusts the Codex verifier's Verdict, or asks a sub-agent for
+   either trusts the external verifier's Verdict, or asks a sub-agent for
    a bounded summary of the diff (e.g., "describe the changes to
    `src/auth/*` in 10 bullets"). It does not page through diff hunks.
 4. **Files larger than ~500 lines** without a specific question in
    mind. Open-ended reads of large files are a sub-agent's job.
-5. **Past Codex calls' verbose logs.** Once a step is marked done in
-   `progress.json`, its logs are archived. The conductor does not
-   re-read them.
+5. **Past external-wrapper calls' verbose logs.** Once a step is marked
+   done in `progress.json`, its logs are archived. The conductor does
+   not re-read them.
 
 These prohibitions are not enforced by a hook. They are enforced by
 the conductor skill's prompt and by the user catching drift in
@@ -109,7 +112,7 @@ conductor's `Agent` call always specifies:
 The sub-agent runs whatever queries it needs internally; the conductor
 sees only the final message.
 
-### From Codex (impl and verify)
+### From external wrappers (Codex and Grok)
 
 A fixed block in the response:
 
@@ -122,11 +125,11 @@ Findings:
   ...
 ```
 
-The conductor parses these three fields and ignores everything else
-Codex emitted. There is no receipt to validate, no signature to check,
-no digester to invoke. The bound is the prompt contract; the contract
-is enforced by the wrapper. See `06-codex-integration.md` for the
-exact prompt and parsing rules.
+The conductor parses these three fields and ignores everything else the
+wrapper emitted. There is no receipt to validate, no signature to
+check, no digester to invoke. The bound is the prompt contract; the
+contract is enforced by the wrapper. See `06-codex-integration.md` and
+`10-grok-integration.md` for the exact prompt and parsing rules.
 
 ### From hooks
 
@@ -159,9 +162,9 @@ For anything larger, dispatch.
 - **Sub-agent returns more than its budget.** Re-dispatch with a
   tighter prompt. Do not paste the over-large summary into context to
   "summarize it" — that defeats the boundary.
-- **Codex returns no contract block.** The wrapper retries once with a
-  reminder. If still missing, the conductor reports the failure to the
-  user and asks how to proceed; it does not guess.
+- **External wrapper returns no contract block.** The wrapper retries
+  once with a reminder. If still missing, the conductor reports the
+  failure to the user and asks how to proceed; it does not guess.
 - **Plan and progress disagree.** `progress.json` is the source of
   truth for state. If `plan.json` is missing a step that
   `progress.json` references, that's a bug in `writing-plans` and

@@ -91,7 +91,10 @@ Field reference:
 - **`dependsOn`** — array of step IDs that must be `done` before this
   step is runnable. Defines the DAG (see below).
 - **`owner`** — who executes: `codex-impl` (default), `claude-impl`
-  (the conductor implements via a sub-agent), or `manual` (the user).
+  (the conductor implements via a sub-agent), `grok-impl` (implemented
+  by Grok 4.5 via the direction-locked Grok Build wrappers — see
+  `docs/10-grok-integration.md`; routing rules in
+  `docs/09-routing-matrix.md`), or `manual` (the user).
 - **`skill`** — the discipline skill the executor should invoke for
   this step. From `05-skills-catalog.md`. Optional.
 - **`estimateMinutes`** — wall-clock estimate. Optional, advisory.
@@ -161,8 +164,13 @@ This is the only runtime-mutable file. Schema:
     },
     "step-3": {
       "status": "in_progress",
-      "owner": "codex-impl",
-      "startedAt": "2026-05-11T15:30:00Z"
+      "owner": "grok-impl",
+      "startedAt": "2026-05-11T15:30:00Z",
+      "dispatch": {
+        "executor": "grok",
+        "model": "grok-build",
+        "startedAt": "2026-05-11T15:30:00Z"
+      }
     },
     "step-4": {
       "status": "pending"
@@ -170,6 +178,34 @@ This is the only runtime-mutable file. Schema:
   }
 }
 ```
+
+### Dispatch record
+
+When a step flips to `in_progress`, the conductor writes an optional
+`dispatch` object alongside `startedAt`:
+
+```json
+"step-5": {
+  "status": "in_progress",
+  "owner": "claude-impl",
+  "startedAt": "2026-05-11T15:44:00Z",
+  "dispatch": {
+    "executor": "claude",
+    "model": "opus",
+    "startedAt": "2026-05-11T15:44:00Z"
+  }
+}
+```
+
+- **`executor`** — one of `codex` | `grok` | `claude`.
+- **`model`** — the model identifier that ran the step (e.g. `opus`,
+  `gpt-5-codex`, `grok-build`).
+- **`startedAt`** — ISO-8601 UTC timestamp of the dispatch.
+
+`dispatch` is the durable record of *which* model did the work, pairing
+with the conductor's user-visible dispatch announcement. It is
+overwritten on re-dispatch, so it always reflects the dispatch that
+produced the recorded verdict.
 
 ### Status values
 

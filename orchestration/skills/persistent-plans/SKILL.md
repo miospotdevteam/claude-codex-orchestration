@@ -80,6 +80,14 @@ After every status change, recompute the frontier and write it to
 parallel by default, serialized when two runnable steps overlap on
 files — see `codex-dispatch`).
 
+Flipping a step to `in_progress` records a `dispatch` object —
+`{executor, model, startedAt}`, with `executor` one of
+`codex` | `grok` | `claude` — alongside the step's `startedAt`. It is
+overwritten on re-dispatch, so it always names the model behind the
+recorded verdict. On resumption, the conductor surfaces in-flight
+steps' dispatch info in its status line, so the user can see which
+models were mid-flight when the prior session ended.
+
 ## Resumption protocol
 
 When a fresh context window starts (cold start or post-compaction):

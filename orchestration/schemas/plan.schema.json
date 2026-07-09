@@ -116,6 +116,7 @@
           "enum": [
             "codex-impl",
             "claude-impl",
+            "grok-impl",
             "manual"
           ]
         },

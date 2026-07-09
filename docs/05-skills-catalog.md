@@ -122,29 +122,44 @@ from a completed discovery, then drive the Orbit review.
 
 ## 5. `codex-dispatch`
 
-**One-line**: Invoke Codex through the direction-locked wrappers and
-parse the bounded Summary / Verdict / Findings contract block.
+**One-line**: The single wrapper-dispatch authority — owns **both** the
+Codex and Grok direction-locked wrapper lanes, invoking each executor
+through its wrappers and parsing the bounded Summary / Verdict /
+Findings contract block. (No tenth skill: Grok is dispatched from here;
+the catalog stays at nine.)
 
 **Triggers**
-- A plan step with `owner: codex-impl` is on the frontier.
-- A step's executor needs verification (`run-codex-verify.sh`).
-- The conductor needs an out-of-band Codex check (rare).
+- A plan step with `owner: codex-impl` or `owner: grok-impl` is on the
+  frontier.
+- A step's executor needs verification — cross-family per
+  `docs/09-routing-matrix.md` (`run-grok-verify.sh` for `codex-impl`
+  when the Grok lane is configured; `run-codex-verify.sh` for
+  `grok-impl` / `claude-impl` and as the fallback).
+- The conductor needs an out-of-band Codex or Grok check (rare).
 
 **Anti-triggers**
-- The step's `owner` is `claude-impl` or `manual`.
+- Implementing a step whose `owner` is `claude-impl` or `manual` —
+  verifying finished `claude-impl` work still fires this skill (via
+  `run-codex-verify.sh` per the cross-family policy).
 - Tasks that don't go through the plan system (free-form
   conversation).
 
 **Responsibilities**
-- Choose `run-codex-impl.sh` vs `run-codex-verify.sh` based on the
-  step's owner — never mix.
+- Choose the wrapper by direction *and* family: `run-codex-impl.sh` /
+  `run-grok-impl.sh` for IMPLEMENT, `run-codex-verify.sh` /
+  `run-grok-verify.sh` for VERIFY — never mix. The Grok wrappers take
+  the identical CLI shape and emit the same parsed JSON as the Codex
+  ones; only the underlying CLI differs.
 - Build the prompt from `step.description`, `step.acceptanceCriteria`,
   and `step.files`.
 - Parse the contract block out of stdout. Reject and retry once if
   the block is missing.
+- On Grok exit 4 (`grok` not on PATH): fall verification back to
+  `run-codex-verify.sh` and record the deviation; flip a `grok-impl`
+  step `blocked` with reason `grok-unavailable`.
 - Write the parsed verdict, findings, and files-touched into
   `progress.json`.
-- Never read raw Codex stream output or treat unparsed text as
+- Never read raw Codex or Grok stream output or treat unparsed text as
   authoritative.
 
 ---

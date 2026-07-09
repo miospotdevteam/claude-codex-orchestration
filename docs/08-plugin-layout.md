@@ -29,7 +29,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
 ├── LICENSE                              ← MIT
 ├── install.sh                           ← conditional uninstall + install via claude CLI
 ├── docs/                                ← design spec (markdown only)
-│   ├── 01-philosophy.md … 09-routing-matrix.md
+│   ├── 01-philosophy.md … 10-grok-integration.md
 │
 └── orchestration/                       ← plugin root (source: "./orchestration")
     ├── .claude-plugin/
@@ -67,6 +67,8 @@ claude-codex-orchestration/              ← repo root = marketplace root
     ├── scripts/                         ← codex wrappers + utilities
     │   ├── run-codex-impl.sh
     │   ├── run-codex-verify.sh
+    │   ├── run-grok-impl.sh
+    │   ├── run-grok-verify.sh
     │   ├── plan-utils.sh                ← read/write helpers for plan files
     │   └── parse-contract.sh            ← extract the contract block
     │
@@ -83,7 +85,9 @@ claude-codex-orchestration/              ← repo root = marketplace root
         │   └── post-compact.test.sh
         └── scripts/
             ├── parse-contract.test.sh
-            └── plan-utils.test.sh
+            ├── plan-utils.test.sh
+            ├── run-grok-impl.test.sh
+            └── run-grok-verify.test.sh
 ```
 
 Notes on shape:
@@ -249,6 +253,8 @@ Cross-reference: which doc(s) inform which file.
 | Other `skills/*/SKILL.md` (core and auxiliary) | `05-skills-catalog.md` (+ skill-specific docs)            |
 | `scripts/run-codex-impl.sh`                    | `06-codex-integration.md`                                 |
 | `scripts/run-codex-verify.sh`                  | `06-codex-integration.md`                                 |
+| `scripts/run-grok-impl.sh`                     | `10-grok-integration.md`                                  |
+| `scripts/run-grok-verify.sh`                   | `10-grok-integration.md`                                  |
 | `scripts/plan-utils.sh`                        | `03-plan-format.md`                                       |
 | `scripts/parse-contract.sh`                    | `06-codex-integration.md`                                 |
 | `schemas/plan.schema.json`                     | `03-plan-format.md`                                       |
@@ -257,6 +263,8 @@ Cross-reference: which doc(s) inform which file.
 | `tests/hooks/*.test.sh`                        | `07-hooks.md`                                             |
 | `tests/scripts/parse-contract.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
+| `tests/scripts/run-grok-impl.test.sh`          | `10-grok-integration.md`                                  |
+| `tests/scripts/run-grok-verify.test.sh`        | `10-grok-integration.md`                                  |
 
 ## Implementation order
 
@@ -270,15 +278,18 @@ A sensible build sequence:
    parser. Independent of Codex itself; testable with fixtures.
 4. **`scripts/run-codex-impl.sh` and `run-codex-verify.sh`** — the
    wrappers, once the parser is solid.
-5. **`hooks/session-start.sh` + `post-compact.sh` + tests** — both
+5. **`scripts/run-grok-impl.sh` and `run-grok-verify.sh`** — the
+   Grok wrappers, mirroring the Codex wrapper shape once the parser
+   is solid.
+6. **`hooks/session-start.sh` + `post-compact.sh` + tests** — both
    thin and similar. Reuse `plan-utils.sh`.
-6. **`skills/`** — write `conductor`, `persistent-plans`, and
+7. **`skills/`** — write `conductor`, `persistent-plans`, and
    `codex-dispatch` first (they wire everything together), then the
    discipline skills.
-7. **`.claude-plugin/plugin.json`**, **`hooks/hooks.json`**, and
+8. **`.claude-plugin/plugin.json`**, **`hooks/hooks.json`**, and
    **`.claude-plugin/marketplace.json`** — the manifests. Trivial
    once the rest is solid.
-8. **`README.md`**, **`AGENTS.md`**, **`install.sh`** — last, when
+9. **`README.md`**, **`AGENTS.md`**, **`install.sh`** — last, when
    everything else is testable.
 
 ## What the implementer should NOT add

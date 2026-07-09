@@ -45,7 +45,7 @@ claude-codex-orchestration/      ← repo root = marketplace root
 ├── .claude/
 │   └── CLAUDE.md                ← context for any Claude session editing this repo
 ├── docs/                        ← the design spec (markdown only)
-│   ├── 01-philosophy.md … 09-routing-matrix.md
+│   ├── 01-philosophy.md … 10-grok-integration.md
 │
 └── orchestration/               ← plugin root (marketplace source: "./orchestration")
     ├── .claude-plugin/
@@ -53,7 +53,7 @@ claude-codex-orchestration/      ← repo root = marketplace root
     ├── skills/                  ← 9 core + 8 auxiliary skills
     ├── codex-skills/            ← Codex-side bodies for dual-install skills
     ├── hooks/                   ← hooks.json + two read-only handler scripts
-    ├── scripts/                 ← codex wrappers + plan/contract helpers
+    ├── scripts/                 ← codex/grok wrappers + plan/contract helpers
     ├── schemas/                 ← JSON schemas for plan + progress files
     ├── templates/               ← starter templates (e.g. masterPlan)
     └── tests/                   ← hook + script tests
@@ -149,17 +149,19 @@ purpose.
 
 ## Testing
 
-Run the four test suites against the helpers and hooks:
+Run the six test suites against the helpers and hooks:
 
 ```bash
 cd orchestration
 bash tests/scripts/parse-contract.test.sh    # 9 contract-block parsing cases
 bash tests/scripts/plan-utils.test.sh        # 6 plan-file helper cases
+bash tests/scripts/run-grok-impl.test.sh     # Grok impl wrapper cases
+bash tests/scripts/run-grok-verify.test.sh   # Grok verify wrapper cases
 bash tests/hooks/session-start.test.sh       # 5 session-start hook cases
 bash tests/hooks/post-compact.test.sh        # 4 post-compact hook cases
 ```
 
-All four suites use plain-bash assertions, sandbox under `mktemp -d`,
+All six suites use plain-bash assertions, sandbox under `mktemp -d`,
 and clean up after themselves. Each exits non-zero on any failure.
 
 Syntax / lint checks for the shell scripts:
@@ -188,6 +190,8 @@ The full design lives under `docs/`. Read in order:
 6. `docs/06-codex-integration.md` — wrappers + prompt contract.
 7. `docs/07-hooks.md` — what the two hooks may/may-not do.
 8. `docs/08-plugin-layout.md` — target tree + build order.
+9. `docs/09-routing-matrix.md` — model routing and verification lanes.
+10. `docs/10-grok-integration.md` — Grok wrappers + prompt contract.
 
 When you're working on the plugin, your own session is itself an
 exercise of the system: a non-trivial change should produce a plan

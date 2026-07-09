@@ -9,8 +9,9 @@ the phases, how parallel work is dispatched, and how a session
 resumes after compaction.
 
 See `02-conductor.md` for the dispatch rules, `03-plan-format.md` for
-the plan/progress schemas, and `06-codex-integration.md` for the
-Codex contract.
+the plan/progress schemas, `06-codex-integration.md` for the Codex lane,
+`10-grok-integration.md` for the Grok lane, and `09-routing-matrix.md`
+for cross-family verification policy.
 
 ## Phase 1 — Discovery
 
@@ -134,7 +135,10 @@ on `step.owner`:
   step description and acceptance criteria. The wrapper returns a
   Summary / Verdict / Findings block (see `06-codex-integration.md`).
 - **`claude-impl`** → dispatch a `general-purpose` sub-agent to
-  implement; then dispatch `run-codex-verify.sh` for verification.
+  implement; then dispatch verification per `09-routing-matrix.md`.
+- **`grok-impl`** → invoke `run-grok-impl.sh` with the step description
+  and acceptance criteria. See `10-grok-integration.md`; verification
+  follows `09-routing-matrix.md`.
 - **`manual`** → flip `progress` to `blocked` with a note for the
   user, and continue with the rest of the frontier.
 
@@ -159,9 +163,9 @@ problems.
 
 ## Phase 4 — Verify
 
-Verification is woven into Phase 3 — every step is verified by Codex
-as part of its dispatch — but there is also a **final verify** at the
-end:
+Verification is woven into Phase 3 — every step is verified according
+to the cross-family policy in `09-routing-matrix.md` as part of its
+dispatch — but there is also a **final verify** at the end:
 
 **Input**: `progress.json` with every step `done` or accounted for.
 
@@ -173,9 +177,9 @@ The conductor:
 1. Confirms every step is `done` / `skipped` / `blocked` and that the
    user has acknowledged the latter two.
 2. Runs project-level checks if defined (type-check, lint, test
-   suite). These are run via Codex (`run-codex-verify.sh` with the
-   project's verification command) or directly by the conductor for
-   short scripts.
+   suite). These are run via the applicable verifier wrapper from
+   `09-routing-matrix.md` or directly by the conductor for short
+   scripts.
 3. Reports back: what changed, what's flagged, what's outstanding.
 4. Moves the plan directory to `archive/`.
 
@@ -196,9 +200,9 @@ When the conductor wakes into a fresh context window:
 6. **Compute the frontier** using the runnable-frontier algorithm.
 7. **Resume** by dispatching the frontier as in Phase 3.
 
-No code is re-read, no exploration is re-run, no Codex output from
-prior steps is re-fetched. Everything needed to continue is in the
-three plan files.
+No code is re-read, no exploration is re-run, no external-wrapper
+output from prior steps is re-fetched. Everything needed to continue is
+in the three plan files.
 
 If the `post-compact` hook is missing or the user invoked the session
 fresh, the conductor falls back to scanning
@@ -219,8 +223,8 @@ skipping is the right call.
 
 ## Failure handling
 
-- **Codex unreachable** → step is `blocked` with reason
-  `codex-unavailable`. Conductor surfaces to user.
+- **External wrapper unreachable** → step is `blocked` with a
+  lane-specific unavailable reason. Conductor surfaces to user.
 - **Verifier returns FAIL twice in a row** → step is `blocked`. The
   conductor does not loop.
 - **Plan invariant violated** (cyclic deps, missing dep ID) → this is

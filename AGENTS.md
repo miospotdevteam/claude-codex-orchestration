@@ -6,10 +6,10 @@ This file documents the agents at work in the **`orchestration` plugin
 actors and their responsibilities so any session — human or model — can
 pick up the system without re-deriving it.
 
-The plugin defines **three roles**. Each has a different read budget, a
-different write budget, and a different escalation path. Confusing them
-is the most common source of bugs in orchestrated systems, so they are
-spelled out here.
+The plugin defines **three role families**. Each has a different read
+budget, a different write budget, and a different escalation path.
+Confusing them is the most common source of bugs in orchestrated
+systems, so they are spelled out here.
 
 ---
 
@@ -25,12 +25,12 @@ sweeps itself, and does not implement large changes inline.
 - `progress.json` (mutable step state, results, deviations)
 - `masterPlan.md` (human-facing proposal)
 - Sub-agent return messages (already bounded by the sub-agent's prompt)
-- Codex Summary / Verdict / Findings blocks (bounded by prompt contract)
+- Codex/Grok Summary / Verdict / Findings blocks (bounded by prompt contract)
 - Small targeted file reads (≤ 200 lines, when surgical context is needed)
 
 **Must not read**
 - Raw exploration dumps from sub-agents (the sub-agent summarizes)
-- Raw Codex `stdout` or stream files (use the parsed contract block)
+- Raw Codex/Grok `stdout` or stream files (use the parsed contract block)
 - Full `git diff` outputs (ask for a bounded summary instead)
 - Files larger than ~500 lines without a specific question in mind
 
@@ -39,7 +39,8 @@ sweeps itself, and does not implement large changes inline.
 - `Skill` (invoking discipline skills)
 - `TaskCreate` / `TaskList` family (tracking work)
 - `Read` / `Edit` / `Write` for small, surgical edits and the plan files
-- The Codex wrapper scripts (`run-codex-impl.sh`, `run-codex-verify.sh`)
+- The external wrapper scripts (`run-codex-impl.sh`, `run-codex-verify.sh`,
+  `run-grok-impl.sh`, `run-grok-verify.sh`)
 
 See `docs/02-conductor.md` for the full spec.
 
@@ -72,11 +73,11 @@ exploration.
 
 ---
 
-## 3. Codex (impl and verify)
+## 3. External wrapper lanes (Codex and Grok)
 
-Codex (`codex exec` CLI) is the third role: a separate model that runs
-under a strict direction lock. The conductor invokes Codex through one of
-two wrapper scripts, never directly:
+Codex (`codex exec` CLI) and Grok (`grok` CLI) are external execution
+lanes: separate models that run under strict direction locks. The
+conductor invokes each lane through wrapper scripts, never directly:
 
 - `run-codex-impl.sh` — Codex implements a step. Reads the step
   description and acceptance criteria; writes code; returns a Summary +
@@ -84,16 +85,20 @@ two wrapper scripts, never directly:
 - `run-codex-verify.sh` — Codex verifies a step the conductor (or a
   sub-agent) just implemented. Reads the diff and acceptance criteria;
   returns Summary + Verdict (PASS / FINDINGS / FAIL) + Findings[].
+- `run-grok-impl.sh` / `run-grok-verify.sh` — Grok mirrors the same
+  bounded lane; see `docs/10-grok-integration.md`.
 
 The wrappers exist so impl and verify can never be confused at the call
-site. Each script pins its system prompt, captures Codex's last message
-via `-o` (`--output-last-message`), and enforces the contract shape
-Codex must return.
+site. Each script pins its direction prompt and enforces the contract
+shape the lane must return; the Codex pair also captures Codex's last
+message via `-o` (`--output-last-message`).
 
 There are **no receipts, no HMAC sidecars, no digester sub-agent** in v2.
-The bound on Codex output is enforced by the prompt contract: the wrapper
+The bound on wrapper output is enforced by the prompt contract: the wrapper
 asks for a fixed shape, the conductor parses that shape, anything else is
-truncated or ignored. See `docs/06-codex-integration.md`.
+truncated or ignored. See `docs/06-codex-integration.md` for Codex,
+`docs/10-grok-integration.md` for Grok, and `docs/09-routing-matrix.md`
+for cross-family verification policy.
 
 ---
 
@@ -101,15 +106,16 @@ truncated or ignored. See `docs/06-codex-integration.md`.
 
 - Conductor → Sub-agent: when work would require reading too much, or
   exploring too widely, to fit in the main thread budget.
-- Conductor → Codex: when a step is well-defined enough to implement or
-  verify against acceptance criteria.
+- Conductor → Codex/Grok: when a step is well-defined enough to implement
+  or verify against acceptance criteria.
 - Sub-agent → Conductor: every sub-agent terminates with one summary
   message. No multi-turn dialogue.
-- Codex → Conductor: one bounded Summary/Verdict/Findings block per call.
+- Codex/Grok → Conductor: one bounded Summary/Verdict/Findings block per
+  call.
 
 If any role exceeds its read budget, the orchestration is broken. The
-remedy is always the same: push the reading down into a sub-agent or Codex,
-and keep the conductor's window clean.
+remedy is always the same: push the reading down into a sub-agent or an
+external wrapper lane, and keep the conductor's window clean.
 
 ---
 
@@ -134,12 +140,14 @@ The plugin's code lives at the repo root, alongside the design spec
   dual-install pattern. Currently only `react-native-mobile` ships a
   Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
   decides which side of a dual-install skill gets a given step.
-- **Codex wrappers** — `scripts/run-codex-impl.sh` (IMPLEMENT-direction)
-  and `scripts/run-codex-verify.sh` (VERIFY-direction). Both pin their
-  direction header in-script — the prompt body cannot override.
+- **External wrappers** — `scripts/run-codex-impl.sh` and
+  `scripts/run-grok-impl.sh` (IMPLEMENT-direction), plus
+  `scripts/run-codex-verify.sh` and `scripts/run-grok-verify.sh`
+  (VERIFY-direction). Each pins its direction header in-script — the
+  prompt body cannot override.
 - **Plan + contract utilities** — `scripts/plan-utils.sh` (read/write
   plan files atomically) and `scripts/parse-contract.sh` (extract the
-  Codex contract block).
+  shared external-wrapper contract block).
 - **Hooks** — `hooks/session-start.sh` (active-plan notice on session
   open) and `hooks/post-compact.sh` (resumption notice after
   compaction). Both read-only, always exit 0. Event mapping lives in
@@ -153,7 +161,8 @@ The plugin's code lives at the repo root, alongside the design spec
 - **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
 
 The full design spec sits under `docs/01-philosophy.md` …
-`docs/08-plugin-layout.md`. Read `docs/02-conductor.md` for the
-conductor's full contract, `docs/06-codex-integration.md` for the
-wrapper prompt contract, and `docs/05-skills-catalog.md` for each
-skill's responsibilities.
+`docs/10-grok-integration.md`. Read `docs/02-conductor.md` for the
+conductor's full contract, `docs/06-codex-integration.md` and
+`docs/10-grok-integration.md` for wrapper lane contracts,
+`docs/09-routing-matrix.md` for cross-family verification policy, and
+`docs/05-skills-catalog.md` for each skill's responsibilities.
