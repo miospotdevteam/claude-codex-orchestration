@@ -3,6 +3,7 @@
 # miospotdevteam/claude-codex-orchestration marketplace.
 #
 # Idempotent:
+#   - Removes the legacy v1 plugin and marketplace when present.
 #   - Uninstalls the plugin if already installed.
 #   - Adds the marketplace if not already registered; updates it if it is.
 #   - Then installs (or reinstalls) the plugin.
@@ -22,6 +23,9 @@ PLUGIN_NAME='orchestration'
 MARKETPLACE_NAME='claude-codex-orchestration'
 MARKETPLACE_SOURCE='miospotdevteam/claude-codex-orchestration'
 PLUGIN_ID="${PLUGIN_NAME}@${MARKETPLACE_NAME}"
+LEGACY_MARKETPLACE_NAME='claude-code-setup'
+LEGACY_PLUGIN_NAME='look-before-you-leap'
+LEGACY_PLUGIN_ID="${LEGACY_PLUGIN_NAME}@${LEGACY_MARKETPLACE_NAME}"
 
 log()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -43,8 +47,10 @@ ok "prereqs OK"
 # ---- step 1: uninstall current plugin if present ----------------------------
 
 is_plugin_installed() {
+  local plugin_name="${1:-$PLUGIN_NAME}"
+  local plugin_id="${2:-$PLUGIN_ID}"
   claude plugin list --json 2>/dev/null \
-    | jq -e --arg id "$PLUGIN_ID" --arg name "$PLUGIN_NAME" '
+    | jq -e --arg id "$plugin_id" --arg name "$plugin_name" '
         def plugin_values:
           if type == "array" then .[]
           elif type == "object" then .
@@ -65,7 +71,13 @@ is_plugin_installed() {
       ' >/dev/null 2>&1
 }
 
-if is_plugin_installed; then
+if is_plugin_installed "$LEGACY_PLUGIN_NAME" "$LEGACY_PLUGIN_ID"; then
+  log "legacy plugin '$LEGACY_PLUGIN_NAME' is installed — uninstalling"
+  claude plugin uninstall "$LEGACY_PLUGIN_NAME" -y
+  ok "uninstalled legacy plugin '$LEGACY_PLUGIN_NAME'"
+fi
+
+if is_plugin_installed "$PLUGIN_NAME" "$PLUGIN_ID"; then
   log "plugin '$PLUGIN_NAME' is currently installed — uninstalling"
   claude plugin uninstall "$PLUGIN_NAME" -y
   ok "uninstalled '$PLUGIN_NAME'"
@@ -76,13 +88,20 @@ fi
 # ---- step 2: add or update the marketplace ---------------------------------
 
 is_marketplace_added() {
+  local marketplace_name="${1:-$MARKETPLACE_NAME}"
   # `claude plugin marketplace list` prints text. Look for the marketplace
   # name as a token; the format is "  ❯ <name>" followed by "Source: ...".
   claude plugin marketplace list 2>/dev/null \
-    | grep -qE "^[[:space:]]*[❯>*•-]?[[:space:]]*${MARKETPLACE_NAME}([[:space:]]|$)"
+    | grep -qE "^[[:space:]]*[❯>*•-]?[[:space:]]*${marketplace_name}([[:space:]]|$)"
 }
 
-if is_marketplace_added; then
+if is_marketplace_added "$LEGACY_MARKETPLACE_NAME"; then
+  log "removing legacy marketplace '$LEGACY_MARKETPLACE_NAME'"
+  claude plugin marketplace remove "$LEGACY_MARKETPLACE_NAME"
+  ok "legacy marketplace removed"
+fi
+
+if is_marketplace_added "$MARKETPLACE_NAME"; then
   log "marketplace '$MARKETPLACE_NAME' is already registered — updating to latest"
   claude plugin marketplace update "$MARKETPLACE_NAME"
   ok "marketplace updated"

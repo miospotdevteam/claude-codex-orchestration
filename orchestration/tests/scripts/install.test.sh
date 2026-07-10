@@ -90,10 +90,12 @@ setup_case() {
     '      printf "[]\n"' \
     '    fi' \
     '    ;;' \
-    '  "plugin marketplace list") printf "  * claude-codex-orchestration\n" ;;' \
+    '  "plugin marketplace list") printf "  * claude-code-setup\n  * claude-codex-orchestration\n" ;;' \
+    '  "plugin marketplace remove claude-code-setup") ;;' \
     '  "plugin marketplace update claude-codex-orchestration") ;;' \
     '  "plugin install orchestration@claude-codex-orchestration") : >"$INSTALL_MARKER" ;;' \
     '  "plugin uninstall orchestration -y") ;;' \
+    '  "plugin uninstall look-before-you-leap -y") ;;' \
     '  "plugin list") printf "orchestration enabled\n" ;;' \
     '  *) printf "unexpected claude command: %s\n" "$*" >&2; exit 64 ;;' \
     'esac'
@@ -279,11 +281,53 @@ test_ambiguous_install_paths_fail_before_cleanup() {
   fi
 }
 
+test_legacy_claude_marketplace_is_removed() {
+  local name='legacy Claude marketplace is removed before orchestration install'
+  setup_case legacy-marketplace
+  populate_artifact "$CACHE_ONE" CACHE
+  populate_stale_checkout
+  jq -n --arg path "$CACHE_ONE" \
+    '{plugins:{orchestration:{installPath:$path}}}' >"$LISTING_FILE"
+
+  run_installer
+  if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $INSTALL_STATUS; stderr=$(<"$STDERR_FILE")"
+  elif ! grep -Fqx 'plugin marketplace remove claude-code-setup' "$COMMAND_LOG"; then
+    fail "$name" 'installer did not remove the legacy Claude marketplace'
+  else
+    pass "$name"
+  fi
+}
+
+test_legacy_claude_plugin_is_uninstalled() {
+  local name='legacy Claude plugin is uninstalled before marketplace removal'
+  setup_case legacy-plugin
+  populate_artifact "$CACHE_ONE" CACHE
+  populate_stale_checkout
+  jq -n --arg path "$CACHE_ONE" \
+    '{plugins:{
+      orchestration:{installPath:$path},
+      "look-before-you-leap":{installPath:"/tmp/legacy-plugin"}
+    }}' >"$LISTING_FILE"
+  : >"$INSTALL_MARKER"
+
+  run_installer
+  if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $INSTALL_STATUS; stderr=$(<"$STDERR_FILE")"
+  elif ! grep -Fqx 'plugin uninstall look-before-you-leap -y' "$COMMAND_LOG"; then
+    fail "$name" 'installer did not uninstall the legacy Claude plugin'
+  else
+    pass "$name"
+  fi
+}
+
 test_plugin_id_keyed_cache_is_the_only_source
 test_bare_name_keyed_cache_is_supported
 test_array_id_listing_is_supported
 test_missing_install_path_fails_before_cleanup
 test_ambiguous_install_paths_fail_before_cleanup
+test_legacy_claude_marketplace_is_removed
+test_legacy_claude_plugin_is_uninstalled
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
