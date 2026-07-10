@@ -78,6 +78,31 @@ field on the `Agent` tool. Codex and Grok are each reached only through
 their direction-locked wrappers; callers never supply a model to either
 wrapper pair (see *Machine defaults* at the bottom of this doc).
 
+### Measured evidence (2026-07 routing eval)
+
+The scorecard above is priors plus measurement. What the eval runs
+(`docs/11-routing-eval.md`; results stay local under `eval/results/`)
+actually established:
+
+- **Correctness parity on clear specs.** codex/sol, grok, and opus
+  were unanimously perfect across two hard adversarial tasks and a
+  375,000-operation differential fuzzer. At frontier tier, correctness
+  cannot rank implementers — so clear-spec implementation routing is
+  an **economics** decision (marginal cost, off-context execution,
+  parallel lanes), which is exactly the Codex-default policy. The
+  policy stands on measurement now, not on an intelligence prior.
+- **Codex taste is task-dependent; rating unchanged.** Measured at
+  parity with Opus on data-model-heavy design (4.89 vs 4.97 blind
+  panel) but far below on business-logic / tool-surface design
+  (3.65 vs 5.00). The scorecard keeps `taste: low` until a wider
+  corpus confirms the split; the taste-escalation rule stays as-is.
+- **Judge honesty differs by family.** Blind self-scoring
+  (harshness-adjusted): codex **+0.30**, fable **+0.47**; grok
+  **−0.04**, opus **−0.06**. This grounds the cross-family
+  verification rule and the arbitration guard in Hard Boundary 10.
+- **Panel planning beats solo and relay** — see the Panel Planning
+  section below.
+
 ### grok-impl vs codex-impl
 
 Both are off-context external implementers; the routing question is
@@ -139,7 +164,7 @@ ownership: every step has exactly one `owner` and one `mode`.
 | **Product copy / UX text / content** | `claude` | `claude-impl` | Skill `doc-coauthoring`. |
 | **Creative / landing page / marketing** | `claude` | `claude-impl` | Skill `frontend-design` / `immersive-frontend` / `svg-art`. |
 | **Brainstorming / requirements shaping** | `claude` | `claude-impl` | Skill `brainstorming`. Codex co-explores in parallel and reviews `design.md` before `writing-plans`. |
-| **Plan writing** | `claude` | `claude-impl` | Skill `writing-plans`. Codex participates in plan consensus. |
+| **Plan writing** | `claude` | `claude-impl` | Skill `writing-plans`. High-ambiguity tasks trigger **automatic panel planning** (see the Panel Planning section below). |
 | **Documentation / API docs / specs** | `claude` | `claude-impl` | Skill `doc-coauthoring`. Codex verifies technical accuracy via `run-codex-verify.sh` contract block. |
 | **MCP / DB / API / external integration** | `codex` | `codex-impl` | If the step is purely external-facing design (no code), it may be `claude-impl` with explicit justification. Otherwise split into design step (`claude-impl`, `doc-coauthoring`) and impl step (`codex-impl`) with `dependsOn`. |
 | **Cross-domain integration** | `codex` | `codex-impl` | Split mixed work into sequential steps: design (`claude-impl`) → backend impl (`codex-impl`) → frontend impl (`claude-impl`) with `dependsOn`. |
@@ -255,6 +280,21 @@ These rules override the table above:
    live. This complements the `→` announcement line; it does not
    replace it.
 
+10. **Quality arbitration routes to the Fable + Codex judge pair.**
+    Arbitration — ranking candidate artifacts, breaking a tie between
+    approaches, scoring output quality — is distinct from step
+    verification (which follows the cross-family rule above). The
+    conductor dispatches BOTH arbiters: **Fable** via
+    `Agent(model: "fable")` and **Codex** via `run-codex-verify.sh`
+    (read-only; machine-default model — expected gpt-5.6-sol; the
+    no-`--model`-flag invariant still holds), and consumes their
+    consensus. **Self-bias guard** (measured: codex +0.30, fable +0.47
+    on their own blind-labeled work; grok/opus ≈ 0): an arbiter's
+    score of an artifact produced by its *own model family* counts
+    only when the other arbiter independently concurs; on a split over
+    an own-family artifact, add a grok or opus tiebreak vote. Blind
+    the artifacts (strip authorship) whenever practical.
+
 ---
 
 ## RN-mobile conditional routing
@@ -296,6 +336,77 @@ the investigation step.
 
 ---
 
+## Panel Planning — automatic for high-ambiguity tasks
+
+For high-ambiguity tasks, the plan itself is the artifact where model
+diversity pays. The conductor then runs a **plan panel** instead of a
+solo draft: independent plans generated in parallel from the identical
+brief, then a single convergence pass. This is **automatic** — the
+conductor applies the trigger below without being asked.
+
+**Empirical grounding** (2026-07-10 local eval runs,
+`eval/results/2026-07-10-plan-eval*`; blind cross-family judging,
+unbiased-judge consensus on a 0–5 rubric):
+
+- Solo plans from codex, grok, opus, and fable clustered tightly
+  (4.44–4.67) — no single model dominates planning.
+- **Parallel-independent drafts + one convergence pass beat every solo
+  plan (4.88)** and led all five rubric dimensions with every judge.
+- **A sequential relay (draft → revise → finalize) scored below the
+  best solo plan (4.56)** — later models anchor on the first draft and
+  polish it instead of reopening decisions.
+
+### Trigger
+
+Panel-plan when ANY of:
+
+- `brainstorming` fired during Discovery (the design ambiguity was
+  real), or
+- the request is a goal without a mechanism ("decide what we should do
+  about X"), or
+- after discovery, two or more plausible architectures remain with
+  non-obvious tradeoffs, or
+- the plan will span ≥3 domains (e.g. mobile + API + backend) or
+  ≥ ~8 steps.
+
+**Skip when:** the user said "just do it" / "quick" / "no plan"; the
+work is single-domain from a clear spec; the work is a mechanical
+sweep. The user can force either mode ("panel plan this" / "solo plan
+is fine"). Cost: a panel is ~3–4× a solo plan draft — the selective
+trigger is what keeps it affordable; wall-clock cost is low because
+generation is parallel.
+
+### Protocol (never sequential)
+
+1. The conductor writes one planning brief (task statement, discovery
+   summary, constraints) to `<plan-dir>/panel/brief.md`.
+2. The identical brief goes to three lanes **in parallel,
+   independently** — no panelist ever sees another's draft:
+   - **Codex** via `run-codex-impl.sh` (synthetic step id
+     `panel-codex`, brief on stdin); deliverable
+     `<plan-dir>/panel/codex.plan.md`.
+   - **Grok** via `run-grok-impl.sh`, same shape, writing
+     `panel/grok.plan.md`. If the grok lane is unavailable (wrapper
+     exit 4), proceed as a two-model panel and note it in
+     `progress.json` `deviations` once progress exists.
+   - **Claude planner** via `Agent` with an explicit model per the
+     Model Scorecard (Opus floor; Fable when the task is the hardest /
+     most user-facing), writing `panel/claude.plan.md`.
+3. **Convergence.** One Claude sub-agent (Fable preferred, Opus floor)
+   reads the brief plus all drafts and produces the converged plan:
+   a definite decision wherever the drafts disagree (with a one-line
+   reason — never "either works"), redundancy cut, complementary
+   strengths kept. The converged output feeds the normal
+   `writing-plans` three-file draft. Panel drafts stay in
+   `<plan-dir>/panel/` as the audit trail; the conductor reads only
+   the converged output, never the raw drafts.
+4. **Never chain panelists on one evolving draft.** Sequential
+   collaboration anchors on the first draft and measured *worse* than
+   the best solo plan. Independence before convergence is the entire
+   point of the panel.
+
+---
+
 ## Skill Injection Rules
 
 When `owner: "codex"`, the step's `skill` field determines what guidance
@@ -315,12 +426,26 @@ Skills that stay Claude-only (never injected into Codex):
 - `svg-art` — creative direction
 - `immersive-frontend` — experiential judgment
 - `brainstorming` — Claude leads dialogue, Codex co-explores and reviews
-- `writing-plans` — Claude leads, Codex participates in plan consensus
+- `writing-plans` — Claude leads; under Panel Planning, Codex and Grok
+  contribute *independent* panel drafts (they never see each other's)
 - `doc-coauthoring` — Claude writes, Codex verifies accuracy
 
 `react-native-mobile` is dual-installable — both Claude and Codex have
 their own copies, and routing per step follows the Routing Directive
 above.
+
+**CLI-side installation.** The repo-root `install.sh` syncs exactly the
+injectable set — `engineering-discipline`, the five injectable workflow
+skills above, and the external-lane `react-native-mobile` body — into
+`~/.codex/skills/` **and** `~/.grok/skills/` on every (re)install. It
+also enforces **one canonical copy per lane**: every plugin-managed
+skill name (plus v1 leftovers) is cleared from `~/.claude/skills/`,
+`~/.codex/skills/`, and `~/.grok/skills/` before the sync — Claude
+loads the plugin's skills from the plugin cache only, so a user-level
+copy would double-install. Skills the plugin does not own are never
+touched. Both external lanes carry the same skill set; Claude-only
+skills are never installed CLI-side (panel-planning briefs and
+arbitration instructions travel in the wrapper prompt).
 
 v2 does not ship a `digest` skill. Raw Codex output is bounded by the
 wrapper's prompt contract (the Summary / Verdict / Findings block at
@@ -349,7 +474,11 @@ work produce a bounded contract block parsed by
   prose.
 
 **Cross-family verification.** The verifier should be a *different*
-model family than the implementer. When the Grok lane is configured
+model family than the implementer. Empirical grounding: in the
+2026-07-10 blind plan eval (`eval/results/2026-07-10-plan-eval/`),
+codex and fable judges favored their own blind-labeled work by +0.30
+and +0.47 (harshness-adjusted) while grok and opus showed none —
+same-family review measurably overrates its own output. When the Grok lane is configured
 (the `grok` CLI is installed and authenticated), `codex-impl` steps are
 verified via `run-grok-verify.sh`, while `grok-impl` and `claude-impl`
 steps are verified via `run-codex-verify.sh`. **Fallback:** whenever the

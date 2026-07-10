@@ -48,6 +48,19 @@ template, or sub-agent prompt that asks Codex or Grok to call a bridge
 MCP tool is a bug — re-dispatch with the contract-block instruction
 instead.
 
+## Hard rule: quality arbitration is the Fable + Codex judge pair
+
+When the conductor needs to **rank candidate artifacts, break a tie
+between approaches, or score output quality** (distinct from step
+verification, which stays cross-family), it dispatches BOTH arbiters —
+Fable via `Agent(model: "fable")` and Codex via
+`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (read-only,
+machine-default model) — and consumes their consensus. Self-bias guard
+(measured): an arbiter's score of its *own family's* artifact counts
+only if the other arbiter concurs; on a split over an own-family
+artifact, add a grok or opus tiebreak vote. Blind the artifacts when
+practical. Full rule: `docs/09-routing-matrix.md`, Hard Boundary 10.
+
 ## Hard rule: always fix findings and re-verify
 
 **On every FAIL or FINDINGS verdict from Codex (or any verifier), the
@@ -216,6 +229,21 @@ should break if I get this wrong?".
 `writing-plans` skill drives this phase end-to-end (drafting,
 Orbit review, plan-mode handoff).
 
+**Panel planning is automatic for high-ambiguity tasks.** On entering
+this phase, apply the trigger in `writing-plans` (brainstorming fired /
+goal-without-mechanism request / ≥2 surviving architectures /
+≥3 domains or ≥ ~8 steps). When it fires, run the panel protocol
+before drafting: the identical brief goes **in parallel,
+independently** to Codex (`run-codex-impl.sh`, step id `panel-codex`),
+Grok (`run-grok-impl.sh`, `panel-grok`; two-model panel on exit 4),
+and a Claude planner (`Agent`, explicit scorecard model) — then one
+Claude convergence sub-agent (Fable preferred) merges the drafts with
+definite decisions where they disagree. Announce each panel dispatch
+with the standard `→` line. Never chain panelists on one evolving
+draft, and never read the raw drafts from the conductor thread — only
+the converged output. Full spec: `docs/09-routing-matrix.md`, Panel
+Planning section.
+
 The integrated draft → review → handoff flow:
 
 1. **Draft** the three files (`plan.json.frozen: false`).
@@ -335,7 +363,7 @@ The conductor invokes other skills as the situation demands:
 | Situation | Skill |
 |---|---|
 | Ambiguous design, unclear data model | `brainstorming` |
-| Discovery complete, ready to commit | `writing-plans` |
+| Discovery complete, ready to commit | `writing-plans` (panel planning auto-triggers for high-ambiguity tasks) |
 | Plan exists, executing a step | `codex-dispatch` |
 | Multi-file restructuring | `refactoring` |
 | New behavior in a tested project | `test-driven-development` |

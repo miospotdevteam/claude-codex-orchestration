@@ -81,6 +81,110 @@ log "installing $PLUGIN_NAME@$MARKETPLACE_NAME"
 claude plugin install "${PLUGIN_NAME}@${MARKETPLACE_NAME}"
 ok "installed"
 
+# ---- step 4: de-duplicate skill dirs, then sync the external CLI lanes -----
+#
+# One canonical copy per lane, no doubles:
+#
+#   - Claude loads the plugin's skills from the plugin cache. Any same-named
+#     copy in ~/.claude/skills would double-install → cleared, never copied.
+#   - Codex and Grok load skills from their own skills dirs. The wrappers
+#     inject "Honor the step-specific skill <name>", so the body must exist
+#     CLI-side → cleared of every plugin-managed name, then EXACTLY the
+#     injectable set from docs/09-routing-matrix.md ("Skill Injection Rules")
+#     is installed: the engineering floor, the five injectable workflow
+#     skills, and the dual-install react-native-mobile body (external-lane
+#     copy from codex-skills/ preferred).
+#
+# Claude-only skills (frontend-design, svg-art, immersive-frontend,
+# brainstorming, writing-plans, doc-coauthoring) are never installed
+# CLI-side — panel-planning briefs and arbitration instructions arrive via
+# the wrapper prompt, not as skills. v1 leftovers (lbyl-*,
+# look-before-you-leap) are cleared everywhere. Skills the plugin does not
+# own (user's own skills, a CLI's bundled skills) are never touched.
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+EXTERNAL_SKILLS=(
+  engineering-discipline
+  test-driven-development
+  refactoring
+  systematic-debugging
+  webapp-testing
+  mcp-builder
+  react-native-mobile
+)
+
+# Every skill name the plugin owns, derived from the repo so the list can
+# never drift: everything under skills/ and codex-skills/, plus v1 names.
+MANAGED_SKILLS=()
+for d in "$REPO_DIR"/orchestration/skills/*/ "$REPO_DIR"/orchestration/codex-skills/*/; do
+  if [[ -d "$d" ]]; then
+    MANAGED_SKILLS+=("$(basename "$d")")
+  fi
+done
+MANAGED_SKILLS+=(look-before-you-leap)
+
+clear_managed() {
+  local lane="$1" target="$2"
+  if [[ ! -d "$target" ]]; then
+    return 0
+  fi
+  local removed=0 s d
+  for s in "${MANAGED_SKILLS[@]}"; do
+    if [[ -d "$target/$s" ]]; then
+      rm -rf "${target:?}/${s:?}"
+      removed=$((removed + 1))
+    fi
+  done
+  for d in "$target"/lbyl-*; do
+    if [[ -d "$d" ]]; then
+      rm -rf "$d"
+      removed=$((removed + 1))
+    fi
+  done
+  if [[ "$removed" -gt 0 ]]; then
+    log "$lane: cleared $removed duplicate/stale skill dir(s) from $target"
+  else
+    ok "$lane: no duplicate skill dirs in $target"
+  fi
+}
+
+sync_external_lane() {
+  local lane="$1" target="$2"
+  mkdir -p "$target"
+  clear_managed "$lane" "$target"
+
+  local installed=0 s src
+  for s in "${EXTERNAL_SKILLS[@]}"; do
+    src="$REPO_DIR/orchestration/codex-skills/$s"
+    if [[ ! -d "$src" ]]; then
+      src="$REPO_DIR/orchestration/skills/$s"
+    fi
+    if [[ ! -d "$src" ]]; then
+      warn "$lane: skill '$s' not found in repo — skipped"
+      continue
+    fi
+    cp -R "$src" "$target/$s"
+    installed=$((installed + 1))
+  done
+  ok "$lane: $installed skill(s) synced into $target"
+}
+
+# Claude: clear only — the plugin cache is the single source of these skills.
+clear_managed claude "$HOME/.claude/skills"
+
+if command -v codex >/dev/null; then
+  sync_external_lane codex "$HOME/.codex/skills"
+else
+  warn "codex CLI not on PATH — skipping codex skill sync"
+fi
+
+if command -v grok >/dev/null; then
+  sync_external_lane grok "$HOME/.grok/skills"
+else
+  warn "grok CLI not on PATH — skipping grok skill sync"
+fi
+
 # ---- final state report ----------------------------------------------------
 
 echo ""

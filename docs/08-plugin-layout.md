@@ -116,6 +116,16 @@ Notes on shape:
   `progress.json` so the conductor doesn't reinvent jq invocations.
   `parse-contract.sh` extracts the contract block from raw Codex
   output and is used by both Codex wrappers.
+- **`eval/` is a repo-root, non-shipped developer tool.** The routing
+  eval harness lives in an `eval/` directory at the repo root — a
+  sibling of `docs/` and `orchestration/`, **not** a subdirectory of
+  `orchestration/`. Because the plugin's marketplace source is
+  `./orchestration`, everything under `eval/` is excluded from what
+  ships; it is a local developer/research tool, never installed with
+  the plugin. It is deliberately absent from the `orchestration/`
+  subtree above; if drawn, it belongs at the repo-root level alongside
+  `docs/`. Read `docs/11-routing-eval.md` before touching any `eval/`
+  artifact.
 
 ## `.claude-plugin/plugin.json` (plugin manifest)
 
@@ -265,6 +275,9 @@ Cross-reference: which doc(s) inform which file.
 | `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
 | `tests/scripts/run-grok-impl.test.sh`          | `10-grok-integration.md`                                  |
 | `tests/scripts/run-grok-verify.test.sh`        | `10-grok-integration.md`                                  |
+| `eval/corpus/`                                 | `11-routing-eval.md`                                      |
+| `eval/scripts/`                                | `11-routing-eval.md`                                      |
+| `eval/results/`                                | `11-routing-eval.md`                                      |
 
 ## Implementation order
 

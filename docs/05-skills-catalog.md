@@ -112,6 +112,10 @@ from a completed discovery, then drive the Orbit review.
 - Mid-execution (use `persistent-plans` to update progress instead).
 
 **Responsibilities**
+- Apply the panel-planning trigger first: high-ambiguity tasks get
+  parallel independent drafts (Codex / Grok / Claude) converged by a
+  Claude sub-agent before drafting — see `09-routing-matrix.md`,
+  Panel Planning.
 - Enforce TDD-granularity steps (one component / one behavior).
 - Set `dependsOn` correctly to form a valid DAG.
 - Generate the `progress[]` checklist on each step.

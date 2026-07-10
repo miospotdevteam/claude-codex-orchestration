@@ -41,22 +41,28 @@ claude-codex-orchestration/      ← repo root = marketplace root
 ├── README.md                    ← you are here
 ├── AGENTS.md                    ← the three roles (conductor, sub-agents, Codex)
 ├── LICENSE                      ← MIT
-├── install.sh                   ← conditional uninstall + install via claude CLI
+├── install.sh                   ← conditional uninstall + install via claude CLI,
+│                                   plus codex/grok CLI-side skill sync
 ├── .claude/
 │   └── CLAUDE.md                ← context for any Claude session editing this repo
 ├── docs/                        ← the design spec (markdown only)
-│   ├── 01-philosophy.md … 10-grok-integration.md
+│   ├── 01-philosophy.md … 11-routing-eval.md
 │
-└── orchestration/               ← plugin root (marketplace source: "./orchestration")
-    ├── .claude-plugin/
-    │   └── plugin.json          ← minimal plugin manifest (name, description)
-    ├── skills/                  ← 9 core + 8 auxiliary skills
-    ├── codex-skills/            ← Codex-side bodies for dual-install skills
-    ├── hooks/                   ← hooks.json + two read-only handler scripts
-    ├── scripts/                 ← codex/grok wrappers + plan/contract helpers
-    ├── schemas/                 ← JSON schemas for plan + progress files
-    ├── templates/               ← starter templates (e.g. masterPlan)
-    └── tests/                   ← hook + script tests
+├── orchestration/               ← plugin root (marketplace source: "./orchestration")
+│   ├── .claude-plugin/
+│   │   └── plugin.json          ← minimal plugin manifest (name, description)
+│   ├── skills/                  ← 9 core + 8 auxiliary skills
+│   ├── codex-skills/            ← Codex-side bodies for dual-install skills
+│   ├── hooks/                   ← hooks.json + two read-only handler scripts
+│   ├── scripts/                 ← codex/grok wrappers + plan/contract helpers
+│   ├── schemas/                 ← JSON schemas for plan + progress files
+│   ├── templates/               ← starter templates (e.g. masterPlan)
+│   └── tests/                   ← hook + script tests
+│
+└── eval/                        ← routing-validation eval harness (non-shipped dev tool)
+    ├── corpus/                  ← gold tasks per domain (tracked)
+    ├── scripts/                 ← bash helpers: score/judge/aggregate (tracked)
+    └── results/                 ← scorecards + raw run JSON (gitignored)
 ```
 
 ## Install
@@ -190,8 +196,9 @@ The full design lives under `docs/`. Read in order:
 6. `docs/06-codex-integration.md` — wrappers + prompt contract.
 7. `docs/07-hooks.md` — what the two hooks may/may-not do.
 8. `docs/08-plugin-layout.md` — target tree + build order.
-9. `docs/09-routing-matrix.md` — model routing and verification lanes.
+9. `docs/09-routing-matrix.md` — model routing, panel planning, and verification lanes.
 10. `docs/10-grok-integration.md` — Grok wrappers + prompt contract.
+11. `docs/11-routing-eval.md` — the routing eval harness that validates the matrix.
 
 When you're working on the plugin, your own session is itself an
 exercise of the system: a non-trivial change should produce a plan

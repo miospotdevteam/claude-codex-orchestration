@@ -27,6 +27,38 @@ It does **not** fire for:
 - Mid-execution updates — use `persistent-plans` to update
   `progress.json`.
 
+## Panel planning — automatic for high-ambiguity tasks
+
+Before drafting solo, apply this trigger. Panel-plan when ANY of:
+`brainstorming` fired during discovery; the request is a goal without
+a mechanism ("decide what to do about X"); two or more plausible
+architectures survived discovery with non-obvious tradeoffs; the plan
+will span ≥3 domains or ≥ ~8 steps. Skip when the user said "just
+do it" / "quick", or the work is single-domain clear-spec or a
+mechanical sweep. The user can force either mode.
+
+The protocol (full spec: `docs/09-routing-matrix.md`, Panel Planning
+section — including the measured result it rests on: independent
+drafts + convergence beat both every solo plan and a sequential
+relay):
+
+1. Write one planning brief to `<plan-dir>/panel/brief.md`.
+2. Send the **identical brief, in parallel, independently** to Codex
+   (`run-codex-impl.sh`, synthetic step id `panel-codex`, deliverable
+   `panel/codex.plan.md`), Grok (`run-grok-impl.sh`,
+   `panel/grok.plan.md`; on wrapper exit 4, continue as a two-model
+   panel), and a Claude planner (`Agent`, explicit scorecard model,
+   `panel/claude.plan.md`). No panelist ever sees another's draft.
+3. Dispatch one Claude convergence sub-agent (Fable preferred, Opus
+   floor) that reads the brief + drafts and returns the converged
+   plan: a definite decision wherever drafts disagree (one-line
+   reason), redundancy cut, complementary strengths kept.
+4. Use the converged plan as the source for step 1 of the flow below.
+   Panel drafts stay in `<plan-dir>/panel/` for audit; the conductor
+   reads only the converged output.
+5. **Never chain panelists sequentially on one evolving draft** — it
+   measured worse than the best solo plan.
+
 ## Outputs
 
 Three files under `.temp/plan-mode/active/<planId>/`:
