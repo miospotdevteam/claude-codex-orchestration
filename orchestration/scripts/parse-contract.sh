@@ -66,7 +66,7 @@ section = None
 for raw_line in block.split("\n"):
     candidate = strip_optional_marker(raw_line)
 
-    if candidate.startswith("Summary:"):
+    if section is None and candidate.startswith("Summary:"):
         seen_summary = True
         section = "summary"
         value = candidate[len("Summary:"):].strip()
@@ -74,7 +74,7 @@ for raw_line in block.split("\n"):
             summary_parts.append(value)
         continue
 
-    if candidate.startswith("Verdict:"):
+    if section == "summary" and candidate.startswith("Verdict:"):
         seen_verdict = True
         section = "verdict"
         value = candidate[len("Verdict:"):].strip()
@@ -83,12 +83,12 @@ for raw_line in block.split("\n"):
         verdict = value
         continue
 
-    if candidate == "Findings:":
+    if section == "verdict" and candidate == "Findings:":
         seen_findings = True
         section = "findings"
         continue
 
-    if candidate == "FilesTouched:":
+    if section in {"verdict", "findings"} and candidate == "FilesTouched:":
         seen_files_touched = True
         section = "files_touched"
         continue

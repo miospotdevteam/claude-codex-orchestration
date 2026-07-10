@@ -87,7 +87,7 @@ At any moment, define:
 ```
 runnable(plan, progress) =
     { step ∈ plan.steps
-      | progress.steps[step.id].status ∈ {pending, blocked-retry}
+      | progress.steps[step.id].status == pending
       ∧ ∀ dep ∈ step.dependsOn: progress.steps[dep].status == done }
 ```
 
@@ -96,8 +96,9 @@ This is the **frontier**. The conductor:
 1. Computes `runnable(plan, progress)` after every step completes.
 2. Updates `progress.currentFrontier`.
 3. Dispatches every step in the frontier **in parallel** by default.
-4. Marks each as `in_progress` before dispatch and `done`/`blocked`
-   after the verifier returns.
+4. Marks each as `in_progress` before dispatch and `done` after the
+   verifier returns PASS (fixing and re-verifying any FAIL/FINDINGS
+   first, per the policy below).
 
 Parallel dispatch uses the harness's ability to call multiple `Agent`
 or wrapper scripts in one assistant message. The conductor sends one
@@ -155,11 +156,14 @@ After every step transition the conductor:
    deviations.
 3. Recomputes the frontier and continues.
 
-If a step's verdict is `FAIL`, the conductor does **not**
-automatically retry. It surfaces the findings to the user and asks
-how to proceed (retry with adjusted criteria, split the step, mark
-blocked, etc.). Automatic retry loops have historically masked real
-problems.
+If a step's verdict is `FAIL` or `FINDINGS`, the conductor fixes the
+findings and re-verifies. The loop is: dispatch → verify → if not
+PASS, fix + re-verify → repeat until PASS. It does **not** mark the
+step `done` with findings, and does **not** defer them to a follow-up
+step. The conductor surfaces one-line progress to the user between
+iterations, but pauses to ask how to proceed only after three
+non-converging iterations or when a finding raises a genuine design
+question that needs the user's judgment.
 
 ## Phase 4 — Verify
 
@@ -223,10 +227,22 @@ skipping is the right call.
 
 ## Failure handling
 
+- **Transient provider capacity or overload** → keep the step
+  `in_progress`, announce the pause, wait 10 minutes, and repeat the
+  identical dispatch on the same model and provider. Permit at most two
+  delayed retries (three attempts total). After exhaustion, use an
+  already-defined lane fallback; if none exists, mark the step `blocked`
+  and surface the capacity failure. Do not apply this loop to auth or
+  configuration errors, missing binaries, invalid invocations, or
+  malformed contracts.
 - **External wrapper unreachable** → step is `blocked` with a
   lane-specific unavailable reason. Conductor surfaces to user.
-- **Verifier returns FAIL twice in a row** → step is `blocked`. The
-  conductor does not loop.
+- **Verifier does not converge** → FAIL/FINDINGS drives the
+  fix-and-re-verify loop, not a `blocked` state. Only after three
+  non-converging iterations (or a finding that needs a design
+  decision) does the conductor pause and ask the user how to proceed.
+  This is distinct from the transport-level retry-once rule for an
+  unreachable wrapper or a missing contract block.
 - **Plan invariant violated** (cyclic deps, missing dep ID) → this is
   a `writing-plans` bug; the conductor reports it and refuses to
   execute the plan.

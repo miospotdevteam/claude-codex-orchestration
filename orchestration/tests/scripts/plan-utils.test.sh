@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 PLAN_UTILS="$SCRIPT_DIR/../../scripts/plan-utils.sh"
+REAL_JQ=$(command -v jq)
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -95,6 +96,102 @@ test_init_progress() {
      and (.steps | keys | sort) == ["step-1", "step-2", "step-3"]'
 }
 
+test_get_plan_dir_selects_most_recent() {
+  local root="$SANDBOX/get-plan-dir"
+  local older="$root/.temp/plan-mode/active/older"
+  local newer="$root/.temp/plan-mode/active/newer"
+  local actual
+  create_plan_dir "$older"
+  create_plan_dir "$newer"
+  "$PLAN_UTILS" init-progress "$older"
+  "$PLAN_UTILS" init-progress "$newer"
+  jq '.lastUpdatedAt = "2026-05-11T00:00:00Z"' "$older/progress.json" >"$older/progress.next.json"
+  mv "$older/progress.next.json" "$older/progress.json"
+  jq '.lastUpdatedAt = "2026-05-12T00:00:00Z"' "$newer/progress.json" >"$newer/progress.next.json"
+  mv "$newer/progress.next.json" "$newer/progress.json"
+
+  actual=$("$PLAN_UTILS" get-plan-dir "$root")
+  [[ "$actual" == "$(cd "$newer" && pwd -P)" ]]
+}
+
+test_read_plan_and_progress() {
+  local dir="$SANDBOX/read-files"
+  create_plan_dir "$dir"
+  "$PLAN_UTILS" init-progress "$dir"
+
+  "$PLAN_UTILS" read-plan "$dir" >"$SANDBOX/read-plan.out"
+  "$PLAN_UTILS" read-progress "$dir" >"$SANDBOX/read-progress.out"
+  cmp -s "$dir/plan.json" "$SANDBOX/read-plan.out" || return 1
+  cmp -s "$dir/progress.json" "$SANDBOX/read-progress.out"
+}
+
+test_start_step_records_dispatch() {
+  local dir="$SANDBOX/start-step"
+  create_plan_dir "$dir"
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex
+
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "in_progress"
+    and (.steps["step-1"].startedAt | test("Z$"))
+    and .steps["step-1"].dispatch == {
+      executor: "codex",
+      model: "gpt-5.6-codex",
+      startedAt: .steps["step-1"].startedAt
+    }
+    and (.steps["step-1"] | has("completedAt") | not)
+    and .lastUpdatedAt == .steps["step-1"].dispatch.startedAt'
+}
+
+test_start_step_rejects_invalid_input_without_writing() {
+  local dir="$SANDBOX/start-step-invalid"
+  create_plan_dir "$dir"
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/start-step-invalid.before"
+
+  if "$PLAN_UTILS" start-step "$dir" step-1 invalid model >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" start-step "$dir" step-1 codex '' >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" start-step "$dir" missing-step codex model >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json"
+}
+
+test_start_step_atomic_failure_preserves_original() {
+  local dir="$SANDBOX/start-step-atomic"
+  local fake_bin="$SANDBOX/fake-bin"
+  create_plan_dir "$dir"
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/start-step-atomic.before"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/jq" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    *'.steps[$id].dispatch'*)
+      printf '{"partial":'
+      exit 7
+      ;;
+  esac
+done
+exec "$REAL_JQ" "$@"
+SH
+  chmod +x "$fake_bin/jq"
+
+  if REAL_JQ="$REAL_JQ" PATH="$fake_bin:$PATH" \
+    "$PLAN_UTILS" start-step "$dir" step-1 claude opus >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-atomic.before" "$dir/progress.json" || return 1
+  ! compgen -G "$dir/.progress.json.tmp.*" >/dev/null
+}
+
 test_set_step_status_round_trip() {
   local dir="$SANDBOX/status-round-trip"
   local started completed
@@ -167,6 +264,11 @@ test_init_progress_force() {
 }
 
 run_test "init-progress creates root frontier and pending steps" test_init_progress
+run_test "get-plan-dir selects the most recently updated plan" test_get_plan_dir_selects_most_recent
+run_test "read-plan and read-progress return validated files" test_read_plan_and_progress
+run_test "start-step records status and full dispatch atomically" test_start_step_records_dispatch
+run_test "start-step rejects invalid input without writing" test_start_step_rejects_invalid_input_without_writing
+run_test "start-step preserves progress on atomic update failure" test_start_step_atomic_failure_preserves_original
 run_test "set-step-status preserves startedAt and sets completedAt" test_set_step_status_round_trip
 run_test "record-verdict writes PASS FINDINGS and FAIL shapes" test_record_verdict_shapes
 run_test "compute-frontier emits dependent step after dependencies done" test_compute_frontier

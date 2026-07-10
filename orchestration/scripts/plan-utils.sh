@@ -10,6 +10,7 @@ Subcommands:
   read-plan <plan-dir>
   read-progress <plan-dir>
   init-progress [--force] <plan-dir>
+  start-step <plan-dir> <step-id> <executor> <model>
   set-step-status <plan-dir> <step-id> <status>
   record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array>
   set-frontier <plan-dir> <space-separated-step-ids>
@@ -72,6 +73,13 @@ valid_status() {
 valid_verdict() {
   case "$1" in
     PASS | FINDINGS | FAIL) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_executor() {
+  case "$1" in
+    codex | grok | claude) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -168,6 +176,38 @@ cmd_init_progress() {
     rm -f "$tmp"
     return 1
   fi
+}
+
+cmd_start_step() {
+  [[ $# -eq 4 ]] || die "start-step requires <plan-dir> <step-id> <executor> <model>"
+
+  local plan_dir step_id executor model now
+  plan_dir=$(abs_dir "$1")
+  step_id=$2
+  executor=$3
+  model=$4
+  valid_executor "$executor" || die "invalid executor: $executor"
+  [[ -n "$model" ]] || die "model must not be empty"
+  require_file_json "$plan_dir/progress.json"
+  jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
+    die "unknown step id: $step_id"
+
+  now=$(utc_now)
+  atomic_update_progress "$plan_dir" '
+    .lastUpdatedAt = $now
+    | .steps[$id].status = "in_progress"
+    | .steps[$id].startedAt = (.steps[$id].startedAt // $now)
+    | .steps[$id].dispatch = {
+        executor: $executor,
+        model: $model,
+        startedAt: $now
+      }
+    | del(.steps[$id].completedAt)
+  ' \
+    --arg id "$step_id" \
+    --arg executor "$executor" \
+    --arg model "$model" \
+    --arg now "$now"
 }
 
 cmd_set_step_status() {
@@ -279,6 +319,7 @@ main() {
     read-plan) cmd_read_plan "$@" ;;
     read-progress) cmd_read_progress "$@" ;;
     init-progress) cmd_init_progress "$@" ;;
+    start-step) cmd_start_step "$@" ;;
     set-step-status) cmd_set_step_status "$@" ;;
     record-verdict) cmd_record_verdict "$@" ;;
     set-frontier) cmd_set_frontier "$@" ;;

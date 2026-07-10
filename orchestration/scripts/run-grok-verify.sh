@@ -6,6 +6,9 @@ set -euo pipefail
 # writes and must not be used for this purpose). The VERIFY prompt constraint
 # is defense-in-depth, not the primary guarantee.
 #
+# --max-turns is capped at 80 (raised from 40, which exhausted on realistic
+# workloads 2026-07-10); exhaustion surfaces as exit 2 plus a diagnostic log.
+#
 # Diff input convention:
 # - With --diff-file <path>, stdin is the rendered step block and the diff is read
 #   from the provided file.
@@ -75,19 +78,12 @@ done
 [[ -n "$PLAN_ID" ]] || die_invocation "--plan-id is required"
 [[ -n "$STEP_ID" ]] || die_invocation "--step-id is required"
 [[ -n "$ROOT_DIR" ]] || die_invocation "--root-dir is required"
+[[ "$ROOT_DIR" = /* ]] || die_invocation "--root-dir must be an absolute path"
 [[ -d "$ROOT_DIR" ]] || die_invocation "--root-dir does not exist or is not a directory: $ROOT_DIR"
-
-if ! command -v grok >/dev/null 2>&1; then
-  die_missing_grok
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PARSER="$SCRIPT_DIR/parse-contract.sh"
 [[ -x "$PARSER" ]] || die_invocation "parser is not executable: $PARSER"
-
-LOG_DIR="$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/logs"
-LOG_FILE="$LOG_DIR/grok-verify-$STEP_ID.log"
-mkdir -p "$LOG_DIR"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -95,7 +91,12 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 STEP_BLOCK_FILE="$TMP_DIR/step-block.txt"
 DIFF_CONTENT_FILE="$TMP_DIR/diff.txt"
 PROMPT_FILE="$TMP_DIR/prompt.txt"
+GROK_STDOUT_FILE="$TMP_DIR/grok-stdout.txt"
+GROK_STDERR_FILE="$TMP_DIR/grok-stderr.txt"
+CONTRACT_FILE="$TMP_DIR/contract.txt"
 
+# Validate the diff input BEFORE the grok-availability check, so a bad invocation
+# exits 1 (invocation error), not 4 (grok missing).
 if [[ -n "$DIFF_FILE" ]]; then
   [[ -f "$DIFF_FILE" ]] || die_invocation "--diff-file does not exist or is not a file: $DIFF_FILE"
   cat >"$STEP_BLOCK_FILE"
@@ -121,6 +122,14 @@ else
   [[ "$found_diff_sentinel" -eq 1 ]] || die_invocation "stdin must contain a ---DIFF--- sentinel when --diff-file is absent"
 fi
 
+if ! command -v grok >/dev/null 2>&1; then
+  die_missing_grok
+fi
+
+LOG_DIR="$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/logs"
+LOG_FILE="$LOG_DIR/grok-verify-$STEP_ID.log"
+mkdir -p "$LOG_DIR"
+
 {
   cat <<'EOF'
 You are Grok Build running in VERIFY mode for the orchestration plugin. You may read files and the provided diff. You may NOT edit files. Do not create, modify, delete, move, or format any file. You must finish with the contract block. Your verdict is PASS only if every acceptance criterion is met by the diff.
@@ -141,6 +150,8 @@ EOF
 # Output Contract
 Your final output must end with the contract block in the exact shape specified. Do not omit any field. Do not emit anything after `=== END-CONTRACT ===`.
 
+The block must be plain text: no markdown bold, exact field labels, both sentinel lines mandatory, nothing after the closing sentinel.
+
 === ORCHESTRATION-CONTRACT ===
 Summary: <one paragraph, at most 6 sentences, plain prose>
 Verdict: PASS | FINDINGS | FAIL
@@ -151,23 +162,68 @@ FilesTouched:
 EOF
 } >"$PROMPT_FILE"
 
+# Capture stdout and stderr separately and parse stdout only, so a CLI footer or
+# late stderr diagnostic cannot force a spurious exit 3. A merged copy is written
+# to the log dir for human debugging.
 set +e
 grok \
   --prompt-file "$PROMPT_FILE" \
   --cwd "$ROOT_DIR" \
-  -m grok-build \
-  --max-turns 40 \
+  -m grok-4.5 \
+  --max-turns 80 \
   --deny 'Write' \
   --deny 'Edit' \
   --deny 'Bash' \
-  >"$LOG_FILE" 2>&1
+  >"$GROK_STDOUT_FILE" 2>"$GROK_STDERR_FILE"
 grok_status=$?
 set -e
+
+{
+  printf '%s\n' '--- grok stdout ---'
+  cat "$GROK_STDOUT_FILE"
+  printf '%s\n' '--- grok stderr ---'
+  cat "$GROK_STDERR_FILE"
+} >"$LOG_FILE"
 
 if [[ $grok_status -ne 0 ]]; then
   exit 2
 fi
 
-if ! "$PARSER" <"$LOG_FILE"; then
+PARSE_INPUT="$GROK_STDOUT_FILE"
+if awk '
+  BEGIN {
+    open_sentinel = "=== ORCHESTRATION-CONTRACT ==="
+    close_sentinel = "=== END-CONTRACT ==="
+  }
+  {
+    comparison = $0
+    sub(/\r$/, "", comparison)
+
+    if (comparison == open_sentinel) {
+      capturing = 1
+      block = $0 ORS
+      next
+    }
+
+    if (capturing) {
+      block = block $0 ORS
+      if (comparison == close_sentinel) {
+        last_complete = block
+        found_complete = 1
+        capturing = 0
+      }
+    }
+  }
+  END {
+    if (!found_complete) {
+      exit 1
+    }
+    printf "%s", last_complete
+  }
+' "$GROK_STDOUT_FILE" >"$CONTRACT_FILE"; then
+  PARSE_INPUT="$CONTRACT_FILE"
+fi
+
+if ! "$PARSER" <"$PARSE_INPUT"; then
   exit 3
 fi

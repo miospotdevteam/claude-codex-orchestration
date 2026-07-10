@@ -27,7 +27,11 @@ function loadWithValidators(moduleName, validators) {
   delete require.cache[require.resolve(validatorsPath)];
   const originalLoad = Module._load;
   Module._load = function (request, parent, isMain) {
-    if (parent && parent.filename === modulePath && request === "./validators") {
+    if (
+      parent &&
+      parent.filename === modulePath &&
+      (request === "./validators" || request === "./validators.js")
+    ) {
       return validators;
     }
     return originalLoad.apply(this, arguments);
@@ -68,6 +72,10 @@ test("createProduct rejects blank title and bad email", (M) => {
 });
 
 // --- target shape present and correct ---
+test("validators.js exports exactly the two validation helpers", (M) => {
+  assert.deepStrictEqual(Object.keys(M.validators).sort(), ["isEmail", "isNonEmptyString"]);
+});
+
 test("validators.js exports isNonEmptyString with correct behavior", (M) => {
   const { isNonEmptyString } = M.validators;
   assert.strictEqual(typeof isNonEmptyString, "function");

@@ -49,6 +49,14 @@ assert_argv_lacks_line() {
   ! grep -qx -- "$unexpected" "$file"
 }
 
+assert_argv_has_pair() {
+  local file="$1"
+  local flag="$2"
+  local value="$3"
+  awk -v flag="$flag" -v value="$value" \
+    '$0 == flag { getline; if ($0 == value) found = 1 } END { exit !found }' "$file"
+}
+
 write_mock_clis() {
   local bin_dir="$1"
   mkdir -p "$bin_dir"
@@ -59,18 +67,27 @@ set -euo pipefail
 
 : "${HELPER_MOCK_ARGV:?}"
 : "${HELPER_MOCK_PROMPT:?}"
+: "${HELPER_MOCK_CWD:?}"
 
 printf '%s\n' "$@" >"$HELPER_MOCK_ARGV"
+pwd -P >"$HELPER_MOCK_CWD"
 cat >"$HELPER_MOCK_PROMPT"
+
+if [[ "${HELPER_MOCK_REQUIRE_LOCAL_INPUTS:-0}" == "1" ]]; then
+  [[ -s bundle.txt && -s rubric.txt ]] || exit 98
+  printf '%s\n' "$(pwd -P)/bundle.txt" "$(pwd -P)/rubric.txt" >"${HELPER_MOCK_INPUTS:?}"
+fi
 
 case "${HELPER_MOCK_KIND:?}" in
   bare-codex)
     printf 'codex raw answer for %s\n' "${HELPER_MOCK_TASK_ID:-unknown}"
     ;;
   judge-codex)
-    cat <<'JSON'
-{"scores":{"A":4.1,"B":3,"C":5},"rationale":"Codex judge rationale."}
-JSON
+    if [[ -n "${HELPER_MOCK_JUDGE_OUTPUT:-}" ]]; then
+      printf '%s\n' "$HELPER_MOCK_JUDGE_OUTPUT"
+    else
+      printf '%s\n' '{"scores":{"A":4.1,"B":3,"C":5},"rationale":"Codex judge rationale."}'
+    fi
     ;;
   *)
     printf 'unexpected codex mock kind: %s\n' "$HELPER_MOCK_KIND" >&2
@@ -86,8 +103,10 @@ set -euo pipefail
 
 : "${HELPER_MOCK_ARGV:?}"
 : "${HELPER_MOCK_PROMPT:?}"
+: "${HELPER_MOCK_CWD:?}"
 
 printf '%s\n' "$@" >"$HELPER_MOCK_ARGV"
+pwd -P >"$HELPER_MOCK_CWD"
 
 prompt_file=""
 while (($# > 0)); do
@@ -108,14 +127,21 @@ else
   cat >"$HELPER_MOCK_PROMPT"
 fi
 
+if [[ "${HELPER_MOCK_REQUIRE_LOCAL_INPUTS:-0}" == "1" ]]; then
+  [[ -s bundle.txt && -s rubric.txt ]] || exit 98
+  printf '%s\n' "$(pwd -P)/bundle.txt" "$(pwd -P)/rubric.txt" >"${HELPER_MOCK_INPUTS:?}"
+fi
+
 case "${HELPER_MOCK_KIND:?}" in
   bare-grok)
     printf 'grok raw answer for %s\n' "${HELPER_MOCK_TASK_ID:-unknown}"
     ;;
   judge-grok)
-    cat <<'JSON'
-{"scores":{"A":2,"B":4.5,"C":3.25},"rationale":"Grok judge rationale."}
-JSON
+    if [[ -n "${HELPER_MOCK_JUDGE_OUTPUT:-}" ]]; then
+      printf '%s\n' "$HELPER_MOCK_JUDGE_OUTPUT"
+    else
+      printf '%s\n' '{"scores":{"A":2,"B":4.5,"C":3.25},"rationale":"Grok judge rationale."}'
+    fi
     ;;
   *)
     printf 'unexpected grok mock kind: %s\n' "$HELPER_MOCK_KIND" >&2
@@ -136,6 +162,8 @@ run_helper() {
   local bin_dir="$case_dir/bin"
   local argv_file="$case_dir/argv.txt"
   local prompt_file="$case_dir/prompt.txt"
+  local cwd_file="$case_dir/cwd.txt"
+  local inputs_file="$case_dir/inputs.txt"
   local stderr_file="$case_dir/stderr.txt"
   local status
 
@@ -148,6 +176,8 @@ run_helper() {
     HELPER_MOCK_TASK_ID="backend/example" \
     HELPER_MOCK_ARGV="$argv_file" \
     HELPER_MOCK_PROMPT="$prompt_file" \
+    HELPER_MOCK_CWD="$cwd_file" \
+    HELPER_MOCK_INPUTS="$inputs_file" \
     "$script" "$@" >"$output_file" 2>"$stderr_file"
   status=$?
   set -e
@@ -167,7 +197,88 @@ run_helper() {
 
   RUN_ARGV_FILE="$argv_file"
   RUN_PROMPT_FILE="$prompt_file"
+  RUN_CWD_FILE="$cwd_file"
+  RUN_INPUTS_FILE="$inputs_file"
   return 0
+}
+
+expect_invalid_file() {
+  local name="$1"
+  local kind="$2"
+  local script="$3"
+  shift 3
+
+  local case_dir="$TMP_DIR/invalid-${kind}-${name// /-}"
+  local bin_dir="$case_dir/bin"
+  local stdout_file="$case_dir/stdout.txt"
+  local stderr_file="$case_dir/stderr.txt"
+  local argv_file="$case_dir/argv.txt"
+  local status
+
+  mkdir -p "$case_dir"
+  write_mock_clis "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    HELPER_MOCK_KIND="$kind" \
+    HELPER_MOCK_ARGV="$argv_file" \
+    HELPER_MOCK_PROMPT="$case_dir/prompt.txt" \
+    HELPER_MOCK_CWD="$case_dir/cwd.txt" \
+    "$script" "$@" >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 1 ]]; then
+    fail "$name" "expected usage exit 1, got $status; stderr=$(<"$stderr_file")"
+    return
+  fi
+  if [[ -e "$argv_file" ]]; then
+    fail "$name" "model CLI was invoked for invalid input"
+    return
+  fi
+  if ! grep -Fq "empty" "$stderr_file"; then
+    fail "$name" "usage error did not identify empty input: $(<"$stderr_file")"
+    return
+  fi
+
+  pass "$name"
+}
+
+expect_invalid_judge_output() {
+  local name="$1"
+  local kind="$2"
+  local script="$3"
+  local case_dir="$TMP_DIR/invalid-output-$kind"
+  local bin_dir="$case_dir/bin"
+  local stdout_file="$case_dir/stdout.txt"
+  local stderr_file="$case_dir/stderr.txt"
+  local status
+
+  mkdir -p "$case_dir"
+  write_mock_clis "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    HELPER_MOCK_KIND="$kind" \
+    HELPER_MOCK_ARGV="$case_dir/argv.txt" \
+    HELPER_MOCK_PROMPT="$case_dir/prompt.txt" \
+    HELPER_MOCK_CWD="$case_dir/cwd.txt" \
+    HELPER_MOCK_JUDGE_OUTPUT='{"scores":{"A":6,"B":3,"C":5},"rationale":"invalid"}' \
+    "$script" --task-id x --bundle "A/B/C" --rubric "score" \
+    >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 3 ]]; then
+    fail "$name" "expected invalid-output exit 3, got $status; stdout=$(<"$stdout_file")"
+    return
+  fi
+  if [[ -s "$stdout_file" ]]; then
+    fail "$name" "expected empty stdout on invalid judge output"
+    return
+  fi
+
+  pass "$name"
 }
 
 test_bare_codex_file_spec() {
@@ -234,12 +345,24 @@ test_bare_grok_text_spec() {
     fail "$name" "prompt contains skill injection"
     return
   }
-  assert_argv_lacks_line "$RUN_ARGV_FILE" "--model" || {
-    fail "$name" "grok argv unexpectedly passed --model"
+  assert_argv_has_pair "$RUN_ARGV_FILE" "--cwd" "$(<"$RUN_CWD_FILE")" || {
+    fail "$name" "grok argv cwd did not match its process cwd"
     return
   }
-  assert_argv_lacks_line "$RUN_ARGV_FILE" "-m" || {
-    fail "$name" "grok argv unexpectedly passed -m"
+  assert_argv_has_pair "$RUN_ARGV_FILE" "-m" "grok-4.5" || {
+    fail "$name" "grok argv did not pin grok-4.5"
+    return
+  }
+  assert_argv_lacks_line "$RUN_ARGV_FILE" "--deny" || {
+    fail "$name" "bare grok unexpectedly used judge deny rules"
+    return
+  }
+  grep -qx -- "--always-approve" "$RUN_ARGV_FILE" || {
+    fail "$name" "grok argv omitted --always-approve"
+    return
+  }
+  assert_argv_has_pair "$RUN_ARGV_FILE" "--max-turns" "80" || {
+    fail "$name" "grok argv did not match the Track-A turn budget"
     return
   }
 
@@ -280,6 +403,18 @@ test_judge_codex() {
     fail "$name" "codex judge argv unexpectedly passed -m"
     return
   }
+  assert_argv_has_pair "$RUN_ARGV_FILE" "-C" "$(<"$RUN_CWD_FILE")" || {
+    fail "$name" "codex judge argv cwd did not match its process cwd"
+    return
+  }
+  assert_argv_has_pair "$RUN_ARGV_FILE" "-s" "read-only" || {
+    fail "$name" "codex judge omitted read-only sandboxing"
+    return
+  }
+  if [[ "$(<"$RUN_CWD_FILE")" == "$(pwd -P)" ]]; then
+    fail "$name" "codex judge ran in the caller repo"
+    return
+  fi
 
   pass "$name"
 }
@@ -314,14 +449,95 @@ test_judge_grok() {
     fail "$name" "grok judge argv unexpectedly passed -m"
     return
   }
+  assert_argv_has_pair "$RUN_ARGV_FILE" "--cwd" "$(<"$RUN_CWD_FILE")" || {
+    fail "$name" "grok judge argv cwd did not match its process cwd"
+    return
+  }
+  for denied in Write Edit Bash; do
+    assert_argv_has_pair "$RUN_ARGV_FILE" "--deny" "$denied" || {
+      fail "$name" "grok judge omitted --deny $denied"
+      return
+    }
+  done
+  if [[ "$(<"$RUN_CWD_FILE")" == "$(pwd -P)" ]]; then
+    fail "$name" "grok judge ran in the caller repo"
+    return
+  fi
 
   pass "$name"
+}
+
+test_judges_do_not_disclose_caller_paths() {
+  local name="judges isolate cwd and do not disclose caller paths"
+  local caller_dir="$TMP_DIR/caller-repo"
+  local bundle="$caller_dir/bundle.md"
+  local rubric="$caller_dir/rubric.md"
+  local deanon="$caller_dir/de-anon-map.json"
+  local output="$TMP_DIR/canary.json"
+  local kind script
+
+  mkdir -p "$caller_dir"
+  printf 'A: one\nB: two\nC: three\n' >"$bundle"
+  printf 'Score from zero to five.\n' >"$rubric"
+  printf '{"A":"codex"}\n' >"$deanon"
+
+  for kind in judge-codex judge-grok; do
+    script="$SCRIPTS_DIR/$kind.sh"
+    HELPER_MOCK_REQUIRE_LOCAL_INPUTS=1 run_helper "$kind" "$script" "$output" \
+      --task-id "backend/canary" --bundle-file "$bundle" --rubric-file "$rubric" || return
+    if [[ ! -s "$RUN_INPUTS_FILE" ]]; then
+      fail "$name" "$kind did not stage judge inputs in its sandbox"
+      return
+    fi
+    if grep -Fq -- "$caller_dir" "$RUN_ARGV_FILE" || grep -Fq -- "$caller_dir" "$RUN_PROMPT_FILE"; then
+      fail "$name" "$kind disclosed the caller repo path to the model"
+      return
+    fi
+    if grep -Fq -- "$deanon" "$RUN_ARGV_FILE" || grep -Fq -- "$deanon" "$RUN_PROMPT_FILE"; then
+      fail "$name" "$kind disclosed the de-anonymization canary path"
+      return
+    fi
+  done
+
+  pass "$name"
+}
+
+test_empty_files_fail_before_model_calls() {
+  local empty="$TMP_DIR/empty-input"
+  local bundle="$TMP_DIR/nonempty-bundle.md"
+  local rubric="$TMP_DIR/nonempty-rubric.md"
+  : >"$empty"
+  printf 'A: one\nB: two\nC: three\n' >"$bundle"
+  printf 'Score candidates.\n' >"$rubric"
+
+  expect_invalid_file "bare-codex rejects empty spec file" "bare-codex" \
+    "$SCRIPTS_DIR/bare-codex.sh" --task-id x --spec-file "$empty"
+  expect_invalid_file "bare-grok rejects empty spec file" "bare-grok" \
+    "$SCRIPTS_DIR/bare-grok.sh" --task-id x --spec-file "$empty"
+  expect_invalid_file "judge-codex rejects empty bundle file" "judge-codex" \
+    "$SCRIPTS_DIR/judge-codex.sh" --task-id x --bundle-file "$empty" --rubric-file "$rubric"
+  expect_invalid_file "judge-codex rejects empty rubric file" "judge-codex" \
+    "$SCRIPTS_DIR/judge-codex.sh" --task-id x --bundle-file "$bundle" --rubric-file "$empty"
+  expect_invalid_file "judge-grok rejects empty bundle file" "judge-grok" \
+    "$SCRIPTS_DIR/judge-grok.sh" --task-id x --bundle-file "$empty" --rubric-file "$rubric"
+  expect_invalid_file "judge-grok rejects empty rubric file" "judge-grok" \
+    "$SCRIPTS_DIR/judge-grok.sh" --task-id x --bundle-file "$bundle" --rubric-file "$empty"
+}
+
+test_judges_reject_out_of_range_scores() {
+  expect_invalid_judge_output "judge-codex rejects out-of-range scores" \
+    "judge-codex" "$SCRIPTS_DIR/judge-codex.sh"
+  expect_invalid_judge_output "judge-grok rejects out-of-range scores" \
+    "judge-grok" "$SCRIPTS_DIR/judge-grok.sh"
 }
 
 run_test "bare-codex emits bare envelope for spec file" test_bare_codex_file_spec
 run_test "bare-grok emits bare envelope for inline spec" test_bare_grok_text_spec
 run_test "judge-codex normalizes judge JSON" test_judge_codex
 run_test "judge-grok normalizes judge JSON" test_judge_grok
+run_test "judges isolate cwd and do not disclose caller paths" test_judges_do_not_disclose_caller_paths
+run_test "empty files fail before model calls" test_empty_files_fail_before_model_calls
+run_test "judges reject out-of-range scores" test_judges_reject_out_of_range_scores
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

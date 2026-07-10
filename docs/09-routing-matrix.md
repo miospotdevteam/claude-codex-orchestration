@@ -1,8 +1,8 @@
 # 09 — Routing Matrix
 
-Canonical task-type routing table for assigning `owner` and (in v2's
-plan vocabulary) `owner` value `claude-impl` / `codex-impl` /
-`grok-impl` / `manual` to each plan step. Consumed by the
+Canonical task-type routing table for assigning each plan step's
+`owner` — one of `claude-impl` / `codex-impl` / `grok-impl` /
+`manual`, the exact enum in `schemas/plan.schema.json`. Consumed by the
 `writing-plans` skill during plan creation and by the `codex-dispatch`
 skill during execution.
 
@@ -38,7 +38,7 @@ and the conductor's escalation both read from them.
 
 **Cost** is not a third selection axis — it is the tiebreak (see the
 policy below). One fact about cost is load-bearing, though: on a Codex
-subscription (the plugin's expected setup), **GPT-5.5 via the Codex
+subscription (the plugin's expected setup), **gpt-5.6-sol via the Codex
 wrappers is effectively free at the margin** and runs *off the
 conductor's context*. That is why Codex is the default implementer —
 not because it has the most taste, but because it is intelligent,
@@ -66,10 +66,10 @@ The conductor reaches six models. Route by the axis the step is
 
 | Model | Reached via | Intelligence | Taste | Route here for |
 |---|---|---|---|---|
-| **Fable 5** | `Agent(model: "fable")` | highest | highest | The hardest *and* most user-facing implementation; end-to-end multi-step work that needs both axes at once — the "steer everything" tier. |
+| **Fable 5** | `Agent(model: "fable")` | highest | highest | Plan drafting and convergence (the Claude panel seat is always Fable when available); the hardest *and* most user-facing implementation; end-to-end multi-step work that needs both axes at once — the "steer everything" tier. |
 | **Opus 4.8** | `Agent(model: "opus")` | high | high | Default Claude-side implementation floor; strong all-rounder when a step needs real taste but is not the top of the pile. |
 | **Sonnet 5** | `Agent(model: "sonnet")` | mid | mid | Cheap, read-heavy scouting and mechanical Claude-side work where taste does not ship. Never the default for code that lands. |
-| **Codex / GPT-5.5** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
+| **Codex / gpt-5.6-sol** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
 | **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations — the *second* off-context implementer; also the independent cross-family verifier for `codex-impl` steps. |
 | **Haiku** | — | low | low | **Never for real work.** Not an execution or verification tier. |
 
@@ -132,8 +132,8 @@ rules on top of it:
 2. **Taste escalation is a first-class move.** Codex is the default
    implementer, but when the artifact is user-facing (SDK, public API,
    UI, copy), route the *design* to a Claude tier first, or add a
-   Claude taste-pass after Codex. This is the `dual-pass` and "Claude
-   reviews Codex integration impact" rows made explicit.
+   Claude taste-pass after Codex. This is the dual-pass review and the
+   "Claude reviews Codex integration impact" rows made explicit.
 3. **Tiebreak for anything that ships: intelligence > taste > cost.**
    Cost decides only when intelligence and taste do not. It never
    blocks the right model for work that lands.
@@ -145,54 +145,90 @@ rules on top of it:
 ## How to Use This Table
 
 When creating a plan, classify each step by its **task category** (left
-column). The table gives the default `owner`, `mode`, and conditions under
+column). The table gives the default `owner` and the conditions under
 which the default should be overridden. Steps may span multiple categories
 — use the category that best describes the step's *primary* work.
 
 If a step would naturally span both Claude-suitable and Codex-suitable
 work (mixed ownership), **split it into two sequential steps with
 `dependsOn`**. The plan schema does not support per-step mixed
-ownership: every step has exactly one `owner` and one `mode`.
+ownership: every step has exactly one `owner`. A category whose owner
+cell lists more than one owner (e.g. `claude-impl` → `codex-impl`) is a
+*decomposition hint* — it produces that many `dependsOn`-ordered steps,
+not one multi-owner step.
 
 ---
 
 ## Task-Type Routing Table
 
-| Task Category | Default Owner | Default Mode | Override Conditions |
-|---|---|---|---|
-| **Frontend UI / visual design / UX polish** | `claude` | `claude-impl` | Skill must be in Claude-only set (`frontend-design`, `svg-art`, `immersive-frontend`). |
-| **Product copy / UX text / content** | `claude` | `claude-impl` | Skill `doc-coauthoring`. |
-| **Creative / landing page / marketing** | `claude` | `claude-impl` | Skill `frontend-design` / `immersive-frontend` / `svg-art`. |
-| **Brainstorming / requirements shaping** | `claude` | `claude-impl` | Skill `brainstorming`. Codex co-explores in parallel and reviews `design.md` before `writing-plans`. |
-| **Plan writing** | `claude` | `claude-impl` | Skill `writing-plans`. High-ambiguity tasks trigger **automatic panel planning** (see the Panel Planning section below). |
-| **Documentation / API docs / specs** | `claude` | `claude-impl` | Skill `doc-coauthoring`. Codex verifies technical accuracy via `run-codex-verify.sh` contract block. |
-| **MCP / DB / API / external integration** | `codex` | `codex-impl` | If the step is purely external-facing design (no code), it may be `claude-impl` with explicit justification. Otherwise split into design step (`claude-impl`, `doc-coauthoring`) and impl step (`codex-impl`) with `dependsOn`. |
-| **Cross-domain integration** | `codex` | `codex-impl` | Split mixed work into sequential steps: design (`claude-impl`) → backend impl (`codex-impl`) → frontend impl (`claude-impl`) with `dependsOn`. |
-| **Backend from clear spec (CRUD, services)** | `codex` | `codex-impl` | — |
-| **API route / service implementation** | `codex` | `codex-impl` | — |
-| **Refactor across many files** | `codex` | `codex-impl` | Claude reviews integration impact via verification subagent. |
-| **Framework / library migration** | `codex` | `codex-impl` | Add a leading design step (`claude-impl`, `doc-coauthoring`) with `dependsOn` if strategy needs human framing. |
-| **Dependency upgrade** | `codex` | `codex-impl` | Same as migration: optional leading design step for breaking-change discussion. |
-| **i18n string extraction sweep** | `codex` | `codex-impl` | Add a leading convention-defining step (`claude-impl`) with `dependsOn` if convention is ambiguous. |
-| **Bug investigation / root cause analysis** | `codex` | `codex-impl` | Skill `systematic-debugging`. |
-| **Failing test / CI failure** | `codex` | `codex-impl` | Skill `systematic-debugging`. |
-| **Performance optimization** | `codex` | `codex-impl` | Investigation step is `codex-impl`. Fix steps assigned after via Dynamic Routing: backend → `codex-impl`, frontend → `claude-impl`. |
-| **Security review / audit** | both | `dual-pass` | Claude: design-level. Codex: implementation-level. Both passes independent. |
-| **Security-sensitive design** | `claude` | `claude-impl` | Skill `brainstorming` / `doc-coauthoring`. Codex does adversarial challenge pass via `run-codex-verify.sh`. |
-| **CI/CD pipeline setup** | `codex` | `codex-impl` | — |
-| **Test writing** | `codex` | `codex-impl` | Gets TDD skill injected. |
-| **PR review** | both | `dual-pass` | Claude: design/architecture. Codex: correctness/security. |
-| **Post-step verification** | `codex` | (verification dispatch — not a step mode) | Codex's verification of `claude-impl` runs via `run-codex-verify.sh` and emits a Summary / Verdict / Findings contract block. Verification is structural, not a step. |
-| **Design system update (tokens)** | varies | sequential | Step A: design tokens + core primitives (`claude-impl`, `frontend-design`). Step B: sweep components to use tokens (`codex-impl`, `dependsOn: [A]`). |
-| **Dark mode / theming** | varies | sequential | Step A: theme system + ThemeProvider (`claude-impl`, `frontend-design`). Step B: sweep components (`codex-impl`, `dependsOn: [A]`). |
-| **Dashboard with charts** | varies | sequential | Step A: layout shell (`claude-impl`, `frontend-design`). Step B: data hooks (`codex-impl`, TDD). Step C: wire charts (`claude-impl`, `dependsOn: [A, B]`). |
-| **Real-time / collaborative features** | varies | sequential | Step A: architecture decision (`claude-impl`, `brainstorming`). Step B: backend (`codex-impl`). Step C: frontend (`claude-impl`, `frontend-design`). `dependsOn` chain or fan-in as appropriate. |
-| **Stripe / payment integration** | varies | sequential | Step A: external API surface design (`claude-impl`, `doc-coauthoring`). Step B: internal services + DB models (`codex-impl`, `dependsOn: [A]`). Step C: webhooks/checkout UI (`claude-impl`, `dependsOn: [B]`). |
-| **Plugin / MCP development** | varies | sequential | Step A: skills + MCP surface (`claude-impl`, `mcp-builder` or `doc-coauthoring`). Step B: hooks + scripts + manifest (`codex-impl`, `dependsOn: [A]`). |
-| **React Native (mobile) UI/UX** | `claude` | `claude-impl` | Skill `react-native-mobile`, **conditional** per the RN Routing Directive (see RN section below). |
-| **React Native (mobile) code-heavy** | `codex` | `codex-impl` | Skill `react-native-mobile`, **conditional** per the RN Routing Directive (see RN section below). |
-| **Vague / ambiguous request** | `claude` | `claude-impl` | Clarification step is `claude-impl`. Once concrete, subsequent steps assigned normally via this table — most will land on `codex-impl`. |
-| **Anything not above (config, glue, wiring, mechanical work)** | `codex` | `codex-impl` | Codex default. |
+| Task Category | Default Owner | Override Conditions |
+|---|---|---|
+| **Frontend UI / visual design / UX polish** | `claude-impl` | Skill must be in Claude-only set (`frontend-design`, `svg-art`, `immersive-frontend`). |
+| **Product copy / UX text / content** | `claude-impl` | Skill `doc-coauthoring`. |
+| **Creative / landing page / marketing** | `claude-impl` | Skill `frontend-design` / `immersive-frontend` / `svg-art`. |
+| **Brainstorming / requirements shaping** | `claude-impl` | Skill `brainstorming`. Codex co-explores in parallel and reviews `design.md` before `writing-plans`. |
+| **Plan writing** | `claude-impl` | Skill `writing-plans`. High-ambiguity tasks trigger **automatic panel planning** (see the Panel Planning section below). |
+| **Documentation / API docs / specs** | `claude-impl` | Skill `doc-coauthoring`. Codex verifies technical accuracy via `run-codex-verify.sh` contract block. |
+| **MCP / DB / API / external integration** | `codex-impl` | If the step is purely external-facing design (no code), it may be `claude-impl` with a one-line routing justification in the step description. Otherwise split into design step (`claude-impl`, `doc-coauthoring`) and impl step (`codex-impl`) with `dependsOn`. |
+| **Cross-domain integration** | `codex-impl` | Split mixed work into sequential steps: design (`claude-impl`) → backend impl (`codex-impl`) → frontend impl (`claude-impl`) with `dependsOn`. |
+| **Backend from clear spec (CRUD, services)** | `codex-impl` | — |
+| **API route / service implementation** | `codex-impl` | — |
+| **Refactor across many files** | `codex-impl` | Claude reviews integration impact via verification subagent. |
+| **Framework / library migration** | `codex-impl` | Add a leading design step (`claude-impl`, `doc-coauthoring`) with `dependsOn` if strategy needs human framing. |
+| **Dependency upgrade** | `codex-impl` | Same as migration: optional leading design step for breaking-change discussion. |
+| **i18n string extraction sweep** | `codex-impl` | Add a leading convention-defining step (`claude-impl`) with `dependsOn` if convention is ambiguous. |
+| **Bug investigation / root cause analysis** | `codex-impl` | Skill `systematic-debugging`. |
+| **Failing test / CI failure** | `codex-impl` | Skill `systematic-debugging`. |
+| **Performance optimization** | `codex-impl` | Investigation step is `codex-impl`. Fix steps assigned after via Dynamic Routing: backend → `codex-impl`, frontend → `claude-impl`. |
+| **Security review / audit** | `codex-impl` + `claude-impl` | Dual-pass verification, both passes independent: a `codex-impl` step for the implementation-level audit and a separate `claude-impl` step for the design-level review. Split into two independent single-owner steps. |
+| **Security-sensitive design** | `claude-impl` | Skill `brainstorming` / `doc-coauthoring`. Codex does adversarial challenge pass via `run-codex-verify.sh`. |
+| **CI/CD pipeline setup** | `codex-impl` | — |
+| **Test writing** | `codex-impl` | Gets TDD skill injected. |
+| **PR review** | `codex-impl` + `claude-impl` | Dual-pass, both passes independent: a `codex-impl` step for correctness/security and a separate `claude-impl` step for design/architecture. Split into two independent single-owner steps. |
+| **Post-step verification** | `codex-impl` | Not a plan step — a verification dispatch. Codex's verification of `claude-impl` runs via `run-codex-verify.sh` and emits a Summary / Verdict / Findings contract block. Verification is structural, not a step. |
+| **Design system update (tokens)** | `claude-impl` → `codex-impl` | Sequential `dependsOn` steps. Step A: design tokens + core primitives (`claude-impl`, `frontend-design`). Step B: sweep components to use tokens (`codex-impl`, `dependsOn: [A]`). |
+| **Dark mode / theming** | `claude-impl` → `codex-impl` | Sequential `dependsOn` steps. Step A: theme system + ThemeProvider (`claude-impl`, `frontend-design`). Step B: sweep components (`codex-impl`, `dependsOn: [A]`). |
+| **Dashboard with charts** | `claude-impl` → `codex-impl` → `claude-impl` | Sequential `dependsOn` steps. Step A: layout shell (`claude-impl`, `frontend-design`). Step B: data hooks (`codex-impl`, TDD). Step C: wire charts (`claude-impl`, `dependsOn: [A, B]`). |
+| **Real-time / collaborative features** | `claude-impl` → `codex-impl` → `claude-impl` | Sequential `dependsOn` steps. Step A: architecture decision (`claude-impl`, `brainstorming`). Step B: backend (`codex-impl`). Step C: frontend (`claude-impl`, `frontend-design`). `dependsOn` chain or fan-in as appropriate. |
+| **Stripe / payment integration** | `claude-impl` → `codex-impl` → `claude-impl` | Sequential `dependsOn` steps. Step A: external API surface design (`claude-impl`, `doc-coauthoring`). Step B: internal services + DB models (`codex-impl`, `dependsOn: [A]`). Step C: webhooks/checkout UI (`claude-impl`, `dependsOn: [B]`). |
+| **Plugin / MCP development** | `claude-impl` → `codex-impl` | Sequential `dependsOn` steps. Step A: skills + MCP surface (`claude-impl`, `mcp-builder` or `doc-coauthoring`). Step B: hooks + scripts + manifest (`codex-impl`, `dependsOn: [A]`). |
+| **React Native (mobile) UI/UX** | `claude-impl` | Skill `react-native-mobile`, **conditional** per the RN Routing Directive (see RN section below). |
+| **React Native (mobile) code-heavy** | `codex-impl` | Skill `react-native-mobile`, **conditional** per the RN Routing Directive (see RN section below). |
+| **Desktop-GUI / computer-use (drive a desktop app, an OS dialog, a GUI-only workflow, visual verification of a native app)** | `codex-impl` | Codex's computer-use lane; **IMPL only — never route to the verify lane**. Browser-only work is not this row: Claude automates Chrome natively, so it stays wherever the matrix already routes it. See the *Computer-use routing* note below. |
+| **Vague / ambiguous request** | `claude-impl` | Clarification step is `claude-impl`. Once concrete, subsequent steps assigned normally via this table — most will land on `codex-impl`. |
+| **Anything not above (config, glue, wiring, mechanical work)** | `codex-impl` | Codex default. |
+
+---
+
+## Computer-use routing
+
+The Codex lane carries **computer use**: the Codex CLI's machine config
+ships an `mcp_servers.computer-use` entry — an MCP server that lets
+Codex drive macOS desktop apps — plus browser-use backends (Chrome and
+an in-app browser). Those tools are present in every `codex exec`
+session with no extra flags, including the sessions the plugin's
+wrappers start, so they are the capability's basis (not a per-machine
+quirk). This is why desktop-GUI work routes to `codex-impl`: it reaches
+what Claude's own tool surface cannot.
+
+- **Browser-only work is not computer-use work.** Claude's harness
+  automates Chrome natively, so anything that is purely a web page stays
+  wherever the matrix already routes it. Codex's own guidance likewise
+  prefers its Chrome plugin over Computer Use for browser tasks. The
+  computer-use route exists for driving a native desktop app, an OS
+  dialog, or a GUI-only workflow — the things Claude's tools cannot
+  reach.
+- **Safety boundary — IMPL lane only.** Computer-use tasks ride the
+  `codex-impl` lane and never the verify lane. The verify wrapper's
+  read-only sandbox constrains *file writes*, not *desktop side
+  effects*: a read-only verifier can still click buttons, move files
+  through Finder, or send messages in a native app. A verifier must
+  therefore never be asked to drive the GUI. Keep computer-use work on
+  the implementation lane, where the side effects are expected.
+
+See `docs/06-codex-integration.md` for the capability's mechanics
+(machine-config MCP server, wrapper-spawned availability,
+graceful degradation when the server is absent).
 
 ---
 
@@ -203,14 +239,15 @@ These rules override the table above:
 1. **Codex is the default implementer.** Under conductor mode, every step
    is presumed `codex-impl` unless one of three conditions holds: (a) the
    step's `skill` is in the Claude-only set below, (b) the RN-mobile
-   Routing Directive sends it to Claude, or (c) a documented routing-matrix
-   override applies (e.g., security-sensitive design, MCP/external-tool
-   reasoning). Claude-impl steps without a written `routingJustification`
-   citing one of these reasons are a planning bug.
+   Routing Directive routes it to `claude-impl`, or (c) a documented
+   routing-matrix override applies (e.g., security-sensitive design,
+   MCP/external-tool reasoning). A `claude-impl` step whose description
+   does not carry a one-line routing justification citing one of these
+   reasons is a planning bug.
 
 2. **Claude-only skill set (exact, exhaustive — six skills).** A step's
-   `skill` field forces `owner: "claude"` if and only if the skill is one
-   of EXACTLY:
+   `skill` field forces `owner: "claude-impl"` if and only if the skill is
+   one of EXACTLY:
 
    ```
    frontend-design, svg-art, immersive-frontend,
@@ -225,7 +262,7 @@ These rules override the table above:
 3. **One step has one owner.** Mixed-ownership work is split into two
    sequential single-owner steps linked by `dependsOn`. The plan schema
    does not support per-file or per-group ownership; each step carries
-   exactly one `owner` and one `mode`.
+   exactly one `owner`.
 
 4. **Conductor mode is the default.** The main thread dispatches every
    step to a subagent and reads only the parsed Codex contract block
@@ -250,7 +287,7 @@ These rules override the table above:
    `run-codex-impl.sh`.
 
 7. **User can override any assignment.** During Orbit plan review, the
-   user may change any step's `owner` and `mode`. The routing matrix
+   user may change any step's `owner`. The routing matrix
    provides defaults, not mandates.
 
 8. **Wrapper-modification serialization.** A step that edits
@@ -314,7 +351,8 @@ routing rule. If a step blends both kinds of work, split
 it into two sequential steps with `dependsOn` rather than forcing a
 single owner.
 
-`routingJustification` examples:
+Routing-justification examples (write these into the step description,
+not a separate field):
 - `"react-native-mobile UI/UX per Routing Directive → claude-impl"`
 - `"react-native-mobile code-heavy per Routing Directive → codex-impl"`
 
@@ -351,7 +389,8 @@ unbiased-judge consensus on a 0–5 rubric):
 - Solo plans from codex, grok, opus, and fable clustered tightly
   (4.44–4.67) — no single model dominates planning.
 - **Parallel-independent drafts + one convergence pass beat every solo
-  plan (4.88)** and led all five rubric dimensions with every judge.
+  plan (4.88)** and led four of five rubric dimensions in the judge
+  consensus — codex-solo edged it on the risks dimension (4.92 vs 4.90).
 - **A sequential relay (draft → revise → finalize) scored below the
   best solo plan (4.56)** — later models anchor on the first draft and
   polish it instead of reopening decisions.
@@ -369,12 +408,18 @@ Panel-plan when ANY of:
 - the plan will span ≥3 domains (e.g. mobile + API + backend) or
   ≥ ~8 steps.
 
-**Skip when:** the user said "just do it" / "quick" / "no plan"; the
-work is single-domain from a clear spec; the work is a mechanical
-sweep. The user can force either mode ("panel plan this" / "solo plan
-is fine"). Cost: a panel is ~3–4× a solo plan draft — the selective
-trigger is what keeps it affordable; wall-clock cost is low because
-generation is parallel.
+**The trigger is binding, not advisory.** When any condition above
+matches, the conductor runs the panel — it does not weigh whether the
+panel "seems worth it" for this particular task; that judgment call is
+exactly how panels get skipped on the tasks that need them (observed
+in practice: a conductor explicitly declined a matching panel until
+the user intervened). The ONLY things that skip a matching trigger
+are the user's own words: "just do it" / "quick" / "no plan" /
+"solo plan is fine". Conversely, work that matches no trigger plans
+solo (single-domain clear-spec work, mechanical sweeps), and the user
+can force a panel anytime with "panel plan this". Cost: a panel is
+~3–4× a solo plan draft — the selective trigger is what keeps it
+affordable; wall-clock cost is low because generation is parallel.
 
 ### Protocol (never sequential)
 
@@ -389,10 +434,13 @@ generation is parallel.
      `panel/grok.plan.md`. If the grok lane is unavailable (wrapper
      exit 4), proceed as a two-model panel and note it in
      `progress.json` `deviations` once progress exists.
-   - **Claude planner** via `Agent` with an explicit model per the
-     Model Scorecard (Opus floor; Fable when the task is the hardest /
-     most user-facing), writing `panel/claude.plan.md`.
-3. **Convergence.** One Claude sub-agent (Fable preferred, Opus floor)
+   - **Claude planner** via `Agent` with an explicit model: **Fable
+     whenever available, otherwise Opus** — the plan is the
+     highest-leverage artifact in the loop, so the strongest model
+     drafts it; Opus is the implementation tier, not the planning
+     tier. Writes `panel/claude.plan.md`.
+3. **Convergence.** One Claude sub-agent (same rule: Fable whenever
+   available, otherwise Opus)
    reads the brief plus all drafts and produces the converged plan:
    a definite decision wherever the drafts disagree (with a one-line
    reason — never "either works"), redundancy cut, complementary
@@ -409,8 +457,8 @@ generation is parallel.
 
 ## Skill Injection Rules
 
-When `owner: "codex"`, the step's `skill` field determines what guidance
-Codex receives in its developer-instructions:
+When `owner: "codex-impl"`, the step's `skill` field determines what
+guidance Codex receives in its developer-instructions:
 
 | Step skill | Codex gets |
 |---|---|
@@ -478,7 +526,16 @@ model family than the implementer. Empirical grounding: in the
 2026-07-10 blind plan eval (`eval/results/2026-07-10-plan-eval/`),
 codex and fable judges favored their own blind-labeled work by +0.30
 and +0.47 (harshness-adjusted) while grok and opus showed none —
-same-family review measurably overrates its own output. When the Grok lane is configured
+same-family review measurably overrates its own output. Corroborating
+observation (2026-07-10): on identical input the Grok verifier (then
+backed by Grok 4.3) returned PASS with 0 findings where the Codex
+verifier returned FAIL with 18. After the backend moved to Grok 4.5
+later the same day, the same verify prompt on the same material
+returned FINDINGS with 6 substantive items — verifier strictness is
+model-version-dependent, so leniency observations must be re-measured
+after upstream model changes. Both observations are further evidence
+*for* cross-family verification, not a routing or model change.
+When the Grok lane is configured
 (the `grok` CLI is installed and authenticated), `codex-impl` steps are
 verified via `run-grok-verify.sh`, while `grok-impl` and `claude-impl`
 steps are verified via `run-codex-verify.sh`. **Fallback:** whenever the
@@ -499,11 +556,14 @@ Two model-selection regimes coexist, and they must not be confused:
   runs its machine default on the impl/verify side. The Codex wrappers
   MUST NOT pass `--model` / `-m`: `scripts/run-codex-impl.sh` and
   `scripts/run-codex-verify.sh` invoke `codex exec` without one, and no
-  caller adds it. The Grok wrappers pin `-m grok-build` in-script —
-  the subscription's Grok 4.5-backed coding model — because the CLI
-  default is user-configurable (`~/.grok/config.toml`) and the raw
-  `grok-4.5` model id bills xAI API credits instead of the subscription
-  pool. The verify wrapper additionally enforces read-only via
+  caller adds it. The Grok wrappers pin `-m grok-4.5` in-script —
+  the subscription's current default coding model per `grok models` —
+  because the CLI default is user-configurable (`~/.grok/config.toml`)
+  and an unpinned wrapper would silently follow whatever that config
+  says. When xAI renames the subscription model id (as happened when
+  `grok-build` was retired for `grok-4.5`), the pin is the single
+  place to update, and a stale pin fails loudly with "unknown model
+  id" (wrapper exit 2) rather than silently running a different model. The verify wrapper additionally enforces read-only via
   `--deny 'Write' --deny 'Edit' --deny 'Bash'`. The invariant is the
   same for both pairs:
   **callers never supply a model to either wrapper pair**; the model is

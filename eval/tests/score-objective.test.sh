@@ -167,5 +167,25 @@ expect_failure \
   "$zero_fixture/tests" \
   "zero tests"
 
+nonzero_full_fixture="$TMP_DIR/nonzero-full"
+mkdir -p "$nonzero_full_fixture"
+make_candidate "$nonzero_full_fixture/candidate"
+make_tests "$nonzero_full_fixture/tests" 3 3 1
+expect_failure \
+  "nonzero exit contradicts full-pass tally" \
+  "$nonzero_full_fixture/candidate" \
+  "$nonzero_full_fixture/tests" \
+  "exit status 1 contradicts full-pass RESULT 3 3"
+
+zero_partial_fixture="$TMP_DIR/zero-partial"
+mkdir -p "$zero_partial_fixture"
+make_candidate "$zero_partial_fixture/candidate"
+make_tests "$zero_partial_fixture/tests" 2 5 0
+expect_failure \
+  "zero exit contradicts partial-failure tally" \
+  "$zero_partial_fixture/candidate" \
+  "$zero_partial_fixture/tests" \
+  "exit status 0 contradicts partial RESULT 2 5"
+
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

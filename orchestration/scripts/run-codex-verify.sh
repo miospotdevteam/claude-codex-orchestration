@@ -65,6 +65,7 @@ done
 [[ -n "$PLAN_ID" ]] || die_invocation "--plan-id is required"
 [[ -n "$STEP_ID" ]] || die_invocation "--step-id is required"
 [[ -n "$ROOT_DIR" ]] || die_invocation "--root-dir is required"
+[[ "$ROOT_DIR" = /* ]] || die_invocation "--root-dir must be an absolute path"
 [[ -d "$ROOT_DIR" ]] || die_invocation "--root-dir does not exist or is not a directory: $ROOT_DIR"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

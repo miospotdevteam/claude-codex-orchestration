@@ -1,6 +1,6 @@
 ---
 name: persistent-plans
-description: Plan files on disk are the source of truth — not context memory. Use whenever you start non-trivial coding work, resume after a context compaction, or the user says "continue" / "where were we". Locates the active plan dir under `.temp/plan-mode/active/<planId>/`, reads `plan.json` (immutable) and `progress.json` (mutable), mirrors progress into a TaskList, and applies the resumption protocol from docs/04-execution-loop.md. Do NOT use for pure read-only questions, conversations that don't touch code, or tasks the user has explicitly tagged "just do it" / "no plan".
+description: Plan files on disk are the source of truth — not context memory. Use whenever you start non-trivial coding work, resume after a context compaction, or the user says "continue" / "where were we". Locates the active plan dir under `.temp/plan-mode/active/<planId>/`, reads `plan.json` (immutable) and `progress.json` (mutable), mirrors progress into a TaskList, and applies the resumption protocol described below. Do NOT use for pure read-only questions, conversations that don't touch code, or tasks the user has explicitly tagged "just do it" / "no plan".
 allowed-tools: Read, Edit, Write, Bash, Glob
 ---
 
@@ -39,9 +39,9 @@ Every plan lives in a single directory at:
 Boundaries:
 
 - **`plan.json` is read-only after approval.** Once `frozen: true`, the
-  definition does not change. Field reference: `schemas/plan.schema.json`.
+  definition does not change. Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json`.
 - **`progress.json` is the only file the conductor mutates during
-  execution.** Field reference: `schemas/progress.schema.json`.
+  execution.** Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/progress.schema.json`.
 - **`masterPlan.md` is for humans.** Not consumed by any tool; not part
   of the resumption protocol.
 - **`logs/` is opaque.** Wrappers write Codex streams there. The
@@ -50,11 +50,12 @@ Boundaries:
 ## The canonical helper
 
 All reads, writes, and frontier computations go through
-`scripts/plan-utils.sh`. Subcommands:
+`${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh`. Subcommands:
 
 - `get-plan-dir <project-root>` — locate the active plan dir.
 - `read-plan <plan-dir>` / `read-progress <plan-dir>` — validated reads.
 - `init-progress <plan-dir>` — initialize progress.json from plan.json.
+- `start-step <plan-dir> <step-id> <executor> <model>` — atomically start a step and record its dispatch.
 - `set-step-status <plan-dir> <step-id> <status>` — atomic status update.
 - `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json>` — write the verifier's result.
 - `set-frontier <plan-dir> <ids…>` / `compute-frontier <plan-dir>` — manage the runnable frontier.
@@ -80,13 +81,16 @@ After every status change, recompute the frontier and write it to
 parallel by default, serialized when two runnable steps overlap on
 files — see `codex-dispatch`).
 
-Flipping a step to `in_progress` records a `dispatch` object —
+Before dispatch, invoke
+`${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step <plan-dir> <step-id> <executor> <model>`.
+The helper atomically flips the step to `in_progress`, records the step's
+`startedAt`, and writes the full `dispatch` object —
 `{executor, model, startedAt}`, with `executor` one of
-`codex` | `grok` | `claude` — alongside the step's `startedAt`. It is
-overwritten on re-dispatch, so it always names the model behind the
-recorded verdict. On resumption, the conductor surfaces in-flight
-steps' dispatch info in its status line, so the user can see which
-models were mid-flight when the prior session ended.
+`codex` | `grok` | `claude`. The dispatch record is overwritten on
+re-dispatch, so it always names the model behind the recorded verdict.
+On resumption, the conductor surfaces in-flight steps' dispatch info in
+its status line, so the user can see which models were mid-flight when
+the prior session ended.
 
 ## Resumption protocol
 

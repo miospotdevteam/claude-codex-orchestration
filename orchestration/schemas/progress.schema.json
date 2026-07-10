@@ -35,6 +35,28 @@
       "additionalProperties": {
         "$ref": "#/$defs/stepProgress"
       }
+    },
+    "deviations": {
+      "type": "array",
+      "description": "Plan-level deviations: events that changed how the plan as a whole executes (a panel lane failing, an executor rerouted for quota, a model id migration). Step-scoped divergences belong in steps.<id>.deviations instead.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "note"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "note": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
     }
   },
   "$defs": {
@@ -47,7 +69,8 @@
       "additionalProperties": false,
       "required": [
         "executor",
-        "model"
+        "model",
+        "startedAt"
       ],
       "properties": {
         "executor": {

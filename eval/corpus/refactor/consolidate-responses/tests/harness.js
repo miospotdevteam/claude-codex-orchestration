@@ -26,7 +26,11 @@ function loadHandlersWithRespond(spies) {
   delete require.cache[require.resolve(respondPath)];
   const originalLoad = Module._load;
   Module._load = function (request, parent, isMain) {
-    if (parent && parent.filename === handlersPath && request === "./respond") {
+    if (
+      parent &&
+      parent.filename === handlersPath &&
+      (request === "./respond" || request === "./respond.js")
+    ) {
       return spies;
     }
     return originalLoad.apply(this, arguments);
@@ -77,6 +81,10 @@ test("getOrder found and missing", (M) => {
 });
 
 // --- target shape present and correct ---
+test("respond.js exports exactly the two response helpers", (M) => {
+  assert.deepStrictEqual(Object.keys(M.respond).sort(), ["notFound", "ok"]);
+});
+
 test("respond.ok builds a 200 envelope", (M) => {
   assert.strictEqual(typeof M.respond.ok, "function");
   assert.deepStrictEqual(M.respond.ok({ a: 1 }), { status: 200, body: { a: 1 } });

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --max-turns is capped at 80 (raised from 40, which exhausted on realistic
+# workloads 2026-07-10); exhaustion surfaces as exit 2 plus a diagnostic log.
+
 usage() {
   cat >&2 <<'USAGE'
 Usage: run-grok-impl.sh --plan-id <id> --step-id <id> --root-dir <absolute-path> [--skill <name>]
@@ -76,7 +79,10 @@ mkdir -p "$logs_dir"
 
 prompt_file="$(mktemp "$logs_dir/prompt.XXXXXX")"
 parse_err="$(mktemp "$logs_dir/parse-error.XXXXXX")"
-trap 'rm -f "$prompt_file" "$parse_err"' EXIT
+stdout_file="$(mktemp "$logs_dir/stdout.XXXXXX")"
+stderr_file="$(mktemp "$logs_dir/stderr.XXXXXX")"
+contract_file="$(mktemp "$logs_dir/contract.XXXXXX")"
+trap 'rm -f "$prompt_file" "$parse_err" "$stdout_file" "$stderr_file" "$contract_file"' EXIT
 
 {
   cat <<EOF
@@ -96,25 +102,80 @@ EOF
 
   cat <<'EOF'
 Your final output must end with the contract block in the exact shape specified. Do not omit any field. Do not emit anything after === END-CONTRACT ===.
+
+The block must be plain text: no markdown bold, exact field labels, both sentinel lines mandatory, nothing after the closing sentinel.
+
+=== ORCHESTRATION-CONTRACT ===
+Summary: <one paragraph, at most 6 sentences, plain prose>
+Verdict: PASS | FINDINGS | FAIL
+Findings:
+- <one-line finding, or omit on PASS>
+FilesTouched:
+=== END-CONTRACT ===
 EOF
 } >"$prompt_file"
 
+# Capture stdout and stderr separately and parse stdout only, so a CLI footer or
+# late stderr diagnostic cannot force a spurious exit 3. A merged copy is written
+# to the log dir for human debugging.
 set +e
 grok \
   --prompt-file "$prompt_file" \
   --cwd "$root_dir" \
-  -m grok-build \
+  -m grok-4.5 \
   --always-approve \
-  --max-turns 40 \
-  >"$log_file" 2>&1
+  --max-turns 80 \
+  >"$stdout_file" 2>"$stderr_file"
 grok_status=$?
 set -e
+
+{
+  printf '%s\n' '--- grok stdout ---'
+  cat "$stdout_file"
+  printf '%s\n' '--- grok stderr ---'
+  cat "$stderr_file"
+} >"$log_file"
 
 if [[ $grok_status -ne 0 ]]; then
   exit 2
 fi
 
-if ! "$parser" <"$log_file" 2>"$parse_err"; then
+parse_input="$stdout_file"
+if awk '
+  BEGIN {
+    open_sentinel = "=== ORCHESTRATION-CONTRACT ==="
+    close_sentinel = "=== END-CONTRACT ==="
+  }
+  {
+    comparison = $0
+    sub(/\r$/, "", comparison)
+
+    if (comparison == open_sentinel) {
+      capturing = 1
+      block = $0 ORS
+      next
+    }
+
+    if (capturing) {
+      block = block $0 ORS
+      if (comparison == close_sentinel) {
+        last_complete = block
+        found_complete = 1
+        capturing = 0
+      }
+    }
+  }
+  END {
+    if (!found_complete) {
+      exit 1
+    }
+    printf "%s", last_complete
+  }
+' "$stdout_file" >"$contract_file"; then
+  parse_input="$contract_file"
+fi
+
+if ! "$parser" <"$parse_input" 2>"$parse_err"; then
   cat "$parse_err" >&2
   exit 3
 fi

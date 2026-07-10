@@ -121,8 +121,10 @@ external wrapper lane, and keep the conductor's window clean.
 
 ## Implementation surfaces
 
-The plugin's code lives at the repo root, alongside the design spec
-(`docs/`). Each role's behavior is enforced by the corresponding files:
+The plugin's code lives under `orchestration/`, alongside the design
+spec (`docs/`) and the routing-eval harness (`eval/`) at the repo root.
+Each role's behavior is enforced by the corresponding files (paths
+below are relative to `orchestration/` unless noted):
 
 - **Manifests** — `.claude-plugin/marketplace.json` at the repo root
   declares this repo as a one-plugin marketplace pointing at
@@ -161,7 +163,7 @@ The plugin's code lives at the repo root, alongside the design spec
 - **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
 
 The full design spec sits under `docs/01-philosophy.md` …
-`docs/10-grok-integration.md`. Read `docs/02-conductor.md` for the
+`docs/11-routing-eval.md`. Read `docs/02-conductor.md` for the
 conductor's full contract, `docs/06-codex-integration.md` and
 `docs/10-grok-integration.md` for wrapper lane contracts,
 `docs/09-routing-matrix.md` for cross-family verification policy, and

@@ -175,35 +175,50 @@ quality score (all domains).
 ### Objective correctness
 
 For code domains, `eval/scripts/score-objective.sh` takes a candidate's
-produced-files directory and a task's hidden `tests/` directory, runs
-`tests/run.sh` in a sandbox, and emits a JSON score object:
+produced-files directory (`--candidate-dir`) and a task's hidden `tests/`
+directory (`--tests-dir`), plus `--task-id`, `--model`, and `--track` for
+identity. It copies **both** the candidate's produced files and the hidden
+tests into a fresh `mktemp` sandbox and runs `tests/run.sh <candidate_dir>`
+against the staged copy, then emits a JSON score object:
 
 ```json
 { "taskId": "backend/url-shortener", "model": "codex", "track": "A",
   "passed": 7, "total": 8, "correctness": 0.875 }
 ```
 
-`correctness` is `passed / total`, a number in `[0, 1]`. A task with
-**zero tests** is reported as an explicit error, never a silent pass —
-a corpus task with no runnable tests is a corpus bug, and the scorer
-surfaces it rather than scoring it 1.0.
+`correctness` is `passed / total`, a number in `[0, 1]`. The contract with
+`tests/run.sh` is exact: its final stdout line must be `RESULT <passed>
+<total>` with non-negative integers and `total > 0`, and its exit status
+must be `0` exactly when `passed == total`. The scorer **fails closed** on
+any incoherence — a missing `RESULT` line, a `total` of zero, `passed >
+total`, or an exit status that contradicts the tally (a full-pass tally
+with a non-zero exit, or a partial tally with exit `0`) is a hard error,
+not a silent score. A task with **zero tests** is therefore reported as an
+explicit error, never a silent pass: a corpus task with no runnable tests
+is a corpus bug the scorer surfaces rather than scoring it 1.0.
 
 ### Judge-scored quality
 
 Correctness alone rewards a passing tangle as much as a passing clean
 solution. So every code-domain output is *also* scored by the judge
 panel on the task's quality rubric, and every taste-domain output is
-scored by the panel alone. The judge score is a rubric number (e.g. a
-0–5 mean across the rubric's dimensions).
+scored by the panel alone. Each judge returns a **single holistic 0–5
+quality number per candidate** — one overall rubric score, not a
+per-dimension sum or mean — and the harness validates that every score is
+a finite number within `[0, 5]` before it is used.
 
-The **combined score** per model per task is:
+The **combined score** per model per task, exactly as
+`eval/scripts/aggregate.sh` computes it, is:
 
-- **Code domain**: `correctness` gates, then rubric quality ranks — a
-  model must pass the tests to compete, and among passing solutions the
-  judge quality score breaks the tie. (The aggregator in
-  `eval/scripts/aggregate.sh` pins the exact combination; see the
-  scorecard section.)
-- **Taste domain**: the rubric score is the whole combined score.
+- **Code domain**: the combined score **equals the raw 0–5 judge quality
+  score, hard-gated to `0` whenever correctness is below `1.0`**. A model
+  must pass *every* test on a task to score at all; a single failing test
+  gates that task's combined score to `0`, and at the domain level any
+  code task below full correctness gates that model's whole domain
+  combined to `0`. Among fully-correct solutions the raw quality score
+  ranks them.
+- **Taste domain**: there is no objective gate; the raw 0–5 quality score
+  is the whole combined score.
 
 ### The blind cross-family judge panel
 
@@ -239,10 +254,49 @@ anonymized candidate against the rubric, with a short rationale:
   "rationale": "C handles the empty state and reads cleanest; B duplicates ..." }
 ```
 
+The blind labels are resolved through one canonical, per-run map at
+`eval/results/<runId>/raw/de-anonymization-map.json`. The **eval-runner
+session produces this file** while constructing the blind bundles and
+before it dispatches any judge. Its schema is:
+
+```json
+{
+  "mappings": [
+    {
+      "taskId": "frontend/pricing-table",
+      "track": "A",
+      "candidateModels": {
+        "A": "codex",
+        "B": "opus",
+        "C": "grok"
+      }
+    }
+  ]
+}
+```
+
+There is exactly one mapping per task and track, every task included in the
+run has both Track A and Track B mappings (a task absent from the run needs
+neither), and each `candidateModels` object has exactly the three
+blind labels `A`, `B`, and `C` mapped to three distinct model names. Label
+assignments are per task and per track, not global. `aggregate.sh` rejects a
+missing, malformed, duplicate, incomplete, or panel-inconsistent map instead
+of filtering unmapped judge records; legacy panel-local `candidateModels`
+fields may be present only when they exactly match the canonical map.
+
 The Codex and Grok judges are shelled out to via
-`eval/scripts/judge-codex.sh` and `judge-grok.sh`. The Opus judge is
-**dispatched from the driving session via `Agent`**, because the Claude
-tiers are only reachable there (see the runbook's dispatch matrix).
+`eval/scripts/judge-codex.sh` and `judge-grok.sh`. Each runs its judge
+model **read-only in an isolated `mktemp` sandbox** — never the caller's
+cwd — with the candidate bundle and rubric copied in as sandbox-local
+files (Codex under `-s read-only`, Grok under `--deny Write --deny Edit
+--deny Bash`), so a judge can read its inputs but cannot write files or
+mutate the tree it judges from. Both wrappers robustly extract the score
+object from the model's stdout via `extract-judge-json.py` — which accepts
+only finite numbers in `[0, 5]` for `A`/`B`/`C` — retry once on
+unparseable output, and re-validate the `{scores:{A,B,C}, rationale}`
+shape before emitting it. The Opus judge is **dispatched from the driving
+session via `Agent`**, because the Claude tiers are only reachable there
+(see the runbook's dispatch matrix).
 
 ---
 
@@ -263,6 +317,18 @@ them is the whole point.
   `eval/scripts/bare-codex.sh` / `bare-grok.sh` for the CLI models, and
   a bare `Agent` prompt for the Claude tiers. Track B measures the raw
   model.
+
+  The two bare wrappers run at **parity**: both prepend the identical
+  minimal preamble (`Complete the following task.`) to the task's spec
+  and nothing else, and both execute the model in an isolated workdir
+  (`--workdir`, or an ephemeral `mktemp` dir) so produced files are
+  captured for scoring instead of polluting the caller. The only flags
+  either passes are *execution-environment* flags, never prompt
+  scaffolding: `bare-codex.sh` uses `codex exec -s workspace-write
+  --skip-git-repo-check` so the model can write into the non-git workdir;
+  `bare-grok.sh` pins the model with **`-m grok-4.5`** and runs
+  `--always-approve --max-turns 80`. Each emits `{ "model": …, "track":
+  "bare", "taskId": …, "output": "<raw stdout>" }`.
 
 The per-model **`delta(A, B)`** — combined score on Track A minus
 combined score on Track B — is the harness's verdict on the plugin's own
@@ -309,9 +375,13 @@ from the judge panel, collected under `eval/results/<runId>/raw/`) and
 emits a per-domain scorecard in two forms into
 `eval/results/<runId>/`:
 
-- **`scorecard.json`** — machine-readable. Per domain: the ranked models
-  with their combined scores, the margin between #1 and #2, and each
-  model's `delta(A, B)`.
+- **`scorecard.json`** — machine-readable. Per domain: the Track-A
+  ranking (models with their `combined`, `correctness`, and `quality`),
+  the `margin` between #1 and #2, and each model's `delta(A, B)` as
+  `wrapperDelta`. `combined` is the raw 0–5 quality gated by correctness
+  (above); `correctness` is present for code domains and `null` for
+  taste; the ranking is **Track A only**, because Track A is the
+  production wrapper path routing is decided on.
 - **`scorecard.md`** — the same data as a human-readable table.
 
 ```json
@@ -320,23 +390,59 @@ emits a per-domain scorecard in two forms into
   "domains": {
     "backend": {
       "ranking": [
-        { "model": "codex", "combined": 0.91, "correctness": 0.94, "quality": 4.3 },
-        { "model": "opus",  "combined": 0.86, "correctness": 0.94, "quality": 3.9 }
+        { "model": "codex", "combined": 4.3, "correctness": 1,    "quality": 4.3 },
+        { "model": "opus",  "combined": 3.9, "correctness": 1,    "quality": 3.9 },
+        { "model": "grok",  "combined": 0,   "correctness": 0.88, "quality": 3.4 }
       ],
-      "margin": 0.05,
-      "wrapperDelta": { "codex": 0.07, "grok": -0.02, "opus": 0.01 }
+      "margin": 0.4,
+      "wrapperDelta": { "codex": 0.2, "opus": 0.1, "grok": 0 }
     }
   }
 }
 ```
 
+Read the example off the formula. On Track A, codex and opus pass every
+backend test (`correctness` `1.0`), so each one's `combined` is simply
+its raw quality — `4.3` and `3.9`. grok fails a test somewhere in the
+domain (`correctness` `0.88 < 1.0`), so its `combined` is **gated to `0`**
+even though its quality is `3.4`; a non-passing solution cannot outrank a
+passing one. The `margin` is `#1 − #2` on `combined`: `4.3 − 3.9 = 0.4`.
+Each `wrapperDelta` is that model's Track-A `combined` minus its Track-B
+`combined` — codex scores `4.1` bare, so `4.3 − 4.1 = 0.2` of wrapper
+lift; opus `3.8` bare gives `3.9 − 3.8 = 0.1`; grok is gated to `0` on
+both tracks, so its delta is `0`. There is **no normalization** of quality: every quality and
+`combined` number on the card is on the raw 0–5 scale, or a
+difference of two such numbers, never rescaled. The only 0–1 figure
+is `correctness` itself, which is a pass ratio (`passed/total`) by
+definition, consumed only by the hard gate.
+
 `runId` is passed to `aggregate.sh` as an argument — the harness scripts
 take no wall-clock or random input, so a run is reproducible and its
 output directory is named by the operator, not by the clock.
 
+**Task identity and kind come from the corpus tree, not the score
+records.** `aggregate.sh` walks `eval/corpus/*/*`, deriving each task's
+domain from its path and its kind from disk: a task with a `tests/`
+directory is `code`, one without is `taste`. Score records are matched
+against that manifest, and a record naming a task outside the corpus is
+an error.
+
+`aggregate.sh` is **fail-closed**: before it ranks anything it runs a
+whole-dataset preflight and dies on any inconsistency rather than
+silently dropping records. It rejects an empty `raw/` (no JSON at all, or
+JSON but no score files) and a missing / malformed / duplicate /
+incomplete de-anonymization map; it requires the **full three-family
+judge panel (codex, grok, opus) on both tracks** for every judged task, a
+valid objective record for **every** code candidate on both tracks (and
+none for a taste task), rejects malformed judge or objective records
+(scores outside `[0, 5]`, non-integer or incoherent `passed` / `total`),
+and rejects any duplicate judge or objective identity. A partial or
+inconsistent run produces **no scorecard**, not a misleading one.
+
 The combined-scoring rule the aggregator applies (code = correctness
-gate + judge quality; taste = rubric only) is documented in-script and
-matches the **Scoring model** section above; the two must not drift.
+gate over raw 0–5 quality; taste = raw quality only) is documented
+in-script and matches the **Scoring model** section above; the two must
+not drift.
 
 ---
 
@@ -395,10 +501,13 @@ For a chosen `runId` and domain, the driving session:
    `eval/results/<runId>/raw/`.
 4. **Run the judge panel** — for each task, and separately per track,
    anonymize the three candidate outputs to A/B/C (position-swapped),
-   then score them with `judge-codex.sh`, `judge-grok.sh`, and an Opus
-   judge via `Agent`; write the judge JSON under `raw/`.
+   write the canonical `raw/de-anonymization-map.json`, then score the
+   bundles with `judge-codex.sh`, `judge-grok.sh`, and an Opus judge via
+   `Agent`; write the judge JSON under `raw/`.
 5. **Aggregate** — run `eval/scripts/aggregate.sh <runId>` over `raw/`
-   to emit `scorecard.json` + `scorecard.md`.
+   to emit `scorecard.json` + `scorecard.md`. It fails closed: an
+   incomplete or inconsistent dataset produces no scorecard, not a
+   misleading one.
 6. **Read and decide** — a human reads the scorecard. If the evidence
    warrants a routing change, they edit `docs/09-routing-matrix.md`
    **by hand**, as a separate step. The harness never touches it.

@@ -162,9 +162,11 @@ For anything larger, dispatch.
 - **Sub-agent returns more than its budget.** Re-dispatch with a
   tighter prompt. Do not paste the over-large summary into context to
   "summarize it" — that defeats the boundary.
-- **External wrapper returns no contract block.** The wrapper retries
-  once with a reminder. If still missing, the conductor reports the
-  failure to the user and asks how to proceed; it does not guess.
+- **External wrapper returns no contract block.** The wrapper exits 3;
+  it does not retry. The conductor re-dispatches exactly once with a
+  stricter format reminder appended to the step block. If the retry
+  also fails, the conductor reports the failure to the user and asks
+  how to proceed; it does not guess.
 - **Plan and progress disagree.** `progress.json` is the source of
   truth for state. If `plan.json` is missing a step that
   `progress.json` references, that's a bug in `writing-plans` and

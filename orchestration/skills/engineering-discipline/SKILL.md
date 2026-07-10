@@ -104,10 +104,10 @@ falls outside the step, flag it and propose a follow-up step.
 
 ## What this skill is not
 
-- It is **not** a hook or a gate. v2's design (`docs/01-philosophy.md`)
-  is that discipline lives in skills, not in tool interceptors. The
-  user can take a shortcut at any moment; this skill just makes the
-  shortcut a conscious choice rather than an unconscious one.
+- It is **not** a hook or a gate. By design, discipline in v2 lives in
+  skills, not in tool interceptors. The user can take a shortcut at any
+  moment; this skill just makes the shortcut a conscious choice rather
+  than an unconscious one.
 - It is **not** a substitute for `test-driven-development` or
   `refactoring`. Those are workflows with their own structure; this
   skill is the floor that runs underneath them.

@@ -2,8 +2,10 @@
 
 This repository is **v2 of the `orchestration` plugin for Claude Code**.
 It contains both the design spec (under `docs/`) and the plugin
-implementation that descends from it (at the repo root: `plugin.json`,
-`skills/`, `hooks/`, `scripts/`, `schemas/`, `templates/`, `tests/`).
+implementation that descends from it (under `orchestration/`:
+`.claude-plugin/plugin.json`, `skills/`, `codex-skills/`, `hooks/`,
+`scripts/`, `schemas/`, `templates/`, `tests/`). A routing-eval harness
+lives in the top-level `eval/` directory. See the layout block below.
 
 ## Why this exists
 
@@ -26,9 +28,15 @@ receipts and signatures.
 - Eight discipline skills (`engineering-discipline`, `persistent-plans`,
   `writing-plans`, `codex-dispatch`, `refactoring`,
   `test-driven-development`, `systematic-debugging`, `brainstorming`).
+- Eight auxiliary craft skills the orchestrator routes to
+  (`doc-coauthoring`, `frontend-design`, `svg-art`, `immersive-frontend`,
+  `mcp-builder`, `react-native-mobile`, `webapp-testing`,
+  `skill-review-standard`), auto-discovered from `skills/<name>/SKILL.md`.
 - Exactly two hooks, both read-only: `session-start` and `post-compact`.
 - Direction-locked Codex wrappers (`run-codex-impl.sh`, `run-codex-verify.sh`)
   with a fixed Summary / Verdict / Findings prompt contract.
+- A parallel Grok lane (`run-grok-impl.sh`, `run-grok-verify.sh`) sharing
+  the same direction-locked contract; see `docs/10-grok-integration.md`.
 - JSON Schemas for `plan.json` and `progress.json`, plus a `masterPlan.md`
   template.
 

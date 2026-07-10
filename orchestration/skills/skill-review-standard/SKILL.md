@@ -1,6 +1,6 @@
 ---
 name: skill-review-standard
-description: "Post-creation quality gate for skills. Runs structural validation, a functional with/without test, and trigger overlap analysis to produce a SHIP/REVISE/BLOCK verdict. Use after finishing a skill with skill-creator, or when reviewing any skill before shipping. Also use when the user asks to 'review my skill', 'check skill quality', 'is this skill ready to ship', or 'validate this skill'. Do NOT use for: creating skills from scratch (use skill-creator), learning skill conventions (use plugin-dev:skill-development), or reviewing application code."
+description: "Post-creation quality gate for skills. Runs structural validation, a functional with/without test, and trigger overlap analysis to produce a SHIP/REVISE/BLOCK verdict. Use after authoring or editing a skill, or when reviewing any skill before shipping. Also use when the user asks to 'review my skill', 'check skill quality', 'is this skill ready to ship', or 'validate this skill'. Do NOT use for: authoring a skill from scratch, or reviewing application code — this is a ship/no-ship gate, not an editor."
 ---
 
 # Skill Review Standard
@@ -230,8 +230,8 @@ This skill must NOT:
 - Skip the functional test (Phase 2 is mandatory)
 - Produce verbose prose findings or severity-rated issues (that's the old
   approach — keep the output compact and data-driven)
-- Replace skill-creator's iterative improvement loop (this is a one-shot
-  ship/no-ship decision)
+- Stand in for authoring or iterative editing of a skill — this is a
+  one-shot ship/no-ship decision, not a build loop
 
 The user may proceed autonomously through all three phases. User
 confirmation is only needed for the test prompt (2.1) and when reporting

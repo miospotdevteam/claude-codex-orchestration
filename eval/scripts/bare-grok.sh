@@ -75,6 +75,9 @@ fi
 if [[ -n "$spec_file" && ! -f "$spec_file" ]]; then
   die_usage "--spec-file does not exist: $spec_file"
 fi
+if [[ -n "$spec_file" && ! -s "$spec_file" ]]; then
+  die_usage "--spec-file is empty: $spec_file"
+fi
 
 require_cmd jq
 require_cmd grok
@@ -82,12 +85,14 @@ require_cmd grok
 # Meta dir holds prompt/output/stderr; always discarded. Kept separate from the
 # workdir so these files never land among the model's produced (scorable) files.
 meta="$(mktemp -d)"
+meta="$(cd "$meta" && pwd -P)"
 if [[ -n "$workdir_arg" ]]; then
   mkdir -p "$workdir_arg"
-  workdir="$workdir_arg"
+  workdir="$(cd "$workdir_arg" && pwd -P)"
   trap 'rm -rf "$meta"' EXIT
 else
   workdir="$(mktemp -d)"
+  workdir="$(cd "$workdir" && pwd -P)"
   trap 'rm -rf "$meta" "$workdir"' EXIT
 fi
 
@@ -105,7 +110,15 @@ fi
 } >"$prompt_file"
 
 set +e
-( cd "$workdir" && grok --prompt-file "$prompt_file" ) >"$output_file" 2>"$stderr_file"
+(
+  cd "$workdir"
+  grok \
+    --prompt-file "$prompt_file" \
+    --cwd "$workdir" \
+    -m grok-4.5 \
+    --always-approve \
+    --max-turns 80
+) >"$output_file" 2>"$stderr_file"
 grok_status=$?
 set -e
 

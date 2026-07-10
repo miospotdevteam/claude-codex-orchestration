@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WRAPPER="$SCRIPT_DIR/../../scripts/run-grok-impl.sh"
 ORIGINAL_PATH="$PATH"
 
+# Single place to change the expected turn cap (see AC5: 40 exhausted 2026-07-10).
+EXPECTED_MAX_TURNS=80
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -95,6 +98,70 @@ EOF
   no_contract)
     printf 'mock output without sentinels\n'
     ;;
+  preamble_footer)
+    cat <<'EOF'
+mock preamble before contract
+=== ORCHESTRATION-CONTRACT ===
+Summary: Impl wrapper extracted a surrounded contract.
+Verdict: PASS
+Findings:
+FilesTouched:
+- orchestration/tests/scripts/run-grok-impl.test.sh
+=== END-CONTRACT ===
+mock footer after contract
+EOF
+    ;;
+  two_blocks)
+    cat <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Earlier impl contract must be ignored.
+Verdict: FAIL
+Findings:
+- stale finding
+FilesTouched:
+=== END-CONTRACT ===
+interstitial output
+=== ORCHESTRATION-CONTRACT ===
+Summary: Last impl contract wins.
+Verdict: PASS
+Findings:
+FilesTouched:
+- orchestration/tests/scripts/run-grok-impl.test.sh
+=== END-CONTRACT ===
+mock footer after both contracts
+EOF
+    ;;
+  missing_open)
+    cat <<'EOF'
+Summary: Impl output is missing its opening sentinel.
+Verdict: PASS
+Findings:
+FilesTouched:
+=== END-CONTRACT ===
+EOF
+    ;;
+  missing_close)
+    cat <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Impl output is missing its closing sentinel.
+Verdict: PASS
+Findings:
+FilesTouched:
+EOF
+    ;;
+  stderr_noise)
+    cat <<'EOF'
+mock preface
+=== ORCHESTRATION-CONTRACT ===
+Summary: Impl wrapper parsed stdout despite late stderr noise.
+Verdict: PASS
+Findings:
+FilesTouched:
+- orchestration/tests/scripts/run-grok-impl.test.sh
+=== END-CONTRACT ===
+EOF
+    printf 'grok: late diagnostic footer emitted on stderr\n' >&2
+    ;;
   *)
     printf 'unknown GROK_MOCK_MODE: %s\n' "$GROK_MOCK_MODE" >&2
     exit 99
@@ -121,6 +188,8 @@ run_with_mock() {
   local mode="$2"
   local expected_status="$3"
   local expected_verdict="${4:-}"
+  local expected_summary="${5:-}"
+  local expected_log_text="${6:-}"
   local case_dir="$TMP_DIR/$name"
   local root_dir="$case_dir/root"
   local bin_dir="$case_dir/bin"
@@ -155,6 +224,18 @@ run_with_mock() {
   if [[ "$expected_status" -eq 0 ]]; then
     if ! jq -e --arg verdict "$expected_verdict" '.verdict == $verdict' "$stdout_file" >/dev/null; then
       fail "$name" "stdout is not parsed JSON with verdict $expected_verdict: $(<"$stdout_file")"
+      return
+    fi
+    if [[ -n "$expected_summary" ]] && ! jq -e --arg summary "$expected_summary" '.summary == $summary' "$stdout_file" >/dev/null; then
+      fail "$name" "stdout does not contain expected summary '$expected_summary': $(<"$stdout_file")"
+      return
+    fi
+  fi
+
+  if [[ -n "$expected_log_text" ]]; then
+    local log_file="$root_dir/.temp/plan-mode/active/grok-wrapper-tests/logs/grok-impl-step-06-wrapper-tests.log"
+    if ! assert_file_contains "$log_file" "$expected_log_text"; then
+      fail "$name" "raw stdout was not preserved in log: $log_file"
       return
     fi
   fi
@@ -247,16 +328,16 @@ test_argv_and_prompt_assertions() {
     fail "$name" "argv missing --cwd"
     return
   }
-  assert_argv_has_pair "$argv_file" "-m" "grok-build" || {
-    fail "$name" "argv missing -m grok-build"
+  assert_argv_has_pair "$argv_file" "-m" "grok-4.5" || {
+    fail "$name" "argv missing -m grok-4.5"
     return
   }
   assert_argv_has_line "$argv_file" "--always-approve" || {
     fail "$name" "argv missing --always-approve"
     return
   }
-  assert_argv_has_pair "$argv_file" "--max-turns" "40" || {
-    fail "$name" "argv missing --max-turns 40"
+  assert_argv_has_pair "$argv_file" "--max-turns" "$EXPECTED_MAX_TURNS" || {
+    fail "$name" "argv missing --max-turns $EXPECTED_MAX_TURNS"
     return
   }
   assert_argv_lacks_line "$argv_file" "--model" || {
@@ -275,12 +356,40 @@ test_argv_and_prompt_assertions() {
     fail "$name" "prompt file missing IMPLEMENT direction text"
     return
   }
+  assert_file_contains "$prompt_file" "=== ORCHESTRATION-CONTRACT ===" || {
+    fail "$name" "prompt file missing literal contract opening sentinel"
+    return
+  }
+  assert_file_contains "$prompt_file" "=== END-CONTRACT ===" || {
+    fail "$name" "prompt file missing literal contract closing sentinel"
+    return
+  }
+  assert_file_contains "$prompt_file" "The block must be plain text: no markdown bold, exact field labels, both sentinel lines mandatory, nothing after the closing sentinel." || {
+    fail "$name" "prompt file missing plain-text hardening language"
+    return
+  }
 
   pass "$name"
 }
 
 test_missing_contract_exits_3() {
-  run_with_mock "missing contract exits 3" "no_contract" 3
+  run_with_mock "missing contract exits 3" "no_contract" 3 "" "" "mock output without sentinels"
+}
+
+test_preamble_footer_exits_0() {
+  run_with_mock "preamble and footer around contract exits 0" "preamble_footer" 0 "PASS" "Impl wrapper extracted a surrounded contract."
+}
+
+test_two_blocks_last_wins() {
+  run_with_mock "two complete contracts use the last block" "two_blocks" 0 "PASS" "Last impl contract wins."
+}
+
+test_missing_open_exits_3_and_preserves_log() {
+  run_with_mock "missing opening sentinel exits 3 and preserves raw log" "missing_open" 3 "" "" "Summary: Impl output is missing its opening sentinel."
+}
+
+test_missing_close_exits_3() {
+  run_with_mock "missing closing sentinel exits 3" "missing_close" 3 "" "" "Summary: Impl output is missing its closing sentinel."
 }
 
 test_missing_binary_exits_4() {
@@ -318,11 +427,117 @@ test_missing_binary_exits_4() {
   pass "$name"
 }
 
+test_stderr_noise_exits_0() {
+  run_with_mock "stderr noise after block still exits 0" "stderr_noise" 0 "PASS"
+}
+
+test_max_turns_cap() {
+  local name="max-turns cap is $EXPECTED_MAX_TURNS"
+  local case_dir="$TMP_DIR/max-turns"
+  local root_dir="$case_dir/root"
+  local bin_dir="$case_dir/bin"
+  local argv_file="$case_dir/argv.txt"
+  local status
+
+  mkdir -p "$root_dir"
+  write_mock_grok "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    GROK_MOCK_MODE="pass" \
+    GROK_MOCK_ARGV="$argv_file" \
+    GROK_MOCK_PROMPT="$case_dir/prompt.txt" \
+    invoke_impl "$root_dir" >"$case_dir/stdout.txt" 2>"$case_dir/stderr.txt"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $status"
+    return
+  fi
+  assert_argv_has_pair "$argv_file" "--max-turns" "$EXPECTED_MAX_TURNS" || {
+    fail "$name" "argv missing --max-turns $EXPECTED_MAX_TURNS"
+    return
+  }
+  pass "$name"
+}
+
+test_relative_root_dir_exits_1() {
+  local name="relative --root-dir rejected with exit 1"
+  local case_dir="$TMP_DIR/rel-root"
+  local bin_dir="$case_dir/bin"
+  local argv_file="$case_dir/argv.txt"
+  local stderr_file="$case_dir/stderr.txt"
+  local status
+
+  mkdir -p "$case_dir"
+  write_mock_grok "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    GROK_MOCK_ARGV="$argv_file" \
+    "$WRAPPER" \
+    --plan-id "p" --step-id "s" --root-dir "relative/root" <<'EOF' >/dev/null 2>"$stderr_file"
+# Step
+EOF
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 1 ]]; then
+    fail "$name" "expected exit 1, got $status; stderr=$(<"$stderr_file")"
+    return
+  fi
+  assert_file_contains "$stderr_file" "absolute path" || {
+    fail "$name" "stderr missing absolute-path message"
+    return
+  }
+  pass "$name"
+}
+
+test_validation_precedence_exits_1() {
+  local name="arg validation precedes grok check (exit 1, not 4)"
+  local case_dir="$TMP_DIR/precedence"
+  local empty_path="$case_dir/empty-path"
+  local argv_file="$case_dir/argv.txt"
+  local stderr_file="$case_dir/stderr.txt"
+  local status
+
+  mkdir -p "$empty_path"
+
+  set +e
+  PATH="$empty_path:/usr/bin:/bin" \
+    GROK_MOCK_ARGV="$argv_file" \
+    "$WRAPPER" \
+    --plan-id "p" --step-id "s" --root-dir "relative/root" <<'EOF' >/dev/null 2>"$stderr_file"
+# Step
+EOF
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 1 ]]; then
+    fail "$name" "expected exit 1, got $status; stderr=$(<"$stderr_file")"
+    return
+  fi
+  if [[ -e "$argv_file" ]]; then
+    fail "$name" "argv file exists even though invocation was invalid"
+    return
+  fi
+  pass "$name"
+}
+
 test_happy_path
 test_nonzero_exits_2
 test_argv_and_prompt_assertions
 test_missing_contract_exits_3
+test_preamble_footer_exits_0
+test_two_blocks_last_wins
+test_missing_open_exits_3_and_preserves_log
+test_missing_close_exits_3
 test_missing_binary_exits_4
+test_stderr_noise_exits_0
+test_max_turns_cap
+test_relative_root_dir_exits_1
+test_validation_precedence_exits_1
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

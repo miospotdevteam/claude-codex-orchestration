@@ -68,7 +68,9 @@ mkdir -p "$logs_dir"
 last_message_file="$(mktemp "$logs_dir/last-message.XXXXXX")"
 prompt_file="$(mktemp "$logs_dir/prompt.XXXXXX")"
 parse_err="$(mktemp "$logs_dir/parse-error.XXXXXX")"
-trap 'rm -f "$last_message_file" "$prompt_file" "$parse_err"' EXIT
+stdout_file="$(mktemp "$logs_dir/stdout.XXXXXX")"
+stderr_file="$(mktemp "$logs_dir/stderr.XXXXXX")"
+trap 'rm -f "$last_message_file" "$prompt_file" "$parse_err" "$stdout_file" "$stderr_file"' EXIT
 
 {
   cat <<EOF
@@ -88,9 +90,19 @@ EOF
 
   cat <<'EOF'
 Your final output must end with the contract block in the exact shape specified. Do not omit any field. Do not emit anything after === END-CONTRACT ===.
+
+=== ORCHESTRATION-CONTRACT ===
+Summary: <one paragraph, at most 6 sentences, plain prose>
+Verdict: PASS | FINDINGS | FAIL
+Findings:
+- <one-line finding, or omit on PASS>
+FilesTouched:
+=== END-CONTRACT ===
 EOF
 } >"$prompt_file"
 
+# Capture stdout and stderr separately, and parse Codex's output-last-message
+# file when it is non-empty. The merged log is retained for human debugging.
 set +e
 codex exec \
   -C "$root_dir" \
@@ -99,15 +111,27 @@ codex exec \
   -o "$last_message_file" \
   - \
   <"$prompt_file" \
-  >"$log_file" 2>&1
+  >"$stdout_file" 2>"$stderr_file"
 codex_status=$?
 set -e
+
+{
+  printf '%s\n' '--- codex stdout ---'
+  cat "$stdout_file"
+  printf '%s\n' '--- codex stderr ---'
+  cat "$stderr_file"
+} >"$log_file"
 
 if [[ $codex_status -ne 0 ]]; then
   exit 2
 fi
 
-if ! "$parser" <"$log_file" 2>"$parse_err"; then
+parse_source="$last_message_file"
+if [[ ! -s "$parse_source" ]]; then
+  parse_source="$stdout_file"
+fi
+
+if ! "$parser" <"$parse_source" 2>"$parse_err"; then
   cat "$parse_err" >&2
   exit 3
 fi

@@ -29,10 +29,10 @@ Code-heavy (data flow, networking, native modules, non-visual logic) → codex.
 
 - If a step is mostly UI/UX (animation personality, haptic feel, gesture
   taste, visual layout, color, typography, native look-and-feel), implement
-  it here with `owner: "claude"`, `mode: "claude-impl"`.
+  it here with `owner: "claude-impl"`.
 - If a step is mostly code-heavy (state wiring, networking, native module
   glue, storage, performance plumbing, tests), route it to the Codex-side
-  `react-native-mobile` skill with `owner: "codex"`, `mode: "codex-impl"`.
+  `react-native-mobile` skill with `owner: "codex-impl"`.
 - If a step mixes UI/UX and code-heavy work, split it into sequential steps
   with `dependsOn` instead of forcing one owner.
 

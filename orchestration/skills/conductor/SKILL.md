@@ -59,7 +59,9 @@ machine-default model) — and consumes their consensus. Self-bias guard
 (measured): an arbiter's score of its *own family's* artifact counts
 only if the other arbiter concurs; on a split over an own-family
 artifact, add a grok or opus tiebreak vote. Blind the artifacts when
-practical. Full rule: `docs/09-routing-matrix.md`, Hard Boundary 10.
+practical. This arbitration pair is distinct from step verification:
+verification stays cross-family (one verifier); quality arbitration
+runs both arbiters and consumes their consensus.
 
 ## Hard rule: always fix findings and re-verify
 
@@ -72,7 +74,7 @@ follow-up step.** The loop is: dispatch → verify → if not PASS, fix
 Concretely:
 
 - **FINDINGS verdict** → dispatch a fix-up sub-agent (at the scorecard
-  tier, per the rule below), then re-dispatch `run-codex-verify.sh` on the same
+  tier, per the rule below), then re-dispatch `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` on the same
   step. Do not record the step as `done` with FINDINGS.
 - **FAIL verdict** → same loop. The findings array is the spec for
   the fix-up sub-agent.
@@ -84,10 +86,9 @@ Concretely:
 - A step's `progress.json` verdict is overwritten on each re-verify;
   only the final PASS verdict is the durable record.
 
-The previous "FAIL → surface and ask" failure-mode line is
-superseded: ask only when the loop fails to converge or the findings
-require user judgment beyond mechanical fixing. Routine findings are
-the conductor's job, not the user's.
+Ask the user only when the loop fails to converge or the findings
+require judgment beyond mechanical fixing. Routine findings are the
+conductor's job, not the user's.
 
 ## Hard rule: implementation sub-agent model follows the scorecard
 
@@ -124,6 +125,23 @@ Sonnet for shipping code is a bug. Silent session-model inheritance is
 a bug anywhere — scouts included. Self-correct by re-dispatching at the
 right tier before consuming the result.
 
+## Hard rule: retry transient provider capacity after 10 minutes
+
+When a dispatch returns a recognizable transient provider-capacity or
+overload condition (for example, "Selected model is at capacity"), keep
+the step `in_progress`, announce the pause, wait 10 minutes, then repeat
+the identical dispatch on the same model and provider. Permit at most two
+delayed retries (three attempts total).
+
+After the delayed retries are exhausted, use an already-defined lane
+fallback when one exists; otherwise mark the step `blocked` and surface
+the capacity failure. This rule applies only to recognizable transient
+capacity or overload responses. Authentication and configuration errors,
+missing binaries, invalid invocations, and malformed contracts follow
+their existing failure paths and must not enter the capacity retry loop.
+Do not read forbidden raw wrapper output merely to infer a capacity
+condition.
+
 ## Hard rule: announce every dispatch
 
 **Every dispatch — an `Agent` tool call OR a wrapper script — emits one
@@ -138,8 +156,8 @@ user-visible line before it fires.** Exact format:
   scorecard rule above.
 - For wrapper dispatches (`run-codex-*.sh`, `run-grok-*.sh`),
   `<model>` is pinned in-script (Codex: machine default, no flag; Grok:
-  `-m grok-build`); callers never pass one. Announcement examples stay
-  `codex machine default` and `grok-build`.
+  `-m grok-4.5`); callers never pass one. Announcement examples stay
+  `codex machine default` and `grok-4.5`.
 
 For `Agent` dispatches, the tool's `description` parameter MUST also
 embed the step id and model, format `<step-id> · <model> · <short
@@ -224,29 +242,36 @@ should break if I get this wrong?".
 
 **Input**: the discovery output.
 
-**Output**: the three plan files (`plan.json`, `progress.json`,
-`masterPlan.md`) under `.temp/plan-mode/active/<planId>/`. The
-`writing-plans` skill drives this phase end-to-end (drafting,
-Orbit review, plan-mode handoff).
+**Output**: the plan on disk under `.temp/plan-mode/active/<planId>/` —
+`plan.json` and `masterPlan.md` drafted, then `progress.json` created
+once at approval via `init-progress`. The `writing-plans` skill drives
+this phase end-to-end (drafting, Orbit review, plan-mode handoff).
 
-**Panel planning is automatic for high-ambiguity tasks.** On entering
-this phase, apply the trigger in `writing-plans` (brainstorming fired /
-goal-without-mechanism request / ≥2 surviving architectures /
-≥3 domains or ≥ ~8 steps). When it fires, run the panel protocol
-before drafting: the identical brief goes **in parallel,
-independently** to Codex (`run-codex-impl.sh`, step id `panel-codex`),
-Grok (`run-grok-impl.sh`, `panel-grok`; two-model panel on exit 4),
-and a Claude planner (`Agent`, explicit scorecard model) — then one
-Claude convergence sub-agent (Fable preferred) merges the drafts with
+**Panel planning is automatic for high-ambiguity tasks — and the
+trigger is binding.** On entering this phase, apply the trigger in
+`writing-plans` (brainstorming fired / goal-without-mechanism request /
+≥2 surviving architectures / ≥3 domains or ≥ ~8 steps). When any
+condition matches, run the panel — do NOT decide on your own judgment
+that a panel is unnecessary for a matching task; only the user's
+explicit words ("just do it" / "quick" / "no plan" / "solo plan is
+fine") skip it. The panel protocol runs before drafting: the identical
+brief goes **in parallel, independently** to Codex
+(`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`, step id `panel-codex`),
+Grok (`${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`, `panel-grok`; two-model panel on exit 4),
+and a Claude planner (`Agent`, model Fable whenever available,
+otherwise Opus — the strongest model drafts the plan; Opus is the
+implementation tier) — then one Claude convergence sub-agent (same
+rule: Fable if available, else Opus) merges the drafts with
 definite decisions where they disagree. Announce each panel dispatch
 with the standard `→` line. Never chain panelists on one evolving
 draft, and never read the raw drafts from the conductor thread — only
-the converged output. Full spec: `docs/09-routing-matrix.md`, Panel
-Planning section.
+the converged output. The `writing-plans` skill owns the full panel
+protocol and its trigger.
 
 The integrated draft → review → handoff flow:
 
-1. **Draft** the three files (`plan.json.frozen: false`).
+1. **Draft** `plan.json` and `masterPlan.md` (`plan.json.frozen: false`);
+   `progress.json` is not written yet.
 2. **Orbit review**: call `orbit_await_review` on
    `masterPlan.md`. The plugin's `orbit` MCP server exposes
    `orbit_await_review`, `orbit_get_review_state`,
@@ -257,7 +282,7 @@ The integrated draft → review → handoff flow:
 3. **Approval**: on `approve` verdict, set `approvedAt`,
    `approvedVia: "orbit"`, `frozen: true`. Initialize
    `progress.json` via
-   `scripts/plan-utils.sh init-progress <plan-dir>`.
+   `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh init-progress <plan-dir>`.
 4. **Plan-mode handoff**: `EnterPlanMode` → write a one-line
    scratchpad pointing at the plan dir → `ExitPlanMode` → harness
    compacts → `post-compact` hook re-injects the plan path +
@@ -287,25 +312,39 @@ runnable(plan, progress) =
 
 The conductor:
 
-1. Computes frontier via `scripts/plan-utils.sh compute-frontier`.
+1. Computes frontier via `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh compute-frontier`.
 2. Updates `progress.currentFrontier`.
 3. Dispatches the frontier **in parallel** (default; serialize on
    file overlap; cap ~4 simultaneous).
-4. Marks each step `in_progress` before dispatch, `done`/`blocked`
-   after the verifier returns.
+4. Flips each step to `in_progress` before dispatch via
+   `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step <plan-dir>
+   <step-id> <executor> <model>` — one atomic update of status plus the
+   `{executor, model, startedAt}` dispatch record (see `persistent-plans`
+   for the canonical description). Marks `done`/`blocked` after the
+   verifier returns.
 
 Per-step routing:
 
-- `owner: codex-impl` → `codex-dispatch` with `run-codex-impl.sh`;
-  verified cross-family via `run-grok-verify.sh`.
-- `owner: grok-impl` → `codex-dispatch` with `run-grok-impl.sh` (the
+- `owner: codex-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`;
+  verified cross-family via `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`.
+- `owner: grok-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` (the
   `codex-dispatch` skill owns both wrapper lanes); verified
-  cross-family via `run-codex-verify.sh`.
+  cross-family via `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`.
 - `owner: claude-impl` → dispatch `general-purpose` sub-agent to
-  implement, then `codex-dispatch` with `run-codex-verify.sh`
+  implement, then `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`
   (Codex verifies Claude — a different family).
 - `owner: manual` → flip `blocked` with a note; continue with the
   rest of the frontier.
+
+When a step requires interacting with a desktop application, an OS
+dialog, or anything outside Claude's own tool surface, route it
+`owner: codex-impl` and say in the step description that the work needs
+Codex's computer use — that capability rides the Codex machine config,
+not a wrapper flag. **Never route such work to the verify lane:** the
+verifier's read-only sandbox constrains file writes, not desktop side
+effects, so a verifier asked to drive the GUI would act with unbounded
+effect. Browser-only work is the exception — Claude automates Chrome
+natively, so it stays on its normal owner.
 
 If `step.skill` is set, the executor honors it. The Codex wrappers
 inject the skill name into their prompt; `general-purpose`
@@ -410,7 +449,7 @@ prompt rather than reading over-large content.
 | Conductor over-reads a file | Stop. Dispatch the rest to a sub-agent. No state cleanup needed. |
 | Sub-agent return is over-budget | Re-dispatch with a stricter prompt. Don't paste the over-large summary into context to "summarize". |
 | Codex returns no contract block | `codex-dispatch` retries once. Second miss → step `blocked`. |
-| Codex returns FAIL | Surface findings to user. **Do not auto-retry.** Ask. |
+| Codex returns FAIL or FINDINGS | Fix the findings and re-verify; loop until PASS. Pause only after three non-converging iterations or a genuine design question that needs user judgment. |
 | `progress.json` and `plan.json` disagree | Trust `progress.json` for state, `plan.json` for definition. If an ID is in one but not the other, surface as a bug in `writing-plans`. |
 | Two active plans | `session-start` picks newest; warns about the other. Ask the user which to keep. |
 | Hook errored | Hook exits 0 silently. Conductor falls back to scanning `.temp/plan-mode/active/` and picking newest by `lastUpdatedAt`. |
@@ -420,11 +459,16 @@ prompt rather than reading over-large content.
 - It does not write code outside the trivial-edit exception.
 - It does not read raw Codex output. The wrappers emit parsed JSON.
 - It does not gate Edit/Write via a hook. v2 has no such hook.
-- It does not retry on FAIL automatically — the user decides.
+- It does not accept a FAIL or FINDINGS verdict as final — it fixes
+  the findings and re-verifies until PASS, pausing only on
+  non-convergence or a design question that needs user judgment.
 - It does not skip plan-mode for non-trivial work because "I know
   what to do" — the plan is for resumability, not just for clarity.
-- It does not invoke skills that are not in v2's catalog. Nine
-  skills, exactly: this one plus the eight others.
+- It does not invoke skills that are not in v2's catalog: the core
+  orchestration skills (this conductor plus its planning, dispatch,
+  and discipline peers) and the auxiliary craft skills the
+  orchestrator routes to. The catalog is exactly the skills shipped
+  under this plugin's `skills/` directory — it invents no others.
 
 The user can override anything in this skill at any moment — "just
 do it" / "no plan" / "skip discovery" are all valid signals. The

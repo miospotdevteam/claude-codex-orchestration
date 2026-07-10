@@ -29,7 +29,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
 ├── LICENSE                              ← MIT
 ├── install.sh                           ← conditional uninstall + install via claude CLI
 ├── docs/                                ← design spec (markdown only)
-│   ├── 01-philosophy.md … 10-grok-integration.md
+│   ├── 01-philosophy.md … 11-routing-eval.md
 │
 └── orchestration/                       ← plugin root (source: "./orchestration")
     ├── .claude-plugin/
@@ -84,19 +84,28 @@ claude-codex-orchestration/              ← repo root = marketplace root
         │   ├── session-start.test.sh
         │   └── post-compact.test.sh
         └── scripts/
+            ├── install.test.sh
             ├── parse-contract.test.sh
             ├── plan-utils.test.sh
+            ├── run-codex-impl.test.sh
+            ├── run-codex-verify.test.sh
             ├── run-grok-impl.test.sh
-            └── run-grok-verify.test.sh
+            ├── run-grok-verify.test.sh
+            ├── skill-contracts.test.sh
+            └── validate-structure.test.sh
 ```
 
 Notes on shape:
 
-- **`.claude-plugin/` holds both manifests.** Claude Code's plugin
+- **`.claude-plugin/` holds each manifest.** Claude Code's plugin
   schema places metadata under `.claude-plugin/` rather than at the
-  repo root. A single-plugin repo can declare both the marketplace
-  and the plugin in the same `.claude-plugin/` directory by setting
-  the plugin's `source` to `"."`.
+  repo root. This repo has two such directories: the repo-root
+  `.claude-plugin/marketplace.json` and the plugin's own
+  `orchestration/.claude-plugin/plugin.json`. Even in a single-plugin
+  repo the marketplace `source` must point at a real subdirectory
+  (`./orchestration`) — Claude Code does **not** accept `"."` as a
+  same-dir marker — which is why the plugin lives in its own subdir
+  rather than sharing the root `.claude-plugin/` directory.
 - **Skills are auto-discovered.** There is no `skills` array in
   `plugin.json`. The harness scans `skills/<name>/SKILL.md` from the
   plugin root and loads whatever it finds.
@@ -273,11 +282,22 @@ Cross-reference: which doc(s) inform which file.
 | `tests/hooks/*.test.sh`                        | `07-hooks.md`                                             |
 | `tests/scripts/parse-contract.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
+| `tests/scripts/run-codex-impl.test.sh`         | `06-codex-integration.md`                                 |
+| `tests/scripts/run-codex-verify.test.sh`       | `06-codex-integration.md`                                 |
 | `tests/scripts/run-grok-impl.test.sh`          | `10-grok-integration.md`                                  |
 | `tests/scripts/run-grok-verify.test.sh`        | `10-grok-integration.md`                                  |
+| `tests/scripts/skill-contracts.test.sh`        | `05-skills-catalog.md`                                    |
+| `tests/scripts/validate-structure.test.sh`     | `05-skills-catalog.md`                                    |
+| `tests/scripts/install.test.sh` (repo root `install.sh`) | `08-plugin-layout.md`                           |
 | `eval/corpus/`                                 | `11-routing-eval.md`                                      |
 | `eval/scripts/`                                | `11-routing-eval.md`                                      |
 | `eval/results/`                                | `11-routing-eval.md`                                      |
+| `eval/tests/`                                  | `11-routing-eval.md`                                      |
+| `eval/tests/aggregate.test.sh`                 | `11-routing-eval.md`                                      |
+| `eval/tests/extract-judge-json.test.sh`        | `11-routing-eval.md`                                      |
+| `eval/tests/helpers.test.sh`                   | `11-routing-eval.md`                                      |
+| `eval/tests/score-objective.test.sh`           | `11-routing-eval.md`                                      |
+| `eval/tests/corpus-harnesses.test.sh`          | `11-routing-eval.md`                                      |
 
 ## Implementation order
 

@@ -18,9 +18,8 @@ Code-heavy (data flow, networking, native modules, non-visual logic) → codex.
 ```
 
 - If a step is mostly UI/UX, do not implement it here. Route it to
-  `owner: "claude"`, `mode: "claude-impl"`.
-- If a step is mostly code-heavy, implement it with `owner: "codex"`,
-  `mode: "codex-impl"`.
+  `owner: "claude-impl"`.
+- If a step is mostly code-heavy, implement it with `owner: "codex-impl"`.
 - If a step mixes UI/UX and code-heavy work, split it into sequential steps
   with `dependsOn` instead of forcing one owner.
 

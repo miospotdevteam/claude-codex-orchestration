@@ -9,11 +9,11 @@ This scans the text for the first balanced JSON object that carries a
     {"scores": {"A": n, "B": n, "C": n}, "rationale": "..."}
 
 Exit 0 and print the object on success; exit 1 if no usable object is found.
-Scores are passed through unchanged (scale normalization happens downstream);
-only their presence and numeric type are enforced here.
+Scores must be finite numbers in the inclusive range 0.0 to 5.0.
 """
-import sys
 import json
+import math
+import sys
 
 
 def find_score_objects(text):
@@ -43,6 +43,10 @@ def usable(obj):
     for k in ("A", "B", "C"):
         v = scores.get(k)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        if v < 0 or v > 5:
             return None
         out[k] = v
     return {"scores": out, "rationale": str(obj.get("rationale", ""))}

@@ -20,8 +20,20 @@ if [ ! -f "$SKILL_FILE" ]; then
 fi
 
 # --- Check 2: Frontmatter has name and description ---
-# Extract YAML frontmatter (between first pair of ---)
-FRONTMATTER=$(awk '/^---$/{n++; next} n==1{print} n>=2{exit}' "$SKILL_FILE")
+# Extract YAML frontmatter only when it starts on line 1 and has a closing
+# delimiter. Without both delimiters, body text could be mistaken for metadata.
+if ! FRONTMATTER=$(awk '
+  NR == 1 {
+    if ($0 != "---") exit 1
+    next
+  }
+  $0 == "---" { closed = 1; exit }
+  { print }
+  END { if (!closed) exit 1 }
+' "$SKILL_FILE"); then
+  fail "Frontmatter: missing opening or closing '---' delimiter"
+  FRONTMATTER=""
+fi
 
 HAS_NAME=$(echo "$FRONTMATTER" | grep -c '^name:' || true)
 HAS_DESC=$(echo "$FRONTMATTER" | grep -c '^description:' || true)

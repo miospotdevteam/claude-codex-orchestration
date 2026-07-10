@@ -283,8 +283,10 @@ into a concrete proposal before any code is written.
 In addition to the nine core skills above, v2 ships eight auxiliary
 skills covering the craft-specific work the orchestrator routes to.
 Each lives in `skills/<name>/SKILL.md` and follows the same harness
-frontmatter convention (`name`, `description`); each is listed in
-`plugin.json`.
+frontmatter convention (`name`, `description`); the harness
+auto-discovers them by scanning `skills/<name>/SKILL.md` — no list in
+`plugin.json` is needed (the manifest carries only `name`,
+`description`, and the `orbit` MCP server).
 
 | Skill | One-line | Routing |
 |---|---|---|
@@ -308,6 +310,6 @@ code-heavy work goes to Codex. The two SKILL.md files keep the same
 wording about the split so both sides see the same rule.
 
 `codex-skills/` is loaded by `codex exec` separately from the Claude
-Code plugin manifest; it is not part of `plugin.json`'s `skills`
-array, but the manifest grants read on `codex-skills/**` so the
-wrappers and the user can inspect them.
+Code plugin manifest; it is not discovered by the Claude Code harness
+at all. The wrappers and the user read these bodies directly from the
+`codex-skills/` tree.

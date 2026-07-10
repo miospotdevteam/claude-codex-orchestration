@@ -45,6 +45,31 @@ expect_success() {
   pass_test "$name"
 }
 
+expect_finding_text() {
+  local name="$1"
+  local fixture="$2"
+  local expected_summary="$3"
+  local expected_finding="$4"
+  local output
+  local err="$TMP_DIR/$name.err"
+
+  if ! output="$("$PARSER" <"$fixture" 2>"$err")"; then
+    fail_test "$name" "expected success, got failure: $(<"$err")"
+    return
+  fi
+
+  if ! jq -e \
+    --arg summary "$expected_summary" \
+    --arg finding "$expected_finding" \
+    '.summary == $summary and .verdict == "FINDINGS" and .findings == [$finding]' \
+    <<<"$output" >/dev/null; then
+    fail_test "$name" "unexpected parsed output: $output"
+    return
+  fi
+
+  pass_test "$name"
+}
+
 expect_failure() {
   local name="$1"
   local fixture="$2"
@@ -160,6 +185,46 @@ FilesTouched:
 === END-CONTRACT ===
 EOF
 
+cat >"$TMP_DIR/dash-verdict-finding.txt" <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Reserved labels in finding text are allowed.
+Verdict: FINDINGS
+Findings:
+- Verdict: this is finding text, not a field.
+FilesTouched:
+=== END-CONTRACT ===
+EOF
+
+cat >"$TMP_DIR/star-verdict-finding.txt" <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Reserved labels in finding text are allowed.
+Verdict: FINDINGS
+Findings:
+* Verdict: this is finding text, not a field.
+FilesTouched:
+=== END-CONTRACT ===
+EOF
+
+cat >"$TMP_DIR/dash-summary-finding.txt" <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Reserved labels in finding text are allowed.
+Verdict: FINDINGS
+Findings:
+- Summary: this is finding text, not a field.
+FilesTouched:
+=== END-CONTRACT ===
+EOF
+
+cat >"$TMP_DIR/star-summary-finding.txt" <<'EOF'
+=== ORCHESTRATION-CONTRACT ===
+Summary: Reserved labels in finding text are allowed.
+Verdict: FINDINGS
+Findings:
+* Summary: this is finding text, not a field.
+FilesTouched:
+=== END-CONTRACT ===
+EOF
+
 expect_success "well-formed PASS with files" "$TMP_DIR/pass.txt" "PASS"
 expect_success "well-formed FINDINGS" "$TMP_DIR/findings.txt" "FINDINGS"
 expect_success "well-formed FAIL" "$TMP_DIR/fail.txt" "FAIL"
@@ -169,6 +234,14 @@ expect_failure "malformed verdict" "$TMP_DIR/malformed-verdict.txt"
 expect_failure "trailing non-whitespace text" "$TMP_DIR/trailing-text.txt"
 expect_success "CRLF well-formed PASS" "$TMP_DIR/crlf.txt" "PASS"
 expect_success "multiple blocks use last" "$TMP_DIR/multiple-blocks.txt" "PASS"
+expect_finding_text "dash Verdict prefix remains a finding" "$TMP_DIR/dash-verdict-finding.txt" \
+  "Reserved labels in finding text are allowed." "Verdict: this is finding text, not a field."
+expect_finding_text "star Verdict prefix remains a finding" "$TMP_DIR/star-verdict-finding.txt" \
+  "Reserved labels in finding text are allowed." "Verdict: this is finding text, not a field."
+expect_finding_text "dash Summary prefix remains a finding" "$TMP_DIR/dash-summary-finding.txt" \
+  "Reserved labels in finding text are allowed." "Summary: this is finding text, not a field."
+expect_finding_text "star Summary prefix remains a finding" "$TMP_DIR/star-summary-finding.txt" \
+  "Reserved labels in finding text are allowed." "Summary: this is finding text, not a field."
 
 if ((failures > 0)); then
   exit 1

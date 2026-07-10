@@ -28,14 +28,20 @@ FilesTouched:
 === END-CONTRACT ===
 ```
 
-The wrappers hand the raw Grok log to the same `scripts/parse-contract.sh`
-that parses Codex output. There is no Grok-specific parser and no
-Grok-specific field. `Verdict` is one of `PASS`, `FINDINGS`, `FAIL`;
-`Findings` is empty on `PASS`; `FilesTouched` is empty for verify. Text
-before the opening sentinel is ignored. Because the contract is shared,
-a Grok `ProgressEntry` and a Codex `ProgressEntry` are indistinguishable
-downstream — the conductor treats a verdict as a verdict regardless of
-which family produced it.
+Each wrapper captures Grok's stdout and stderr in **separate** streams
+(a merged copy is written to the log for humans only) and parses
+**stdout alone**, so a CLI footer or a late stderr diagnostic cannot
+force a spurious parse failure. Before parsing, the wrapper extracts the
+**last** sentinel-delimited contract block from stdout with a small awk
+pass, then feeds that block to the same `orchestration/scripts/parse-contract.sh` that
+parses Codex output — the wrapper's stdout is only ever the parsed JSON
+`{summary, verdict, findings, filesTouched}`. There is no Grok-specific
+parser and no Grok-specific field. `Verdict` is one of `PASS`,
+`FINDINGS`, `FAIL`; `Findings` is empty on `PASS`; `FilesTouched` is
+empty for verify. Text before the opening sentinel is ignored. Because
+the contract is shared, a Grok `ProgressEntry` and a Codex
+`ProgressEntry` are indistinguishable downstream — the conductor treats
+a verdict as a verdict regardless of which family produced it.
 
 ## The two wrappers
 
@@ -43,27 +49,39 @@ The direction is the **script's identity**, exactly as in the Codex
 lane. Nothing in the per-call prompt can flip an implementer into a
 verifier or vice versa.
 
+Both wrappers live at `orchestration/scripts/run-grok-impl.sh` and
+`orchestration/scripts/run-grok-verify.sh`; the short names below
+refer to those paths.
+
 ### `run-grok-impl.sh`
 
 Invoked when a plan step routes to the Grok implementation lane. It
 takes `--plan-id`, `--step-id`, `--root-dir` (must be an absolute,
-existing path), and optional `--skill`. It reads the rendered step
-block from stdin, builds a system prompt whose first line pins the
-direction to **IMPLEMENT** ("You are Grok Build running in IMPLEMENT
-mode…"), always honors `engineering-discipline`, honors the
-step-specific `--skill` when supplied, and appends the contract-block
-enforcement line. The IMPLEMENT prose is pinned in the script and is
-not overridable per call.
+existing path — the same absolute-path guard the Codex lane enforces),
+and optional `--skill`. It reads the rendered step block from stdin,
+builds a system prompt whose first line pins the direction to
+**IMPLEMENT** ("You are Grok Build running in IMPLEMENT mode…"), always
+honors `engineering-discipline`, honors the step-specific `--skill`
+when supplied, and embeds the **full contract template** verbatim —
+the same template the Codex impl wrapper embeds — hardened with a
+strict plain-text instruction ("The block must be plain text: no
+markdown bold, exact field labels, both sentinel lines mandatory,
+nothing after the closing sentinel."). The IMPLEMENT prose is pinned in
+the script and is not overridable per call.
 
 ### `run-grok-verify.sh`
 
 Invoked to confirm acceptance criteria against a diff. It takes the
 same args plus an optional `--diff-file <path>`. Without `--diff-file`,
 stdin carries the step block, then a line containing exactly
-`---DIFF---`, then the diff. Its system prompt pins the direction to
-**VERIFY** ("You are Grok Build running in VERIFY mode… You may NOT
-edit files."), embeds the step block, skill, and diff, and prints the
-contract template inline. The VERIFY prose is likewise pinned in-script.
+`---DIFF---`, then the diff. The wrapper **validates the diff input
+before the grok-availability check**, so a bad invocation (a missing
+`--diff-file` target, or stdin with no `---DIFF---` sentinel) exits `1`
+(invocation error), not `4` (grok missing). Its system prompt pins the
+direction to **VERIFY** ("You are Grok Build running in VERIFY mode…
+You may NOT edit files."), embeds the step block, skill, and diff, and
+prints the same plain-text-hardened contract template inline. The
+VERIFY prose is likewise pinned in-script.
 
 ## Exact invocation as shipped
 
@@ -71,25 +89,35 @@ The impl wrapper invokes:
 
 ```
 grok --prompt-file <file> --cwd <root> \
-  -m grok-build \
+  -m grok-4.5 \
   --always-approve \
-  --max-turns 40
+  --max-turns 80
 ```
 
 The verify wrapper invokes:
 
 ```
 grok --prompt-file <file> --cwd <root> \
-  -m grok-build \
-  --max-turns 40 \
+  -m grok-4.5 \
+  --max-turns 80 \
   --deny 'Write' --deny 'Edit' --deny 'Bash'
 ```
 
-The wrappers pin `-m grok-build`, the subscription's Grok 4.5-backed
-coding model. This avoids config drift from the user-configurable CLI
-default (`~/.grok/config.toml`) and avoids the API-credit hazard of
-using the raw `grok-4.5` model id, which bills xAI API credits instead
-of the subscription pool.
+`--cwd` receives the validated **absolute** `--root-dir`, matching the
+Codex lane's `-C <root-dir>` parity.
+
+**`--max-turns 80`.** Raised from 40, which realistic workloads
+exhausted on **2026-07-10**. Turn exhaustion surfaces as `grok`
+exiting non-zero, which the wrapper reports as **exit `2`** plus a
+diagnostic entry in the merged log — it is not silently swallowed.
+
+**`-m grok-4.5`.** The wrappers pin `-m grok-4.5`, the subscription's
+Grok 4.5-backed coding model. The earlier `grok-build` alias was
+**retired upstream**; the single `-m grok-4.5` occurrence in each
+wrapper is the one place to update if the id changes again, and a stale
+id fails loudly (the CLI rejects an unknown model) rather than silently
+falling back. Pinning it also avoids config drift from the
+user-configurable CLI default (`~/.grok/config.toml`).
 
 ## Read-only enforcement
 
@@ -110,15 +138,16 @@ in the Codex lane.
 
 ## Log files
 
-Each wrapper streams the full raw Grok run to a per-step log under the
-active plan directory:
+Each wrapper writes a **merged copy** of Grok's separately-captured
+stdout and stderr to a per-step log under the active plan directory:
 
 - `.temp/plan-mode/active/<planId>/logs/grok-impl-<stepId>.log`
 - `.temp/plan-mode/active/<planId>/logs/grok-verify-<stepId>.log`
 
-These logs are for human debugging only. The **only** thing written to
-the wrapper's stdout is the parsed contract JSON; the conductor never
-reads the log as part of orchestration.
+The merged log exists for human debugging only. The wrapper never
+parses it — parsing keys off the isolated stdout stream. The **only**
+thing written to the wrapper's own stdout is the parsed contract JSON;
+the conductor never reads the log as part of orchestration.
 
 ## Exit codes
 
@@ -153,7 +182,7 @@ below are from **grok 0.2.93 on 2026-07-09**; re-run on every upgrade.
 
 - [x] Binary present and version check — `grok --version` → `0.2.93` ✓
 - [x] Headless subscription auth via `grok login` (grok.com) ✓
-- [x] Model inventory via `grok models` — `grok-build` (default),
+- [x] Model inventory via `grok models` — `grok-4.5` (default),
       `grok-composer-2.5-fast` ✓
 - [x] Deny-rule write-block probe — write under
       `--deny Write/Edit/Bash` refused ✓ (blocked)

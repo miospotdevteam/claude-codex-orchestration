@@ -53,6 +53,15 @@ expect_scores "prose-wrapped with leading non-scores object" \
 expect_fail "no json at all" "I could not evaluate these candidates."
 expect_fail "json without scores" '{"foo":1,"bar":2}'
 expect_fail "non-numeric score" '{"scores":{"A":"high","B":3,"C":5},"rationale":"bad"}'
+expect_scores "boundary scores are accepted" \
+  '{"scores":{"A":0,"B":5,"C":2.5},"rationale":"bounds"}' \
+  '{"A":0,"B":5,"C":2.5}'
+expect_fail "negative score" '{"scores":{"A":-0.1,"B":3,"C":5},"rationale":"bad"}'
+expect_fail "score above five" '{"scores":{"A":5.1,"B":3,"C":5},"rationale":"bad"}'
+expect_fail "NaN score" '{"scores":{"A":NaN,"B":3,"C":5},"rationale":"bad"}'
+expect_fail "positive infinity score" '{"scores":{"A":Infinity,"B":3,"C":5},"rationale":"bad"}'
+expect_fail "negative infinity score" '{"scores":{"A":-Infinity,"B":3,"C":5},"rationale":"bad"}'
+expect_fail "partial score object" '{"scores":{"A":1,"B":3},"rationale":"bad"}'
 
 printf 'TOTAL pass=%d fail=%d\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

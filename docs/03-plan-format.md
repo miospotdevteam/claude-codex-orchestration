@@ -107,8 +107,8 @@ Field reference:
 
 `dependsOn` defines a directed acyclic graph over steps. The execution
 loop (see `04-execution-loop.md`) uses it to compute the **runnable
-frontier**: the set of steps whose dependencies are all `done` and
-which are not themselves `done` or `in_progress`.
+frontier**: the set of steps whose own status is `pending` and whose
+every `dependsOn` step is `done`.
 
 Validity rules `writing-plans` enforces:
 
@@ -155,12 +155,10 @@ This is the only runtime-mutable file. Schema:
     },
     "step-2": {
       "status": "done",
-      "verdict": "FINDINGS",
-      "findings": [
-        "Test src/auth/session.test.ts:42 was skipped; not in acceptance criteria but worth flagging."
-      ],
-      "result": "...",
-      "filesTouched": ["..."]
+      "verdict": "PASS",
+      "result": "Extracted cookie parsing into src/auth/cookie.ts. The verifier's first pass returned FINDINGS (a skipped test); that was fixed and re-verified to PASS.",
+      "deviations": [],
+      "filesTouched": ["src/auth/cookie.ts", "src/auth/index.ts"]
     },
     "step-3": {
       "status": "in_progress",
@@ -168,7 +166,7 @@ This is the only runtime-mutable file. Schema:
       "startedAt": "2026-05-11T15:30:00Z",
       "dispatch": {
         "executor": "grok",
-        "model": "grok-build",
+        "model": "grok-4.5",
         "startedAt": "2026-05-11T15:30:00Z"
       }
     },
@@ -199,7 +197,7 @@ When a step flips to `in_progress`, the conductor writes an optional
 
 - **`executor`** — one of `codex` | `grok` | `claude`.
 - **`model`** — the model identifier that ran the step (e.g. `opus`,
-  `gpt-5-codex`, `grok-build`).
+  `gpt-5-codex`, `grok-4.5`).
 - **`startedAt`** — ISO-8601 UTC timestamp of the dispatch.
 
 `dispatch` is the durable record of *which* model did the work, pairing
@@ -211,7 +209,8 @@ produced the recorded verdict.
 
 - **`pending`** — not yet runnable, or runnable but not picked.
 - **`in_progress`** — dispatched, awaiting result.
-- **`done`** — completed with a verdict of PASS or FINDINGS.
+- **`done`** — completed with a verdict of PASS. Only a PASS flips a
+  step to `done`.
 - **`blocked`** — could not complete; needs human input. The
   `result` field carries the reason.
 - **`skipped`** — explicitly skipped by user decision; `result`
@@ -222,16 +221,26 @@ produced the recorded verdict.
 These mirror the Codex verifier's contract (see
 `06-codex-integration.md`):
 
-- **`PASS`** — all acceptance criteria met.
+- **`PASS`** — all acceptance criteria met. Only a PASS flips a step
+  to `done`.
 - **`FINDINGS`** — criteria met but the verifier noted concerns. The
-  conductor surfaces findings to the user; the step is still `done`.
-- **`FAIL`** — criteria not met. The step goes back to `in_progress`
-  or `blocked` depending on whether a retry is sensible.
+  conductor fixes the findings and re-verifies; it does not mark the
+  step `done` with FINDINGS and does not defer them to a follow-up
+  step. Only the final PASS is the durable record.
+- **`FAIL`** — criteria not met. Same loop: fix the findings and
+  re-verify until PASS. The conductor pauses to ask the user only
+  after three non-converging iterations or when a finding raises a
+  genuine design question that needs their judgment.
 
 ### Deviations
 
-`deviations` is an array of `{type, description, files}` objects
-recording where execution diverged from `plan.json`. Examples:
+Deviations live at two levels. Per-step `deviations` (inside
+`steps.<id>`) is an array of `{type, description, files}` objects
+recording where that step's execution diverged from `plan.json`.
+Top-level `deviations` is an array of `{at, note}` objects for
+plan-level events that are not scoped to one step — a panel lane
+failing, an executor rerouted around a quota outage, an upstream
+model id migration. Per-step examples:
 
 - `{type: "extra-file", description: "Also updated src/types/auth.d.ts because the new type was re-exported there", files: ["src/types/auth.d.ts"]}`
 - `{type: "missing-criterion", description: "Acceptance criterion 3 could not be tested in this step; deferred to step-7", files: []}`

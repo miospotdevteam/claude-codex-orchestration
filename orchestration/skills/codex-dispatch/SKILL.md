@@ -90,8 +90,8 @@ every off-context executor and verifier.
 | `grok-impl` impl needs verification | `run-codex-verify.sh` | VERIFY |
 | `owner: claude-impl` step needs verification after Claude finishes | `run-codex-verify.sh` | VERIFY |
 
-Verification is **cross-family** (see `docs/09-routing-matrix.md`): the
-verifier is a different model family than the implementer. When the
+Verification is **cross-family**: the verifier is always a different
+model family than the implementer (the policy stated above). When the
 Grok lane is configured (the `grok` CLI is installed and
 authenticated), `codex-impl` steps are verified via
 `run-grok-verify.sh`; `grok-impl` and `claude-impl` steps are verified
@@ -100,6 +100,15 @@ via `run-codex-verify.sh`.
 The wrappers are direction-locked: the prompt body cannot flip a
 verifier into an implementer. Choosing the right wrapper — direction
 *and* family — is this skill's only directional decision.
+
+**Computer-use steps are ordinary `codex-impl` dispatches.** A step that
+drives a desktop app or OS dialog uses `run-codex-impl.sh` like any
+other impl step — the computer-use capability comes from Codex's machine
+config, not from any wrapper flag, so nothing here changes. If Codex
+reports the computer-use tools are unavailable, block the step with
+reason `executor-unavailable` and surface that the step should be
+re-routed `manual` (a machine without the tools cannot be retried into
+having them).
 
 ### Calling conventions are identical across families
 
@@ -153,6 +162,13 @@ this at runtime to the plugin's installed location (typically
 Do **not** hard-code an absolute path; the env var is the contract.
 
 ### IMPLEMENT call (codex-impl steps)
+
+Flip the step to `in_progress` at dispatch time with a single atomic
+call — `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step
+<plan-dir> <step-id> <executor> <model>` — which records the
+`{executor, model, startedAt}` dispatch object in the same write (see
+`persistent-plans` for its canonical description). Do this before
+firing the wrapper, not a bare `set-step-status … in_progress`.
 
 ```bash
 PLAN_DIR='.temp/plan-mode/active/<planId>'
@@ -227,14 +243,21 @@ Always go through `plan-utils.sh`. Atomic writes; no jq one-offs:
   "$PLAN_DIR" "$STEP_ID" \
   "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON"
 
-# Then flip status — done on PASS/FINDINGS, in_progress/blocked on FAIL.
+# Then flip status — only PASS marks the step done. FINDINGS and FAIL
+# both keep the step in_progress and trigger a fix + re-verify pass
+# (the conductor's "always fix findings and re-verify" hard rule); the
+# step reaches done only on a subsequent PASS. Pause the loop only
+# after three non-converging iterations or a genuine design question.
 case "$VERDICT" in
-  PASS|FINDINGS)
+  PASS)
     "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
       set-step-status "$PLAN_DIR" "$STEP_ID" done ;;
-  FAIL)
-    "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
-      set-step-status "$PLAN_DIR" "$STEP_ID" blocked ;;
+  FINDINGS|FAIL)
+    # Step is already in_progress from its dispatch-time start-step, so
+    # no status write is needed here. Re-dispatch the fix-up through
+    # start-step (recording the fix's executor+model in a fresh dispatch
+    # object) — never a bare set-step-status flip. See persistent-plans.
+    : ;;
 esac
 ```
 
@@ -294,8 +317,10 @@ helper (full bash example in "Calling the wrappers" above):
   "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON"
 ```
 
-Then call `set-step-status` to flip the step to `done` (PASS /
-FINDINGS) or `blocked` (FAIL after retry).
+Then call `set-step-status`: only PASS flips the step to `done`.
+FINDINGS and FAIL both keep it `in_progress` and trigger a fix +
+re-verify pass (the conductor's "always fix findings and re-verify"
+rule); the step reaches `done` only on a later PASS.
 
 ## The hard rule: never read raw stdout
 
@@ -320,18 +345,22 @@ wrapper. Reading the log defeats the boundary.
 |---|---|---|
 | 0 | Contract block parsed | Read JSON, record verdict |
 | 1 | Bad invocation (missing args, etc.) | Bug in this skill — fix |
-| 2 | `codex exec` itself failed | Step → `blocked` with reason `codex-unavailable`; surface |
+| 2 | executor CLI invocation failed (`codex exec` or `grok`) | Step → `blocked` with reason `executor-unavailable`; surface. Exit 4 (the `grok` binary not on PATH) is a distinct case — see the next row. |
 | 3 | Contract block missing or malformed | **Retry exactly once** with a stricter reminder appended to the step block. Second failure → step `blocked` with reason `contract-parse-failed` |
 | 4 | `grok` binary not on PATH (Grok wrapper only) | **Verify dispatch** (`run-grok-verify.sh`): re-dispatch the verification via `run-codex-verify.sh` — the pre-Grok fallback — and record the fallback in the step's `progress.json` `deviations`. **Impl dispatch** (`run-grok-impl.sh`): flip the step `blocked` with reason `grok-unavailable`; surface |
 
 Codex verdict handling:
 
 - **PASS** — record and mark step `done`.
-- **FINDINGS** — record (with findings array), mark step `done`,
-  surface findings to the user.
-- **FAIL** — record, mark step `in_progress` (one retry) or
-  `blocked`. **Do not auto-retry indefinitely.** Surface findings,
-  ask the user how to proceed.
+- **FINDINGS** — record (with findings array), keep the step
+  `in_progress`, and hand the findings to the conductor as the spec
+  for a fix + re-verify pass. Never mark the step `done` on FINDINGS.
+- **FAIL** — record, keep the step `in_progress`, and re-verify after
+  the fix. Same loop as FINDINGS: fix the findings and re-run the
+  verifier until PASS. Pause only after three non-converging
+  iterations or a genuine design question that needs the user's
+  judgment — a FAIL is not a hard stop by default. (Distinct from the
+  exit-3 parse-failure retry, which is retried exactly once.)
 
 ## What this skill explicitly does not do
 
@@ -339,8 +368,8 @@ Codex verdict handling:
 - It does not pass `--model` / `-m` to anything, on either lane.
   Callers never pass a model to either wrapper pair: the Codex wrappers
   pass no flag and run the machine default; the Grok wrappers pin
-  `-m grok-build` in-script (see `docs/06-codex-integration.md` and
-  the model-selection doctrine in `docs/09-routing-matrix.md`).
+  `-m grok-4.5` in-script. The model is the wrapper's identity, never
+  the caller's choice.
 - It does not write its own prompts to Codex outside the rendered
   step block — the direction header is part of the wrapper, not the
   caller's responsibility.
@@ -372,6 +401,10 @@ Codex verdict handling:
   `codex-impl-step-3.log` "just to see what happened". The context
   budget blows immediately and the conductor starts orchestrating
   from raw Codex prose. Don't.
-- **Auto-retry on FAIL** — looping FAIL → retry → FAIL hides a real
-  problem. One retry on parse failure (different cause). Zero
-  automatic retries on `Verdict: FAIL`. Surface and ask.
+- **Non-converging fix loop** — a FAIL or FINDINGS verdict triggers a
+  fix + re-verify pass, not a hard stop and not an indefinite retry.
+  The guard is convergence: after three iterations that do not reach
+  PASS, pause and surface the state (pause immediately, too, on a
+  design question that needs the user's judgment). The exit-3
+  parse-failure retry is separate — that one is retried exactly once,
+  for a different cause.

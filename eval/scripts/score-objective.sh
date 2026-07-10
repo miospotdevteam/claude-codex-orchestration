@@ -18,6 +18,7 @@ Contract:
   tests/run.sh is invoked as: tests/run.sh <candidate_dir>
   Its final stdout line must be exactly: RESULT <passed> <total>
   <passed> and <total> must be non-negative integers, and total must be > 0.
+  Exit status must be 0 exactly when passed equals total.
 USAGE
 }
 
@@ -126,6 +127,14 @@ fi
 
 if ((passed > total)); then
   die "invalid RESULT line: passed exceeds total ($passed > $total)"
+fi
+
+if ((passed == total && run_status != 0)); then
+  die "exit status $run_status contradicts full-pass RESULT $passed $total"
+fi
+
+if ((passed < total && run_status == 0)); then
+  die "exit status 0 contradicts partial RESULT $passed $total"
 fi
 
 jq -n \

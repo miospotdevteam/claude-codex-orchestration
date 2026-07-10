@@ -1,14 +1,15 @@
 ---
 name: writing-plans
-description: Draft the three plan files (plan.json, progress.json, masterPlan.md) after discovery is complete, then drive review and approval. Use whenever the user says "write the plan", "draft a plan.json", "let's plan this", or after discovery / brainstorming has produced enough context to commit to a path. Produces a DAG of TDD-granularity steps with explicit dependsOn edges, a per-step progress[] checklist, and a tight human-facing masterPlan.md. Do NOT use when discovery is incomplete (use `brainstorming` or dispatch `Explore`), when the user says "just do it" / "no plan", or mid-execution (use `persistent-plans` to update progress instead).
+description: Draft the plan files (plan.json, masterPlan.md) after discovery is complete, then drive review and approval; progress.json is created once, at approval. Use whenever the user says "write the plan", "draft a plan.json", "let's plan this", or after discovery / brainstorming has produced enough context to commit to a path. Produces a DAG of TDD-granularity steps with explicit dependsOn edges, a per-step progress[] checklist, and a tight human-facing masterPlan.md. Do NOT use when discovery is incomplete (use `brainstorming` or dispatch `Explore`), when the user says "just do it" / "no plan", or mid-execution (use `persistent-plans` to update progress instead).
 allowed-tools: Read, Edit, Write, Bash, Glob
 ---
 
 # writing-plans
 
-Turn a completed discovery into the three plan files on disk. The
-plan is a contract, not a script — once approved it does not change.
-`progress.json` carries every deviation.
+Turn a completed discovery into the draft plan files on disk —
+`plan.json` and `masterPlan.md`; `progress.json` is created once, at
+approval. The plan is a contract, not a script — once approved it does
+not change. `progress.json` carries every deviation.
 
 ## When this fires
 
@@ -33,24 +34,29 @@ Before drafting solo, apply this trigger. Panel-plan when ANY of:
 `brainstorming` fired during discovery; the request is a goal without
 a mechanism ("decide what to do about X"); two or more plausible
 architectures survived discovery with non-obvious tradeoffs; the plan
-will span ≥3 domains or ≥ ~8 steps. Skip when the user said "just
-do it" / "quick", or the work is single-domain clear-spec or a
-mechanical sweep. The user can force either mode.
+will span ≥3 domains or ≥ ~8 steps. **The trigger is binding**: when
+any condition matches, run the panel — do not re-litigate whether it
+seems worth it for this task. The only skip signals are the user's
+own words ("just do it" / "quick" / "no plan" / "solo plan is fine").
+Work matching no trigger plans solo (single-domain clear-spec,
+mechanical sweeps); the user can force a panel anytime.
 
-The protocol (full spec: `docs/09-routing-matrix.md`, Panel Planning
-section — including the measured result it rests on: independent
-drafts + convergence beat both every solo plan and a sequential
-relay):
+The protocol (it rests on a measured result: independent drafts +
+convergence beat both every solo plan and a sequential relay):
 
 1. Write one planning brief to `<plan-dir>/panel/brief.md`.
 2. Send the **identical brief, in parallel, independently** to Codex
-   (`run-codex-impl.sh`, synthetic step id `panel-codex`, deliverable
-   `panel/codex.plan.md`), Grok (`run-grok-impl.sh`,
+   (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`, synthetic step id
+   `panel-codex`, deliverable `panel/codex.plan.md`), Grok
+   (`${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`,
    `panel/grok.plan.md`; on wrapper exit 4, continue as a two-model
-   panel), and a Claude planner (`Agent`, explicit scorecard model,
-   `panel/claude.plan.md`). No panelist ever sees another's draft.
-3. Dispatch one Claude convergence sub-agent (Fable preferred, Opus
-   floor) that reads the brief + drafts and returns the converged
+   panel), and a Claude planner (`Agent`, model Fable whenever
+   available, otherwise Opus — the strongest model drafts the plan;
+   Opus is the implementation tier — writing `panel/claude.plan.md`).
+   No panelist ever sees another's draft.
+3. Dispatch one Claude convergence sub-agent (same rule: Fable
+   whenever available, otherwise Opus) that reads the brief + drafts
+   and returns the converged
    plan: a definite decision wherever drafts disagree (one-line
    reason), redundancy cut, complementary strengths kept.
 4. Use the converged plan as the source for step 1 of the flow below.
@@ -63,13 +69,14 @@ relay):
 
 Three files under `.temp/plan-mode/active/<planId>/`:
 
-- **`plan.json`** — schema in `schemas/plan.schema.json`. Required
+- **`plan.json`** — schema in `${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json`. Required
   fields: planId, title, createdAt, createdBy, frozen, context,
   steps. Approval fields (approvedAt, approvedVia) are optional until
   approval lands.
-- **`progress.json`** — schema in `schemas/progress.schema.json`.
-  Initialized via `scripts/plan-utils.sh init-progress <plan-dir>`.
-- **`masterPlan.md`** — start from `templates/masterPlan.template.md`
+- **`progress.json`** — schema in `${CLAUDE_PLUGIN_ROOT}/schemas/progress.schema.json`.
+  Not written at draft time; created exactly once at approval via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh init-progress <plan-dir>`.
+- **`masterPlan.md`** — start from `${CLAUDE_PLUGIN_ROOT}/templates/masterPlan.template.md`
   and fill the five sections: Goal, Approach, Steps, Risks and open
   questions, Out of scope.
 
@@ -116,12 +123,16 @@ step into a single owner.
 
 ## Routing (owner + skill)
 
-Default routing follows the matrix in `docs/09-routing-matrix.md`.
-Short form:
+Default routing, in short form:
 
 - **`codex-impl` (default)**: backend services, CRUD, refactors,
   migrations, test writing, config/glue/mechanical work, CI/CD
   setup, any "no other rule fires" step.
+- **`grok-impl`**: the second off-context implementer lane — parallel
+  capacity when the Codex lane is saturated, bulk sweeps split across
+  both lanes, or an explicit author choice. Grok and Codex share the
+  identical wrapper contract, so a step routes to whichever lane has
+  capacity; `codex-dispatch` owns both lanes.
 - **`claude-impl`**: steps whose `skill` is in the Claude-only set
   (`frontend-design`, `svg-art`, `immersive-frontend`,
   `brainstorming`, `writing-plans`, `doc-coauthoring`).
@@ -140,12 +151,13 @@ Planning has two integrated mechanisms that must run in order:
 **Orbit review** (the user sees the plan) and **the plan-mode handoff**
 (execution starts in a clean context window). Run them in this order:
 
-### 1. Draft the three files (frozen:false)
+### 1. Draft plan.json + masterPlan.md (frozen:false)
 
-Write `plan.json` (with `frozen: false`), `progress.json`, and
-`masterPlan.md` under `.temp/plan-mode/active/<planId>/`. Don't
-initialize `progress.steps[*].status` yet — initialization happens
-on approval (step 4 below).
+Write `plan.json` (with `frozen: false`) and `masterPlan.md` under
+`.temp/plan-mode/active/<planId>/`. Do **not** write `progress.json`
+yet — it is created exactly once at approval (step 3 below) via
+`init-progress`. Writing it at draft time makes that call fail with an
+already-exists error.
 
 ### 2. Open Orbit review on `masterPlan.md`
 
@@ -187,8 +199,9 @@ verdict or non-empty blocking threads):
 - Set `plan.json.approvedVia` to `"orbit"`.
 - Flip `plan.json.frozen` to `true`.
 - Initialize `progress.json` via
-  `scripts/plan-utils.sh init-progress <plan-dir>` so every step is
-  `pending` and `currentFrontier` is the set of root steps.
+  `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh init-progress <plan-dir>`
+  so every step is `pending` and `currentFrontier` is the set of root
+  steps. This is the one and only creation of `progress.json`.
 
 ### 4. Plan-mode handoff (clear context before execution)
 

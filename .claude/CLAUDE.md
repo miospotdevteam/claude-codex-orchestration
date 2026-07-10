@@ -2,16 +2,20 @@
 
 You are working inside the repository for **v2 of the `orchestration`
 plugin for Claude Code**. This repo holds both the design spec (under
-`docs/`) and the plugin implementation that descends from it (at the
-repo root: `plugin.json`, `skills/`, `hooks/`, `scripts/`, `schemas/`,
-`templates/`, `tests/`).
+`docs/`) and the plugin implementation that descends from it (under
+`orchestration/`: `.claude-plugin/plugin.json`, `skills/`,
+`codex-skills/`, `hooks/`, `scripts/`, `schemas/`, `templates/`,
+`tests/`).
 
 ## What this repo is
 
-- The v2 design spec, in `docs/01-philosophy.md` … `docs/08-plugin-layout.md`.
-- The v2 implementation that the spec describes. The target shape is in
-  `docs/08-plugin-layout.md` and the suggested build order is at the
-  bottom of that doc.
+- The v2 design spec, in `docs/01-philosophy.md` … `docs/11-routing-eval.md`.
+- The v2 implementation that the spec describes, living under
+  `orchestration/`. The target shape is in `docs/08-plugin-layout.md`
+  and the suggested build order is at the bottom of that doc.
+- The routing-eval harness under `eval/` (a top-level directory with
+  `corpus/`, `scripts/`, `results/`, `tests/`) that validates the
+  routing matrix; see `docs/11-routing-eval.md`.
 - A clean rewrite of v1 (`look-before-you-leap`). Do not import,
   reference, or port v1 implementation files. The spec already
   encodes what survives from v1 and what does not.

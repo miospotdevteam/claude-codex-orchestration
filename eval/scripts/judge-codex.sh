@@ -89,8 +89,14 @@ fi
 if [[ -n "$bundle_file" && ! -f "$bundle_file" ]]; then
   die_usage "--bundle-file does not exist: $bundle_file"
 fi
+if [[ -n "$bundle_file" && ! -s "$bundle_file" ]]; then
+  die_usage "--bundle-file is empty: $bundle_file"
+fi
 if [[ -n "$rubric_file" && ! -f "$rubric_file" ]]; then
   die_usage "--rubric-file does not exist: $rubric_file"
+fi
+if [[ -n "$rubric_file" && ! -s "$rubric_file" ]]; then
+  die_usage "--rubric-file is empty: $rubric_file"
 fi
 
 require_cmd jq
@@ -101,19 +107,29 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 extractor="$script_dir/extract-judge-json.py"
 
 sandbox="$(mktemp -d)"
+sandbox="$(cd "$sandbox" && pwd -P)"
 trap 'rm -rf "$sandbox"' EXIT
 
 prompt_file="$sandbox/prompt.txt"
 output_file="$sandbox/output.txt"
 extracted_file="$sandbox/extracted.json"
 stderr_file="$sandbox/stderr.txt"
+bundle_input="$sandbox/bundle.txt"
+rubric_input="$sandbox/rubric.txt"
 
 if [[ -n "$bundle_file" ]]; then
-  bundle_text="$(cat "$bundle_file")"
+  cp "$bundle_file" "$bundle_input"
+else
+  printf '%s\n' "$bundle_text" >"$bundle_input"
 fi
 if [[ -n "$rubric_file" ]]; then
-  rubric_text="$(cat "$rubric_file")"
+  cp "$rubric_file" "$rubric_input"
+else
+  printf '%s\n' "$rubric_text" >"$rubric_input"
 fi
+
+bundle_text="$(cat "$bundle_input")"
+rubric_text="$(cat "$rubric_input")"
 
 {
   cat <<EOF
@@ -140,7 +156,15 @@ EOF
 # robustly and retry once if the CLI errors or emits nothing parseable.
 run_and_extract() {
   set +e
-  codex exec --skip-git-repo-check - <"$prompt_file" >"$output_file" 2>"$stderr_file"
+  (
+    cd "$sandbox"
+    codex exec \
+      -C "$sandbox" \
+      -s read-only \
+      --skip-git-repo-check \
+      - \
+      <prompt.txt >output.txt 2>stderr.txt
+  )
   local status=$?
   set -e
   [[ "$status" -eq 0 ]] || { cat "$stderr_file" >&2; return 1; }
@@ -155,11 +179,12 @@ if ! run_and_extract; then
 fi
 
 if ! jq -e \
-  'type == "object"
+  'def valid_score: type == "number" and . >= 0 and . <= 5;
+   type == "object"
    and (.scores | type == "object")
-   and (.scores.A | type == "number")
-   and (.scores.B | type == "number")
-   and (.scores.C | type == "number")
+   and (.scores.A | valid_score)
+   and (.scores.B | valid_score)
+   and (.scores.C | valid_score)
    and (.rationale | type == "string")' \
   "$extracted_file" >/dev/null; then
   printf 'judge-codex: extracted output failed schema validation\n' >&2

@@ -21,6 +21,7 @@ set -euo pipefail
 PLUGIN_NAME='orchestration'
 MARKETPLACE_NAME='claude-codex-orchestration'
 MARKETPLACE_SOURCE='miospotdevteam/claude-codex-orchestration'
+PLUGIN_ID="${PLUGIN_NAME}@${MARKETPLACE_NAME}"
 
 log()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -43,8 +44,24 @@ ok "prereqs OK"
 
 is_plugin_installed() {
   claude plugin list --json 2>/dev/null \
-    | jq -e --arg name "$PLUGIN_NAME" '
-        (.. | objects | select(.name? == $name)) // empty
+    | jq -e --arg id "$PLUGIN_ID" --arg name "$PLUGIN_NAME" '
+        def plugin_values:
+          if type == "array" then .[]
+          elif type == "object" then .
+          else empty
+          end;
+        def matching_entries:
+          if type == "array" then
+            .[] | select(.id? == $id or .name? == $name)
+          elif type == "object" then
+            (.plugins? // .)
+            | to_entries[]
+            | select(.key == $id or .key == $name)
+            | .value
+            | plugin_values
+          else empty
+          end;
+        [matching_entries] | length > 0
       ' >/dev/null 2>&1
 }
 
@@ -78,10 +95,74 @@ fi
 # ---- step 3: install the plugin --------------------------------------------
 
 log "installing $PLUGIN_NAME@$MARKETPLACE_NAME"
-claude plugin install "${PLUGIN_NAME}@${MARKETPLACE_NAME}"
+claude plugin install "$PLUGIN_ID"
 ok "installed"
 
-# ---- step 4: de-duplicate skill dirs, then sync the external CLI lanes -----
+# ---- step 4: resolve and validate the installed plugin artifact ------------
+
+resolve_plugin_install_path() {
+  local listing paths path count=0
+
+  if ! listing="$(claude plugin list --json 2>/dev/null)"; then
+    die "could not read Claude's machine-readable plugin listing"
+  fi
+  if ! paths="$(
+    jq -r --arg id "$PLUGIN_ID" --arg name "$PLUGIN_NAME" '
+      def plugin_values:
+        if type == "array" then .[]
+        elif type == "object" then .
+        else empty
+        end;
+      def matching_entries:
+        if type == "array" then
+          .[] | select(.id? == $id or .name? == $name)
+        elif type == "object" then
+          (.plugins? // .)
+          | to_entries[]
+          | select(.key == $id or .key == $name)
+          | .value
+          | plugin_values
+        else empty
+        end;
+      [matching_entries | .installPath?]
+      | map(select(type == "string" and length > 0))
+      | unique[]
+    ' <<<"$listing"
+  )"; then
+    die "Claude's machine-readable plugin listing is invalid"
+  fi
+
+  PLUGIN_INSTALL_PATH=''
+  while IFS= read -r path; do
+    if [[ -n "$path" ]]; then
+      PLUGIN_INSTALL_PATH="$path"
+      count=$((count + 1))
+    fi
+  done <<<"$paths"
+
+  if [[ "$count" -ne 1 ]]; then
+    die "expected exactly one installed $PLUGIN_ID installPath; found $count"
+  fi
+}
+
+resolve_plugin_install_path
+
+[[ "$PLUGIN_INSTALL_PATH" == /* ]] \
+  || die "installed $PLUGIN_ID installPath is not absolute: $PLUGIN_INSTALL_PATH"
+[[ -d "$PLUGIN_INSTALL_PATH" ]] \
+  || die "installed $PLUGIN_ID installPath is not a directory: $PLUGIN_INSTALL_PATH"
+[[ -f "$PLUGIN_INSTALL_PATH/.claude-plugin/plugin.json" ]] \
+  || die "installed $PLUGIN_ID artifact has no plugin manifest: $PLUGIN_INSTALL_PATH"
+jq -e --arg name "$PLUGIN_NAME" '.name == $name' \
+  "$PLUGIN_INSTALL_PATH/.claude-plugin/plugin.json" >/dev/null \
+  || die "installed artifact manifest is not for $PLUGIN_NAME: $PLUGIN_INSTALL_PATH"
+[[ -d "$PLUGIN_INSTALL_PATH/skills" ]] \
+  || die "installed $PLUGIN_ID artifact has no skills directory: $PLUGIN_INSTALL_PATH"
+
+PLUGIN_INSTALL_PATH="$(cd "$PLUGIN_INSTALL_PATH" && pwd -P)"
+ok "resolved installed plugin artifact: $PLUGIN_INSTALL_PATH"
+
+# ---- step 5: de-duplicate skill dirs, then sync the external CLI lanes -----
 #
 # One canonical copy per lane, no doubles:
 #
@@ -102,8 +183,6 @@ ok "installed"
 # look-before-you-leap) are cleared everywhere. Skills the plugin does not
 # own (user's own skills, a CLI's bundled skills) are never touched.
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 EXTERNAL_SKILLS=(
   engineering-discipline
   test-driven-development
@@ -114,10 +193,19 @@ EXTERNAL_SKILLS=(
   react-native-mobile
 )
 
-# Every skill name the plugin owns, derived from the repo so the list can
-# never drift: everything under skills/ and codex-skills/, plus v1 names.
+# Validate every required source before cleanup so a malformed installed
+# artifact cannot leave an external lane partially cleared or partially synced.
+for s in "${EXTERNAL_SKILLS[@]}"; do
+  if [[ ! -d "$PLUGIN_INSTALL_PATH/codex-skills/$s" \
+    && ! -d "$PLUGIN_INSTALL_PATH/skills/$s" ]]; then
+    die "installed artifact is missing external skill '$s': $PLUGIN_INSTALL_PATH"
+  fi
+done
+
+# Every skill name the plugin owns, derived from the installed artifact so the
+# list can never drift or be influenced by the checkout invoking this script.
 MANAGED_SKILLS=()
-for d in "$REPO_DIR"/orchestration/skills/*/ "$REPO_DIR"/orchestration/codex-skills/*/; do
+for d in "$PLUGIN_INSTALL_PATH"/skills/*/ "$PLUGIN_INSTALL_PATH"/codex-skills/*/; do
   if [[ -d "$d" ]]; then
     MANAGED_SKILLS+=("$(basename "$d")")
   fi
@@ -156,13 +244,9 @@ sync_external_lane() {
 
   local installed=0 s src
   for s in "${EXTERNAL_SKILLS[@]}"; do
-    src="$REPO_DIR/orchestration/codex-skills/$s"
+    src="$PLUGIN_INSTALL_PATH/codex-skills/$s"
     if [[ ! -d "$src" ]]; then
-      src="$REPO_DIR/orchestration/skills/$s"
-    fi
-    if [[ ! -d "$src" ]]; then
-      warn "$lane: skill '$s' not found in repo — skipped"
-      continue
+      src="$PLUGIN_INSTALL_PATH/skills/$s"
     fi
     cp -R "$src" "$target/$s"
     installed=$((installed + 1))
