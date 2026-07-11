@@ -11,25 +11,45 @@ central invariant is that **the conductor dispatches; it does not do
 the heavy work itself**. This skill is the contract for that
 invariant.
 
-## Hard rule: verification is cross-family and Claude-session-dispatched
+## Hard rule: verification is cross-family, Grok always verifies, and every verify is Claude-session-dispatched
 
-**Every implementation step gets a Claude-session-dispatched verify
-whose model family differs from the implementer's. The verifier
-wrapper never calls the bridge directly.**
+**Every implementation step gets (a) a verifier whose model family
+differs from the implementer's, and (b) a Grok verify — always. When
+Grok is already the cross-family verifier, one Grok dispatch satisfies
+both. The verifier wrapper never calls the bridge directly.**
 
-The cross-family policy:
+The verification policy, per owner:
 
-- `codex-impl` steps are verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` when the Grok lane
-  is configured; the implementer is Codex, so the verifier is Grok.
-- `grok-impl` and `claude-impl` steps are verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`; the implementer
-  is Grok or Claude, so the verifier is Codex.
-- The invariant: the verifier is always a **different model family**
-  than the implementer.
-- If a grok wrapper exits 4 (the grok binary is unavailable), fall
-  back to `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` and note
-  the fallback in the step's `progress.json` `deviations`.
+- `codex-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; Grok is both the
+  cross-family verifier and the mandated Grok pass — one dispatch.
+- `claude-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family)
+  **and** `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` (the
+  mandatory Grok second pass). Dispatch both; the step is `done` only
+  when both final verdicts are PASS.
+- `grok-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family,
+  the authoritative gate) **and** a Grok second pass. The Grok pass is
+  same-family here — measured blind-eval self-scoring showed Grok does
+  not favor its own output, which is why it is acceptable as the
+  *second* voice; it is never the sole gate on its own work.
+- The invariants: at least one verifier is a **different model
+  family** than the implementer, and **Grok is always among the
+  verifiers** when its lane is available.
+- Findings from EITHER verifier enter the fix-and-re-verify loop; both
+  verifiers re-run after a fix.
+- Degradation, by role of the failing verifier: when Grok is the
+  **second** verifier (claude-impl / grok-impl), exit 4 or two
+  contract-parse failures → proceed on the already-run Codex verdict
+  with a `deviations` note — do not loop. When Grok is the **sole**
+  verifier (codex-impl), the same failures → **re-dispatch
+  verification via `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`**
+  (no Codex verdict exists yet) with a deviation note. If the Codex
+  lane is unavailable, verification is never skipped: the step stays
+  `in_progress` with a deviation until the lane returns — an
+  unverified step never flips `done` and never rides a milestone
+  commit.
 
 BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
 `claude-bridge` MCP call-back tools (`verify_step`,
@@ -90,6 +110,27 @@ Ask the user only when the loop fails to converge or the findings
 require judgment beyond mechanical fixing. Routine findings are the
 conductor's job, not the user's.
 
+## Hard rule: milestone commits, message drafted by Grok
+
+The conductor commits **autonomously at milestones** on `main`: when a
+step (or coherent group) reaches `done` with every required verifier
+at PASS, and at the end of a work session. Never commit unverified
+work or failing tests. Git stays append-only: `add`, `commit`, `push`,
+`fetch`, fast-forward-only `pull` — no rebase, reset, checkout, stash,
+branch, or force-push, ever; divergence between machines is surfaced,
+never auto-merged.
+
+The commit message is **drafted by Grok**: dispatch an out-of-band
+read-only call through `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`
+with a synthetic step block over the staged diff asking for a
+conventional commit message; the returned `Summary` carries it (first
+line = subject ≤72 chars, remainder = body). If the grok lane is
+unavailable (exit 4) or the contract fails to parse twice, write the
+message yourself and note the fallback. Before starting NEW work in a
+repo shared with the second machine, run the sync protocol first:
+check `git status` on both machines (SSH), bring the working copy to
+par with HEAD via commit+push / `pull --ff-only`, and only then begin.
+
 ## Hard rule: implementation sub-agent model follows the scorecard
 
 **Every Claude sub-agent the conductor dispatches MUST carry an
@@ -100,9 +141,16 @@ the tiers below govern *dispatched* sub-agents.
 
 The tiers:
 
-- **Opus is the floor and the default.** `owner: claude-impl` step →
+- **Before any Claude implementation dispatch, check the lane.** A
+  `claude-impl` step must be taste-led or gated on a Claude-only
+  skill; general implementation that merely *could* run on Opus
+  belongs on `grok-impl` (the Grok lane is the measured slack quota;
+  the Claude quota is a binding constraint). Re-route rather than
+  dispatch when the step doesn't justify the Claude lane.
+- **Opus is the floor and the default *within* the Claude lane.**
+  A justified `owner: claude-impl` step →
   `Agent(subagent_type: "general-purpose", model: "opus", ...)` unless a
-  rule below moves it. Refactoring, multi-file edit, and TDD
+  rule below moves it. Taste-led refactoring, multi-file edit, and TDD
   implementation sub-agents default here too.
 - **Escalate to Fable** (`model: "fable"`) for the hardest *and* most
   user-facing implementation — work that needs top intelligence and top
@@ -326,13 +374,16 @@ The conductor:
 Per-step routing:
 
 - `owner: codex-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`;
-  verified cross-family via `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`.
+  verified via `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` (Grok
+  is both the cross-family verifier and the mandatory Grok pass).
 - `owner: grok-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` (the
-  `codex-dispatch` skill owns both wrapper lanes); verified
-  cross-family via `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`.
+  `codex-dispatch` skill owns both wrapper lanes); verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (authoritative
+  cross-family gate) plus the mandatory Grok second pass.
 - `owner: claude-impl` → dispatch `general-purpose` sub-agent to
-  implement, then `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`
-  (Codex verifies Claude — a different family).
+  implement, then BOTH `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`
+  (cross-family) and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`
+  (mandatory Grok second pass); `done` requires both PASS.
 - `owner: manual` → flip `blocked` with a note; continue with the
   rest of the frontier.
 
@@ -408,10 +459,17 @@ The conductor invokes other skills as the situation demands:
 | New behavior in a tested project | `test-driven-development` |
 | Reported bug, failed test, FAIL verdict | `systematic-debugging` |
 | Cold start / post-compaction resume | `persistent-plans` |
+| Start or launch Mini work; continue or resume Mini work; inspect or check whether it needs input; control, steer, or send instructions to Mini; reclaim or take over Mini work | `remote-agent-host` |
 | Every code edit, full stop | `engineering-discipline` (always) |
 
 `engineering-discipline` is the floor under everything. It is
 invoked alongside whichever workflow skill fires.
+
+The `remote-agent-host` route is an intent route, not a plan-step owner or an
+external wrapper lane. When a user asks to start, continue, inspect for input,
+control, or reclaim a supported Mini session, invoke that skill and let it own
+the guarded helper interaction and safety checks. The conductor consumes only
+its bounded captured-state report; it never improvises SSH or rsync commands.
 
 ## Resumption
 

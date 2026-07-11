@@ -1,6 +1,6 @@
 ---
 name: codex-dispatch
-description: Invoke Codex and Grok through the plugin's direction-locked wrappers (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh` / `run-codex-verify.sh`, `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` / `run-grok-verify.sh`) and parse the bounded Summary / Verdict / Findings contract block. Use whenever a plan step with `owner: codex-impl` or `owner: grok-impl` is on the frontier, for every verification dispatch (cross-family policy: `codex-impl` verified by Grok when the Grok lane is configured; `grok-impl` / `claude-impl` verified by Codex), or when the conductor needs an out-of-band check. The wrapper's identity locks the direction (impl vs verify); never read raw Codex or Grok output — only the JSON emitted by `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh` that the wrapper prints. Do NOT use for implementing `claude-impl` / `manual` steps (verifying finished `claude-impl` work does go through here), for free-form conversation, or for any Codex or Grok call that bypasses the wrappers.
+description: Invoke Codex and Grok through the plugin's direction-locked wrappers (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh` / `run-codex-verify.sh`, `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` / `run-grok-verify.sh`) and parse the bounded Summary / Verdict / Findings contract block. Use whenever a plan step with `owner: codex-impl` or `owner: grok-impl` is on the frontier, for every verification dispatch (dual-verify policy: `codex-impl` verified by Grok alone; `grok-impl` / `claude-impl` verified by BOTH Codex and Grok, done requiring both PASS; Codex alone only as the degraded fallback), or when the conductor needs an out-of-band check (including the milestone-commit message draft via the Grok verify wrapper). The wrapper's identity locks the direction (impl vs verify); never read raw Codex or Grok output — only the JSON emitted by `${CLAUDE_PLUGIN_ROOT}/scripts/parse-contract.sh` that the wrapper prints. Do NOT use for implementing `claude-impl` / `manual` steps (verifying finished `claude-impl` work does go through here), for free-form conversation, or for any Codex or Grok call that bypasses the wrappers.
 allowed-tools: Read, Bash, Edit, Write
 ---
 
@@ -12,25 +12,47 @@ it goes through one of the direction-locked wrappers whose script
 identity is the source of truth for the direction (IMPLEMENT vs
 VERIFY). Anything outside this contract is a correctness hazard.
 
-## Hard rule: verification is cross-family and Claude-session-dispatched
+## Hard rule: verification is cross-family, Grok always verifies, and every verify is Claude-session-dispatched
 
-**Every implementation step gets a Claude-session-dispatched verify
-whose model family differs from the implementer's. The verifier
-wrapper never calls the bridge directly.**
+**Every implementation step gets (a) a verifier whose model family
+differs from the implementer's, and (b) a Grok verify — always. When
+Grok is already the cross-family verifier, one Grok dispatch satisfies
+both. The verifier wrapper never calls the bridge directly.**
 
-The cross-family policy:
+The verification policy, per owner:
 
-- `codex-impl` steps are verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` when the Grok lane
-  is configured; the implementer is Codex, so the verifier is Grok.
-- `grok-impl` and `claude-impl` steps are verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`; the implementer
-  is Grok or Claude, so the verifier is Codex.
-- The invariant: the verifier is always a **different model family**
-  than the implementer.
-- If a grok wrapper exits 4 (the grok binary is unavailable), fall
-  back to `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` and note
-  the fallback in the step's `progress.json` `deviations`.
+- `codex-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; Grok is both the
+  cross-family verifier and the mandated Grok pass — one dispatch.
+- `claude-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family)
+  **and** `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` (the
+  mandatory Grok second pass). Dispatch both; the step is `done` only
+  when both final verdicts are PASS.
+- `grok-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family,
+  the authoritative gate) **and** a Grok second pass (same-family, but
+  measured blind-eval self-scoring showed no Grok self-favoring; it is
+  the second voice, never the sole gate on its own work).
+- The invariants: at least one verifier is a **different model
+  family** than the implementer, and **Grok is always among the
+  verifiers** when its lane is available.
+- Findings from EITHER verifier enter the fix-and-re-verify loop; both
+  verifiers re-run after a fix.
+- Degradation, by role of the failing verifier:
+  - Grok as the **second** verifier (claude-impl / grok-impl steps):
+    exit 4, or contract-parse failure twice (exit 3 after the one
+    strict-reminder retry) → proceed on the already-run Codex verdict
+    and record the deviation — do not loop.
+  - Grok as the **sole** verifier (codex-impl steps): exit 4, or
+    parse failure twice → **re-dispatch verification via
+    `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`** (there is no
+    Codex verdict yet) and record the deviation.
+  - Codex lane unavailable (quota, capacity after the delayed
+    retries): verification is **never skipped** — the step stays
+    `in_progress` with a deviation note until the lane returns. An
+    unverified step never flips `done` and never rides a milestone
+    commit.
 
 BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
 `claude-bridge` MCP call-back tools (`verify_step`,
@@ -60,9 +82,18 @@ contract-block flow instead.
   use the cross-family verify wrapper (`run-grok-verify.sh` for
   `codex-impl` when the Grok lane is configured; otherwise
   `run-codex-verify.sh`).
-- The conductor needs an out-of-band Codex check (rare; e.g. a quick
-  sanity scan before approving a plan) → use the verify wrapper with
-  a synthetic step block.
+- The conductor needs an out-of-band Codex or Grok check (rare; e.g.
+  a quick sanity scan before approving a plan) → use the verify
+  wrapper with a synthetic step block.
+- The conductor needs a **milestone-commit message**: a sanctioned
+  out-of-band use of `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`
+  with a synthetic step block over the staged diff. The contract's
+  `Summary` carries the message (first line = subject ≤72 chars,
+  remainder = body); the `Verdict` field is required by the contract
+  but carries no meaning for this use — any token is accepted and
+  ignored. Known, accepted coupling: Grok may draft the message for a
+  diff it also verified; the conductor-authored fallback covers Grok
+  unavailability.
 
 It does **not** fire for:
 
@@ -85,17 +116,17 @@ every off-context executor and verifier.
 |---|---|---|
 | `owner: codex-impl`, status `pending` → `in_progress` | `run-codex-impl.sh` | IMPLEMENT |
 | `owner: grok-impl`, status `pending` → `in_progress` | `run-grok-impl.sh` | IMPLEMENT |
-| `codex-impl` impl needs verification, **Grok lane configured** | `run-grok-verify.sh` | VERIFY |
-| `codex-impl` impl needs verification, Grok lane not configured | `run-codex-verify.sh` | VERIFY |
-| `grok-impl` impl needs verification | `run-codex-verify.sh` | VERIFY |
-| `owner: claude-impl` step needs verification after Claude finishes | `run-codex-verify.sh` | VERIFY |
+| `codex-impl` impl needs verification, **Grok lane configured** | `run-grok-verify.sh` (satisfies both mandates) | VERIFY |
+| `codex-impl` impl needs verification, Grok lane not configured | `run-codex-verify.sh` (degraded; note deviation) | VERIFY |
+| `grok-impl` impl needs verification | `run-codex-verify.sh` **and** `run-grok-verify.sh` | VERIFY ×2 |
+| `owner: claude-impl` step needs verification after Claude finishes | `run-codex-verify.sh` **and** `run-grok-verify.sh` | VERIFY ×2 |
 
-Verification is **cross-family**: the verifier is always a different
-model family than the implementer (the policy stated above). When the
-Grok lane is configured (the `grok` CLI is installed and
-authenticated), `codex-impl` steps are verified via
-`run-grok-verify.sh`; `grok-impl` and `claude-impl` steps are verified
-via `run-codex-verify.sh`.
+Verification follows the dual mandate in the hard rule above: at least
+one verifier from a different model family than the implementer, and
+Grok always among the verifiers when its lane is available. For
+`codex-impl` steps one `run-grok-verify.sh` dispatch satisfies both;
+`grok-impl` and `claude-impl` steps dispatch BOTH verify wrappers, and
+the step is `done` only when both final verdicts are PASS.
 
 The wrappers are direction-locked: the prompt body cannot flip a
 verifier into an implementer. Choosing the right wrapper — direction
@@ -346,7 +377,7 @@ wrapper. Reading the log defeats the boundary.
 | 0 | Contract block parsed | Read JSON, record verdict |
 | 1 | Bad invocation (missing args, etc.) | Bug in this skill — fix |
 | 2 | executor CLI invocation failed (`codex exec` or `grok`) | Step → `blocked` with reason `executor-unavailable`; surface. Exit 4 (the `grok` binary not on PATH) is a distinct case — see the next row. |
-| 3 | Contract block missing or malformed | **Retry exactly once** with a stricter reminder appended to the step block. Second failure → step `blocked` with reason `contract-parse-failed` |
+| 3 | Contract block missing or malformed | **Retry exactly once** with a stricter reminder appended to the step block. Second failure, by role: Grok as the **second** verifier → proceed on the already-run Codex verdict, record the deviation. Grok as the **sole** verifier (`codex-impl` step) → re-dispatch verification via `run-codex-verify.sh`, record the deviation. Any **impl** dispatch, or a failing `run-codex-verify.sh` → step `blocked` with reason `contract-parse-failed` |
 | 4 | `grok` binary not on PATH (Grok wrapper only) | **Verify dispatch** (`run-grok-verify.sh`): re-dispatch the verification via `run-codex-verify.sh` — the pre-Grok fallback — and record the fallback in the step's `progress.json` `deviations`. **Impl dispatch** (`run-grok-impl.sh`): flip the step `blocked` with reason `grok-unavailable`; surface |
 
 Codex verdict handling:

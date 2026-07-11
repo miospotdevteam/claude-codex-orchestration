@@ -11,8 +11,8 @@ Subcommands:
   read-progress <plan-dir>
   init-progress [--force] <plan-dir>
   start-step <plan-dir> <step-id> <executor> <model>
-  set-step-status <plan-dir> <step-id> <status>
-  record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array>
+  set-step-status <plan-dir> <step-id> <status> [--degraded <reason>]
+  record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array> [lane]
   set-frontier <plan-dir> <space-separated-step-ids>
   compute-frontier <plan-dir>
 USAGE
@@ -81,6 +81,43 @@ valid_executor() {
   case "$1" in
     codex | grok | claude) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+valid_lane() {
+  case "$1" in
+    codex | grok) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Owner from plan.json for a step id. Empty string if missing.
+step_owner_from_plan() {
+  local plan_dir=$1
+  local step_id=$2
+  local plan_file="$plan_dir/plan.json"
+  [[ -f "$plan_file" ]] || die "missing plan.json in $plan_dir"
+  jq -r --arg id "$step_id" '
+    (.steps // [])
+    | map(select(.id == $id))
+    | if length == 0 then empty else .[0].owner // empty end
+  ' "$plan_file"
+}
+
+# True when lane is the authoritative verifier for owner (mirrors to top-level verdict).
+lane_is_authoritative() {
+  local owner=$1
+  local lane=$2
+  case "$owner" in
+    codex-impl)
+      [[ "$lane" == "grok" ]]
+      ;;
+    claude-impl | grok-impl)
+      [[ "$lane" == "codex" ]]
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 
@@ -210,19 +247,126 @@ cmd_start_step() {
     --arg now "$now"
 }
 
+# Parse optional --degraded <reason> from argv; remaining positionals go to stdout
+# as lines (bash 3.2 safe — no nameref).
+parse_degraded_flag() {
+  degraded_reason=""
+  _parse_pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --degraded)
+        [[ $# -ge 2 ]] || die "--degraded requires a reason"
+        [[ -n "$2" ]] || die "--degraded reason must not be empty"
+        degraded_reason=$2
+        shift 2
+        ;;
+      *)
+        _parse_pos+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+# Dual-verifier done gate. Sets gate_ok=true/false and gate_use_degraded=true/false.
+# Reads progress.json + plan.json; does not write.
+check_done_gate() {
+  local plan_dir=$1
+  local step_id=$2
+  local degraded=$3
+
+  local owner progress_file
+  progress_file="$plan_dir/progress.json"
+  owner=$(step_owner_from_plan "$plan_dir" "$step_id")
+  [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+
+  local codex_v grok_v top_v has_lane
+  codex_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.codex.verdict // empty' "$progress_file")
+  grok_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.grok.verdict // empty' "$progress_file")
+  top_v=$(jq -r --arg id "$step_id" '.steps[$id].verdict // empty' "$progress_file")
+  has_lane=false
+  if [[ -n "$codex_v" || -n "$grok_v" ]]; then
+    has_lane=true
+  fi
+
+  local codex_pass=false grok_pass=false top_pass=false any_pass=false
+  [[ "$codex_v" == "PASS" ]] && codex_pass=true
+  [[ "$grok_v" == "PASS" ]] && grok_pass=true
+  [[ "$top_v" == "PASS" ]] && top_pass=true
+  # any_pass gates --degraded: it requires a real per-lane PASS. The
+  # legacy top-level verdict never satisfies a degraded completion —
+  # degraded means "one of the two required lanes is down", not "no
+  # lane ever ran".
+  if [[ "$codex_pass" == true || "$grok_pass" == true ]]; then
+    any_pass=true
+  fi
+
+  gate_ok=false
+  gate_use_degraded=false
+
+  case "$owner" in
+    codex-impl)
+      if [[ "$grok_pass" == true ]]; then
+        gate_ok=true
+      elif [[ "$has_lane" == false && "$top_pass" == true ]]; then
+        # Legacy path: no per-lane data, top-level PASS is enough.
+        gate_ok=true
+      elif [[ -n "$degraded" && "$any_pass" == true ]]; then
+        gate_ok=true
+        gate_use_degraded=true
+      else
+        die "cannot mark step '$step_id' done: codex-impl requires grok-lane PASS (or legacy top-level PASS when no lane data); got grok='${grok_v:-none}' top='${top_v:-none}'"
+      fi
+      ;;
+    claude-impl | grok-impl)
+      if [[ "$codex_pass" == true && "$grok_pass" == true ]]; then
+        gate_ok=true
+      elif [[ -n "$degraded" && "$any_pass" == true ]]; then
+        gate_ok=true
+        gate_use_degraded=true
+      else
+        die "cannot mark step '$step_id' done: $owner requires PASS in both verdicts.codex and verdicts.grok (or --degraded <reason> with a single-lane PASS); got codex='${codex_v:-none}' grok='${grok_v:-none}'"
+      fi
+      ;;
+    *)
+      # manual / unknown: no dual mandate
+      gate_ok=true
+      ;;
+  esac
+}
+
 cmd_set_step_status() {
-  [[ $# -eq 3 ]] || die "set-step-status requires <plan-dir> <step-id> <status>"
+  parse_degraded_flag "$@"
+  set -- "${_parse_pos[@]}"
+  [[ $# -eq 3 ]] || die "set-step-status requires <plan-dir> <step-id> <status> [--degraded <reason>]"
 
   local plan_dir step_id status now
   plan_dir=$(abs_dir "$1")
   step_id=$2
   status=$3
   valid_status "$status" || die "invalid status: $status"
+  if [[ -n "$degraded_reason" && "$status" != "done" ]]; then
+    die "--degraded is only valid when setting status to done"
+  fi
   require_file_json "$plan_dir/progress.json"
   jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
     die "unknown step id: $step_id"
 
   now=$(utc_now)
+
+  if [[ "$status" == "done" ]]; then
+    check_done_gate "$plan_dir" "$step_id" "$degraded_reason"
+    if [[ "$gate_use_degraded" == true ]]; then
+      atomic_update_progress "$plan_dir" '
+        .lastUpdatedAt = $now
+        | .steps[$id].status = "done"
+        | .steps[$id].completedAt = $now
+        | .deviations = ((.deviations // []) + [{at: $now, note: $note}])
+      ' --arg id "$step_id" --arg now "$now" --arg note "$degraded_reason"
+      return 0
+    fi
+  fi
+
   atomic_update_progress "$plan_dir" '
     .lastUpdatedAt = $now
     | .steps[$id].status = $status
@@ -240,15 +384,21 @@ cmd_set_step_status() {
 }
 
 cmd_record_verdict() {
-  [[ $# -eq 6 ]] || die "record-verdict requires <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array>"
+  [[ $# -eq 6 || $# -eq 7 ]] ||
+    die "record-verdict requires <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array> [lane]"
 
-  local plan_dir step_id verdict summary findings_json files_json now
+  local plan_dir step_id verdict summary findings_json files_json lane now owner
   plan_dir=$(abs_dir "$1")
   step_id=$2
   verdict=$3
   summary=$4
   findings_json=$5
   files_json=$6
+  lane=""
+  if [[ $# -eq 7 ]]; then
+    lane=$7
+    valid_lane "$lane" || die "invalid lane: $lane (expected codex or grok)"
+  fi
   valid_verdict "$verdict" || die "invalid verdict: $verdict"
   require_file_json "$plan_dir/progress.json"
   jq -e 'type == "array"' <<<"$findings_json" >/dev/null || die "findings must be a JSON array"
@@ -257,19 +407,78 @@ cmd_record_verdict() {
     die "unknown step id: $step_id"
 
   now=$(utc_now)
-  atomic_update_progress "$plan_dir" '
-    .lastUpdatedAt = $now
-    | .steps[$id].verdict = $verdict
-    | .steps[$id].result = $summary
-    | .steps[$id].findings = $findings
-    | .steps[$id].filesTouched = $files
-  ' \
-    --arg id "$step_id" \
-    --arg verdict "$verdict" \
-    --arg summary "$summary" \
-    --argjson findings "$findings_json" \
-    --argjson files "$files_json" \
-    --arg now "$now"
+
+  if [[ -z "$lane" ]]; then
+    # Legacy path: top-level fields only.
+    atomic_update_progress "$plan_dir" '
+      .lastUpdatedAt = $now
+      | .steps[$id].verdict = $verdict
+      | .steps[$id].result = $summary
+      | .steps[$id].findings = $findings
+      | .steps[$id].filesTouched = $files
+    ' \
+      --arg id "$step_id" \
+      --arg verdict "$verdict" \
+      --arg summary "$summary" \
+      --argjson findings "$findings_json" \
+      --argjson files "$files_json" \
+      --arg now "$now"
+    return 0
+  fi
+
+  owner=$(step_owner_from_plan "$plan_dir" "$step_id")
+  [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+
+  local mirror=false
+  if lane_is_authoritative "$owner" "$lane"; then
+    mirror=true
+  fi
+
+  if [[ "$mirror" == true ]]; then
+    atomic_update_progress "$plan_dir" '
+      .lastUpdatedAt = $now
+      | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
+          ($lane): {
+            verdict: $verdict,
+            summary: $summary,
+            findings: $findings,
+            filesTouched: $files,
+            timestamp: $now
+          }
+        })
+      | .steps[$id].verdict = $verdict
+      | .steps[$id].result = $summary
+      | .steps[$id].findings = $findings
+      | .steps[$id].filesTouched = $files
+    ' \
+      --arg id "$step_id" \
+      --arg lane "$lane" \
+      --arg verdict "$verdict" \
+      --arg summary "$summary" \
+      --argjson findings "$findings_json" \
+      --argjson files "$files_json" \
+      --arg now "$now"
+  else
+    atomic_update_progress "$plan_dir" '
+      .lastUpdatedAt = $now
+      | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
+          ($lane): {
+            verdict: $verdict,
+            summary: $summary,
+            findings: $findings,
+            filesTouched: $files,
+            timestamp: $now
+          }
+        })
+    ' \
+      --arg id "$step_id" \
+      --arg lane "$lane" \
+      --arg verdict "$verdict" \
+      --arg summary "$summary" \
+      --argjson findings "$findings_json" \
+      --argjson files "$files_json" \
+      --arg now "$now"
+  fi
 }
 
 cmd_set_frontier() {

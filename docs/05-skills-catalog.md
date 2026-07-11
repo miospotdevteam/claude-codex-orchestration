@@ -135,16 +135,20 @@ the catalog stays at nine.)
 **Triggers**
 - A plan step with `owner: codex-impl` or `owner: grok-impl` is on the
   frontier.
-- A step's executor needs verification — cross-family per
-  `docs/09-routing-matrix.md` (`run-grok-verify.sh` for `codex-impl`
-  when the Grok lane is configured; `run-codex-verify.sh` for
-  `grok-impl` / `claude-impl` and as the fallback).
+- A step's executor needs verification — per the dual mandate in
+  `docs/09-routing-matrix.md`: at least one cross-family verifier, and
+  Grok always among the verifiers when its lane is available
+  (`run-grok-verify.sh` alone for `codex-impl`; BOTH
+  `run-codex-verify.sh` and `run-grok-verify.sh` for `grok-impl` /
+  `claude-impl`, `done` requiring both PASS; `run-codex-verify.sh` as
+  the degraded fallback when the Grok lane is down).
 - The conductor needs an out-of-band Codex or Grok check (rare).
 
 **Anti-triggers**
 - Implementing a step whose `owner` is `claude-impl` or `manual` —
-  verifying finished `claude-impl` work still fires this skill (via
-  `run-codex-verify.sh` per the cross-family policy).
+  verifying finished `claude-impl` work still fires this skill (both
+  `run-codex-verify.sh` and `run-grok-verify.sh` per the dual-verify
+  policy).
 - Tasks that don't go through the plan system (free-form
   conversation).
 
@@ -280,7 +284,7 @@ into a concrete proposal before any code is written.
 
 ## Auxiliary skills
 
-In addition to the nine core skills above, v2 ships eight auxiliary
+In addition to the nine core skills above, v2 ships nine auxiliary
 skills covering the craft-specific work the orchestrator routes to.
 Each lives in `skills/<name>/SKILL.md` and follows the same harness
 frontmatter convention (`name`, `description`); the harness
@@ -298,6 +302,54 @@ auto-discovers them by scanning `skills/<name>/SKILL.md` — no list in
 | `react-native-mobile` | Premium native-feeling React Native mobile apps; dual-installable (Claude for UI/UX, Codex for code-heavy) | Conditional — see RN-mobile Routing Directive in `docs/09-routing-matrix.md` |
 | `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Codex-default with Claude design for test plans |
 | `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Claude-only (meta) |
+| `remote-agent-host` | Guarded natural-language start, inspect, control, and reclaim lifecycle for supported Mac Mini sessions | Claude-only (host orchestration) |
+
+### `remote-agent-host` lifecycle contract
+
+This skill triggers only when the user asks to start, continue, inspect,
+control, stop, or reclaim work on the configured Mini. It does not trigger for
+ordinary local execution, arbitrary remote administration, or unsupported
+projects and hosts. Its sole executable boundary is:
+
+```text
+${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
+```
+
+The closed command set is `status`, `start`, `inspect`, `continue`, `send`,
+`interrupt`, `kill`, and `reclaim`; projects are exactly `miospot` and
+`orchestration`; harnesses are exactly `claude`, `codex`, and `grok`. The skill
+uses only `--host`, `--prompt-file`, `--active-plan`, `--include-ignored`, and
+`--approve-ignored` options. It maps natural language to that interface,
+defaults the harness to Claude only
+when no family was named, puts prompts in private temporary files, and reports
+a bounded `inspect` capture before every input. A launch is therefore
+`status` → promptless `start` → `inspect` and report → `send`, even though the
+lower-level helper permits an optional prompt on `start`.
+
+Ownership is a lease, not continuous synchronization. `start` accepts equal
+or local-only state and makes the Mini the single writer. `inspect`,
+`continue`, `send`, `interrupt`, and `kill` do not synchronize project files;
+even a quiescent `kill` does not reclaim them or release the lease. Safe
+reclaim checks `status` and `inspect`, obtains termination permission when
+needed, kills and verifies quiescence, requires remote-only state, then pulls
+through private verified staging and releases ownership last. Stale writers
+require explicit administration and are never broken by reclaim.
+
+The normal transfer universe is tracked and ordinary untracked regular files.
+Ignored content requires exact per-path consent and identical literal values
+for `--include-ignored` and `--approve-ignored`; globs, absolute paths,
+symlinks, `.git`, directory expansion, and inferred neighbors are excluded.
+`--active-plan NAME` adds exactly the selected plan's `plan.json`,
+`progress.json`, and `masterPlan.md`, with snapshot-change detection.
+Destination apply uses a private restore journal: verified restore leaves
+ownership unchanged; failed restore retains authoritative recovery evidence
+and the mutex. The local state mirror is diagnostic only. The helper assumes
+the Mini protocol, launchers, worktrees, authentication, and transport are
+already provisioned; it promises no backend bootstrap, implicit secret copy,
+continuous sync, chat persistence, or reboot survival. A human may attach on
+the Mini to `remote-agent--PROJECT--HARNESS`, but attachment neither changes
+ownership nor substitutes for reclaim; the skill itself never improvises raw
+tmux or transport commands.
 
 ### Codex-side skill bodies (`codex-skills/`)
 

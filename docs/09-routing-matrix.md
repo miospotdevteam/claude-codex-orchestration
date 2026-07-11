@@ -67,10 +67,10 @@ The conductor reaches six models. Route by the axis the step is
 | Model | Reached via | Intelligence | Taste | Route here for |
 |---|---|---|---|---|
 | **Fable 5** | `Agent(model: "fable")` | highest | highest | Plan drafting and convergence (the Claude panel seat is always Fable when available); the hardest *and* most user-facing implementation; end-to-end multi-step work that needs both axes at once — the "steer everything" tier. |
-| **Opus 4.8** | `Agent(model: "opus")` | high | high | Default Claude-side implementation floor; strong all-rounder when a step needs real taste but is not the top of the pile. |
+| **Opus 4.8** | `Agent(model: "opus")` | high | high | Implementation floor *within* the Claude lane — taste-led steps that are not the top of the pile. For implementation without a taste requirement, prefer `grok-impl` (quota economics; see the lane-preference section below). |
 | **Sonnet 5** | `Agent(model: "sonnet")` | mid | mid | Cheap, read-heavy scouting and mechanical Claude-side work where taste does not ship. Never the default for code that lands. |
 | **Codex / gpt-5.6-sol** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
-| **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations — the *second* off-context implementer; also the independent cross-family verifier for `codex-impl` steps. |
+| **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations — the *second* off-context implementer; also the **mandatory verifier on every implementation step** (sole cross-family verifier for `codex-impl`, second verifier alongside Codex elsewhere). |
 | **Haiku** | — | low | low | **Never for real work.** Not an execution or verification tier. |
 
 The Claude tiers (Fable / Opus / Sonnet) are selected via the `model`
@@ -103,20 +103,34 @@ actually established:
 - **Panel planning beats solo and relay** — see the Panel Planning
   section below.
 
-### grok-impl vs codex-impl
+### grok-impl vs codex-impl vs claude-impl (Opus)
 
-Both are off-context external implementers; the routing question is
-*which lane*. **Codex remains the default external implementer.** A step
-is routed `grok-impl` in three cases:
+The implementation lanes rank by quota economics, measured, not
+assumed. **Measured 2026-07-10:** a full day of heavy orchestration —
+a 20-step fix plan, panels, dual verification — consumed ~2% of the
+weekly Grok quota while exhausting both the Claude and Codex quotas.
+Grok is the slack resource; the routing must spend it.
 
-- **Parallel capacity** — the Codex lane is saturated and a step is
-  otherwise runnable; Grok is the second lane.
-- **Bulk sweeps** — mechanical work where a second lane doubles
-  throughput (splitting a large sweep across both lanes).
-- **Explicit routing** — the plan author routes the step `grok-impl`
-  outright.
+The implementation preference order:
 
-Absent one of these, `codex-impl` is the default.
+1. **`codex-impl` remains the default external implementer**
+   (off-context, effectively free at the margin on the subscription).
+2. **`grok-impl` is preferred over a Claude (Opus) implementation
+   sub-agent for any implementation step that does not need
+   Claude-side taste or a Claude-only skill.** If a step would land on
+   `claude-impl` merely because the Codex lane is busy, or because "an
+   Opus agent can do it", route it `grok-impl` instead. Grok is also
+   the second lane when Codex is saturated, and the second half of
+   bulk sweeps split across both lanes.
+3. **`claude-impl` (Opus floor) is reserved for taste-led work**: steps
+   whose skill is Claude-only (frontend/design/prose lanes) or where
+   the artifact's shape for human readers is the point. Opus is the
+   implementation floor *within* the Claude lane — not the default
+   destination for implementation in general.
+
+A `claude-impl` step that isn't taste-led or Claude-skill-gated is a
+routing bug twice over: it burns the scarce quota and leaves the slack
+lane idle.
 
 ---
 
@@ -535,12 +549,35 @@ returned FINDINGS with 6 substantive items — verifier strictness is
 model-version-dependent, so leniency observations must be re-measured
 after upstream model changes. Both observations are further evidence
 *for* cross-family verification, not a routing or model change.
-When the Grok lane is configured
-(the `grok` CLI is installed and authenticated), `codex-impl` steps are
-verified via `run-grok-verify.sh`, while `grok-impl` and `claude-impl`
-steps are verified via `run-codex-verify.sh`. **Fallback:** whenever the
-`grok` binary is unavailable (wrapper exit code 4), verification falls
-back to `run-codex-verify.sh` — the pre-Grok behavior.
+**Grok is a mandatory verifier on every implementation step.** When
+the Grok lane is configured (the `grok` CLI is installed and
+authenticated):
+
+- `codex-impl` steps are verified via `run-grok-verify.sh` — Grok is
+  simultaneously the cross-family verifier and the mandated Grok pass.
+- `claude-impl` steps get **two** verifiers: `run-codex-verify.sh`
+  (cross-family) plus `run-grok-verify.sh` (the mandatory Grok second
+  pass). The step is done only when both final verdicts are PASS.
+- `grok-impl` steps also get two: `run-codex-verify.sh` is the
+  authoritative cross-family gate, and the Grok pass is the second
+  voice. Same-family here — acceptable *as the second* because the
+  blind eval measured no Grok self-favoring (−0.04); it is never the
+  sole gate on Grok's own work.
+
+Findings from either verifier enter the fix-and-re-verify loop, and
+both verifiers re-run after a fix. **Degradation, by the failing
+verifier's role:** when Grok is the *second* verifier (`claude-impl` /
+`grok-impl`), Grok exit 4 or two consecutive contract-parse failures
+(exit 3 after the strict-reminder retry) defer to the already-run
+Codex verdict with a recorded deviation. When Grok is the *sole*
+verifier (`codex-impl`), the same failures re-dispatch verification
+via `run-codex-verify.sh` — no Codex verdict exists yet — with a
+deviation note. When the **Codex lane** is unavailable (quota or
+capacity after the delayed retries), verification is never skipped:
+the step stays `in_progress` with a deviation until the lane returns.
+The grok-over-Opus implementation preference never overrides this —
+routing more work to `grok-impl` presumes the Codex gate; if Codex is
+down, prefer holding dispatches over accumulating unverifiable work.
 
 There are **no signed receipts, no HMAC sidecars, no digester
 subagent** in v2. See `docs/01-philosophy.md` for the rationale.

@@ -125,6 +125,7 @@
           "$ref": "#/$defs/dispatch"
         },
         "verdict": {
+          "description": "Authoritative single-verdict field (legacy flat record). Lane-scoped history lives under verdicts.",
           "enum": [
             "PASS",
             "FINDINGS",
@@ -140,6 +141,19 @@
         "result": {
           "type": "string"
         },
+        "verdicts": {
+          "description": "Per-lane verifier records (codex / grok). Optional; dual-mandate done-gating reads these.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "codex": {
+              "$ref": "#/$defs/laneVerdict"
+            },
+            "grok": {
+              "$ref": "#/$defs/laneVerdict"
+            }
+          }
+        },
         "deviations": {
           "type": "array",
           "items": {
@@ -151,6 +165,45 @@
           "items": {
             "$ref": "#/$defs/path"
           }
+        }
+      }
+    },
+    "laneVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "summary",
+        "findings",
+        "filesTouched",
+        "timestamp"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "PASS",
+            "FINDINGS",
+            "FAIL"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "filesTouched": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/path"
+          }
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
         }
       }
     },

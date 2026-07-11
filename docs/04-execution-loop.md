@@ -96,9 +96,12 @@ This is the **frontier**. The conductor:
 1. Computes `runnable(plan, progress)` after every step completes.
 2. Updates `progress.currentFrontier`.
 3. Dispatches every step in the frontier **in parallel** by default.
-4. Marks each as `in_progress` before dispatch and `done` after the
-   verifier returns PASS (fixing and re-verifying any FAIL/FINDINGS
-   first, per the policy below).
+4. Marks each as `in_progress` before dispatch and `done` after every
+   required verifier returns PASS (fixing and re-verifying any
+   FAIL/FINDINGS first, per the policy below). Verifier assignment
+   follows the routing matrix in `docs/09-routing-matrix.md`: at least
+   one verifier from a different model family than the implementer,
+   and Grok always among the verifiers when its lane is available.
 
 Parallel dispatch uses the harness's ability to call multiple `Agent`
 or wrapper scripts in one assistant message. The conductor sends one
@@ -185,7 +188,34 @@ The conductor:
    `09-routing-matrix.md` or directly by the conductor for short
    scripts.
 3. Reports back: what changed, what's flagged, what's outstanding.
-4. Moves the plan directory to `archive/`.
+4. Commits the completed work (see Milestone commits below) if a
+   milestone commit has not already covered it.
+5. Moves the plan directory to `archive/`.
+
+## Milestone commits
+
+Commits are part of the loop, not an afterthought left to the user.
+The conductor commits **autonomously at milestones**: when a step (or
+a coherent group of steps that shipped together) reaches `done` with
+every required verifier at PASS, and always at the end of a work
+session. Never commit a step that has not passed verification, and
+never commit with failing tests.
+
+The mechanics, per the machine's git policy (append-only on `main`):
+
+- Stage the step's files (`git add` of the step's `files[]` plus any
+  recorded deviations' files), commit on `main`, then push so the
+  second machine can fast-forward.
+- **The commit message is drafted by Grok**: an out-of-band read-only
+  dispatch through `run-grok-verify.sh` with a synthetic step block
+  containing the staged diff and asking for a conventional commit
+  message; the contract block's `Summary` carries it (first line =
+  subject, ≤72 chars; remainder = body). If the Grok lane is
+  unavailable (exit 4) or the contract fails to parse twice, the
+  conductor writes the message itself and notes the fallback.
+- History-rewriting git (rebase, reset, checkout, stash, force-push,
+  branching) stays forbidden — divergence between machines is
+  surfaced to the user, never auto-merged.
 
 ## Resumption protocol (after compaction)
 

@@ -132,10 +132,17 @@ Default routing, in short form:
   capacity when the Codex lane is saturated, bulk sweeps split across
   both lanes, or an explicit author choice. Grok and Codex share the
   identical wrapper contract, so a step routes to whichever lane has
-  capacity; `codex-dispatch` owns both lanes.
+  capacity; `codex-dispatch` owns both lanes. **Grok is preferred over
+  a Claude (Opus) sub-agent for any implementation step that does not
+  need Claude-side taste or a Claude-only skill** — quota economics:
+  the Grok lane is the measured slack resource while the Claude and
+  Codex quotas are the binding constraints.
 - **`claude-impl`**: steps whose `skill` is in the Claude-only set
   (`frontend-design`, `svg-art`, `immersive-frontend`,
-  `brainstorming`, `writing-plans`, `doc-coauthoring`).
+  `brainstorming`, `writing-plans`, `doc-coauthoring`), or where the
+  artifact's shape for human readers is the point (taste-led work).
+  Not the fallback lane for general implementation — that is
+  `grok-impl`.
 - **`manual`**: the user does it (auth flows that need a human
   browser, secret handling, decisions that need judgment outside the
   model).

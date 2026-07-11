@@ -205,12 +205,28 @@ with the conductor's user-visible dispatch announcement. It is
 overwritten on re-dispatch, so it always reflects the dispatch that
 produced the recorded verdict.
 
+The schemas govern **active** plans. Progress files under `archive/`
+are historical records: they may predate schema changes and are never
+retro-validated or rewritten to match a newer schema.
+
+### Per-lane verdicts
+
+Alongside the single authoritative `verdict`, a step may carry an
+optional `verdicts` object with `codex` and/or `grok` keys, each the
+same record shape plus a timestamp. This is how the dual-verify
+mandate (see `09-routing-matrix.md`) is stored durably: for
+`claude-impl` and `grok-impl` steps both lanes must record PASS before
+the step flips `done` (the plan-utils `done` transition enforces this;
+a `--degraded <reason>` escape records a deviation instead). The
+top-level `verdict` mirrors the authoritative lane — grok for
+`codex-impl` steps, codex for the others.
+
 ### Status values
 
 - **`pending`** — not yet runnable, or runnable but not picked.
 - **`in_progress`** — dispatched, awaiting result.
-- **`done`** — completed with a verdict of PASS. Only a PASS flips a
-  step to `done`.
+- **`done`** — completed with a verdict of PASS from every required
+  verifier lane. Only PASS flips a step to `done`.
 - **`blocked`** — could not complete; needs human input. The
   `result` field carries the reason.
 - **`skipped`** — explicitly skipped by user decision; `result`

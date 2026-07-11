@@ -38,6 +38,9 @@ assert_jq() {
 
 create_plan_dir() {
   local dir=$1
+  local owner1=${2:-codex-impl}
+  local owner2=${3:-codex-impl}
+  local owner3=${4:-codex-impl}
   mkdir -p "$dir"
   cat >"$dir/plan.json" <<JSON
 {
@@ -58,7 +61,7 @@ create_plan_dir() {
       "acceptanceCriteria": ["done"],
       "files": ["one.txt"],
       "dependsOn": [],
-      "owner": "codex-impl"
+      "owner": "$owner1"
     },
     {
       "id": "step-2",
@@ -67,7 +70,7 @@ create_plan_dir() {
       "acceptanceCriteria": ["done"],
       "files": ["two.txt"],
       "dependsOn": [],
-      "owner": "codex-impl"
+      "owner": "$owner2"
     },
     {
       "id": "step-3",
@@ -76,7 +79,7 @@ create_plan_dir() {
       "acceptanceCriteria": ["done"],
       "files": ["three.txt"],
       "dependsOn": ["step-1", "step-2"],
-      "owner": "codex-impl"
+      "owner": "$owner3"
     }
   ]
 }
@@ -200,6 +203,8 @@ test_set_step_status_round_trip() {
   "$PLAN_UTILS" set-step-status "$dir" step-1 in_progress
   started=$(jq -r '.steps["step-1"].startedAt' "$dir/progress.json")
   [[ "$started" != "null" && -n "$started" ]] || return 1
+  # Legacy no-lane path: top-level PASS is required before done for codex-impl.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy pass" '[]' '[]'
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   completed=$(jq -r '.steps["step-1"].completedAt' "$dir/progress.json")
   [[ "$completed" != "null" && -n "$completed" ]] || return 1
@@ -237,10 +242,168 @@ test_compute_frontier() {
   local actual
   create_plan_dir "$dir"
   "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "ok" '[]' '[]'
+  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "ok" '[]' '[]'
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   "$PLAN_UTILS" set-step-status "$dir" step-2 done
   actual=$("$PLAN_UTILS" compute-frontier "$dir")
   [[ "$actual" == "step-3" ]]
+}
+
+# --- Dual-verifier verdict storage and done-gating ---
+
+test_record_verdict_lane_mirrors_authoritative_for_codex_impl() {
+  local dir="$SANDBOX/lane-mirror-codex-impl"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+
+  # Grok is authoritative for codex-impl: lane write + top-level mirror.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok ok" '[]' '["g.txt"]' grok
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.grok.verdict == "PASS"
+    and .steps["step-1"].verdicts.grok.summary == "grok ok"
+    and .steps["step-1"].verdicts.grok.findings == []
+    and .steps["step-1"].verdicts.grok.filesTouched == ["g.txt"]
+    and (.steps["step-1"].verdicts.grok.timestamp | test("Z$"))
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "grok ok"
+    and .steps["step-1"].filesTouched == ["g.txt"]' || return 1
+
+  # Non-authoritative codex lane on codex-impl: store lane only, no top-level overwrite.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "codex second" '["c"]' '["c.txt"]' codex
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.codex.verdict == "FINDINGS"
+    and .steps["step-1"].verdicts.codex.summary == "codex second"
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "grok ok"'
+}
+
+test_record_verdict_lane_mirrors_authoritative_for_claude_impl() {
+  local dir="$SANDBOX/lane-mirror-claude-impl"
+  create_plan_dir "$dir" claude-impl claude-impl claude-impl
+  "$PLAN_UTILS" init-progress "$dir"
+
+  # Codex is authoritative for claude-impl.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex gate" '[]' '["a.txt"]' codex
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.codex.verdict == "PASS"
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "codex gate"' || return 1
+
+  # Non-authoritative grok lane: store without overwriting top-level.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "grok second" '["g"]' '["g.txt"]' grok
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.grok.verdict == "FINDINGS"
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "codex gate"'
+}
+
+test_record_verdict_lane_mirrors_authoritative_for_grok_impl() {
+  local dir="$SANDBOX/lane-mirror-grok-impl"
+  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  "$PLAN_UTILS" init-progress "$dir"
+
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex auth" '[]' '[]' codex
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.codex.verdict == "PASS"
+    and .steps["step-1"].verdict == "PASS"' || return 1
+
+  "$PLAN_UTILS" record-verdict "$dir" step-1 FAIL "grok self" '["x"]' '[]' grok
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.grok.verdict == "FAIL"
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "codex auth"'
+}
+
+test_done_refused_when_only_one_dual_lane_pass() {
+  local dir="$SANDBOX/done-one-lane"
+  create_plan_dir "$dir" claude-impl claude-impl claude-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex only" '[]' '[]' codex
+  cp "$dir/progress.json" "$SANDBOX/done-one-lane.before"
+
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/done-one-lane.before" "$dir/progress.json" || return 1
+  assert_jq "$dir/progress.json" '.steps["step-1"].status != "done"'
+}
+
+test_done_accepted_with_degraded_and_deviation() {
+  local dir="$SANDBOX/done-degraded"
+  create_plan_dir "$dir" claude-impl claude-impl claude-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex only" '[]' '[]' codex
+
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done --degraded "grok lane unavailable"
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "done"
+    and (.steps["step-1"].completedAt | test("Z$"))
+    and (.deviations | length) >= 1
+    and (.deviations[-1].note | test("grok lane unavailable"))
+    and (.deviations[-1].at | test("Z$"))'
+}
+
+test_done_degraded_refused_without_lane_pass() {
+  local dir="$SANDBOX/done-degraded-no-lane"
+  create_plan_dir "$dir" claude-impl claude-impl claude-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  # Legacy top-level PASS only (no lane argument): --degraded must refuse.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy top-level only" '[]' '[]'
+
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done --degraded "grok lane unavailable" >/dev/null 2>&1; then
+    return 1
+  fi
+  assert_jq "$dir/progress.json" '.steps["step-1"].status != "done"'
+}
+
+test_done_codex_impl_with_grok_lane_pass() {
+  local dir="$SANDBOX/done-codex-impl-grok"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok sole" '[]' '["x.txt"]' grok
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "done"
+    and .steps["step-1"].verdicts.grok.verdict == "PASS"
+    and .steps["step-1"].verdict == "PASS"'
+}
+
+test_done_dual_lanes_both_pass() {
+  local dir="$SANDBOX/done-dual-both"
+  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex" '[]' '[]' codex
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok" '[]' '[]' grok
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.codex.verdict == "PASS"
+    and .steps["step-1"].verdicts.grok.verdict == "PASS"' || return 1
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done
+  assert_jq "$dir/progress.json" '.steps["step-1"].status == "done"'
+}
+
+test_legacy_no_lane_record_and_done() {
+  local dir="$SANDBOX/legacy-no-lane"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy" '[]' '["a.txt"]'
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "legacy"
+    and (.steps["step-1"] | has("verdicts") | not)' || return 1
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done
+  assert_jq "$dir/progress.json" '.steps["step-1"].status == "done"'
+}
+
+test_done_refused_without_pass_no_partial_write() {
+  local dir="$SANDBOX/done-no-pass"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/done-no-pass.before"
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/done-no-pass.before" "$dir/progress.json"
 }
 
 test_set_frontier_override() {
@@ -274,6 +437,16 @@ run_test "record-verdict writes PASS FINDINGS and FAIL shapes" test_record_verdi
 run_test "compute-frontier emits dependent step after dependencies done" test_compute_frontier
 run_test "set-frontier explicit override round trip" test_set_frontier_override
 run_test "init-progress refuses existing progress unless forced" test_init_progress_force
+run_test "record-verdict lane mirrors authoritative for codex-impl" test_record_verdict_lane_mirrors_authoritative_for_codex_impl
+run_test "record-verdict lane mirrors authoritative for claude-impl" test_record_verdict_lane_mirrors_authoritative_for_claude_impl
+run_test "record-verdict lane mirrors authoritative for grok-impl" test_record_verdict_lane_mirrors_authoritative_for_grok_impl
+run_test "done refused when only one of two dual lanes has PASS" test_done_refused_when_only_one_dual_lane_pass
+run_test "done accepted with --degraded and deviation recorded" test_done_accepted_with_degraded_and_deviation
+run_test "done refused with --degraded when no lane has PASS" test_done_degraded_refused_without_lane_pass
+run_test "done for codex-impl with grok-lane PASS" test_done_codex_impl_with_grok_lane_pass
+run_test "done for dual-mandate when both lanes PASS" test_done_dual_lanes_both_pass
+run_test "legacy no-lane record-verdict and done still green" test_legacy_no_lane_record_and_done
+run_test "done refused without PASS and no partial write" test_done_refused_without_pass_no_partial_write
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
