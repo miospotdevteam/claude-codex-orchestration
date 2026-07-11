@@ -109,9 +109,10 @@ for cross-family verification policy.
 - Conductor → Codex/Grok: when a step is well-defined enough to implement
   or verify against acceptance criteria.
 - Conductor → `remote-agent-host`: when natural language explicitly asks to
-  start, inspect, steer, stop, or reclaim one of the supported Mini sessions.
-  This Claude-only route uses the guarded helper, inspects before every input,
-  and is not dispatched as a Codex/Grok plan step.
+  start, continue, wait for, inspect, reveal, steer, interrupt, kill, or reclaim
+  one of the supported Mini sessions. This Claude-only route uses the guarded
+  helper, inspects before every input and after every lifecycle wake, and is
+  not dispatched as a Codex/Grok plan step.
 - Sub-agent → Conductor: every sub-agent terminates with one summary
   message. No multi-turn dialogue.
 - Codex/Grok → Conductor: one bounded Summary/Verdict/Findings block per
@@ -158,32 +159,43 @@ below are relative to `orchestration/` unless noted):
   natural-language route; `scripts/remote-agent.sh` is its only transport and
   session-control entry point. It supports only `miospot` / `orchestration`
   and `claude` / `codex` / `grok`, with `status`, `start`, `inspect`,
-  `continue`, `send`, `interrupt`, `kill`, and `reclaim`. `start` transfers
+  `continue`, `send`, `interrupt`, `kill`, `wait`, `reveal`, and `reclaim`.
+  Its options are `--host`, `--prompt-file`, `--active-plan`,
+  `--include-ignored`, `--approve-ignored`, `--cursor`, and `--timeout`.
+  `start` transfers
   ownership to one exact Mini writer; session controls do not synchronize or
-  release that ownership; verified remote-only `reclaim` releases it last.
-  The only options are `--host`, `--prompt-file`, `--active-plan`,
-  `--include-ignored`, and `--approve-ignored`; prompt text is file-backed and
-  never placed in argv.
+  release that ownership. Remote-only `reclaim` transfers verified content and
+  releases last; equal+quiescent `reclaim` is release-only.
+  Prompt text is file-backed and never placed in argv. `wait` is one blocking
+  event call with a restart-aware cursor retained from successful `start`, a
+  running `status`, or the prior wait; `reveal` opens Terminal on the exact
+  existing session. Neither event, tmux exit, nor timeout proves lease
+  quiescence.
   Transfers cover tracked and ordinary untracked regular files, plus at most
   one identically included-and-approved ignored path and the three explicitly
   selected active-plan files. The Mini protocol state and restore journal are
-  authoritative; the local state file is diagnostic only. No role may bypass
-  a live/stale writer, divergence, CAS, changed-snapshot, restore, or
+  authoritative; the local state file is diagnostic only. Every writer record
+  remains active until an explicit safe protocol transition clears it; no role
+  may bypass an active writer, divergence, CAS, changed-snapshot, restore, or
   recovery-required refusal with raw SSH, rsync, or tmux commands.
-- **Hooks** — `hooks/session-start.sh` (active-plan notice on session
-  open) and `hooks/post-compact.sh` (resumption notice after
-  compaction). Both read-only, always exit 0. Event mapping lives in
-  `hooks/hooks.json`: `SessionStart` (matcher `startup|resume|clear`)
-  fires `session-start.sh`; `PostCompact` fires `post-compact.sh`.
+- **Hooks** — six event registrations explicitly supersede the prior
+  exactly-two-read-only-hooks design. `SessionStart` and `PostCompact` run the
+  bounded context handlers `session-start.sh` and `post-compact.sh`. `Stop`,
+  `SubagentStop`, `StopFailure`, and `Notification` share `agent-event.sh`, a
+  narrowly scoped synchronous, fail-open, non-decision observer that writes
+  only closed labels to a private supervisor queue. The Notification allowlist
+  is exactly `permission_prompt`, `idle_prompt`, and `elicitation_dialog`; no
+  handler edits user Claude settings or stores prompt/transcript/terminal text.
 - **Schemas** — `schemas/plan.schema.json` and
   `schemas/progress.schema.json` describe the plan files the conductor
   reads.
 - **Templates** — `templates/masterPlan.template.md` is the starter
   for `writing-plans`.
 - **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
-  There are 12 plugin suites: 10 script suites (including
-  `remote-agent.test.sh`) and 2 hook suites. The repo-root routing eval adds 5
-  suites under `eval/tests/` but is not shipped with the plugin.
+  There are 15 plugin suites: 12 script suites (including `agent-supervisor`,
+  `remote-agent-protocol`, and `remote-agent`) and 3 hook suites (including
+  `agent-event`). The repo-root routing eval adds 5 suites under `eval/tests/`
+  but is not shipped with the plugin.
 
 The full design spec sits under `docs/01-philosophy.md` …
 `docs/11-routing-eval.md`. Read `docs/02-conductor.md` for the

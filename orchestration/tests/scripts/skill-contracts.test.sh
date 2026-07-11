@@ -116,6 +116,8 @@ test_skill_routes_resolve() {
   local name="skill routes resolve to shipped skills"
   local viol="" tok base tokens nstokens deny
 
+  # Markdown backticks are intentional literal regex characters.
+  # shellcheck disable=SC2016
   tokens="$(grep -rhoE '`[A-Za-z][A-Za-z0-9-]*` (skill|sub-agent)' "${SKILL_FILES[@]}" 2>/dev/null \
     | grep -oE '`[A-Za-z][A-Za-z0-9-]*`' | tr -d '`' | sort -u || true)"
   while IFS= read -r tok; do
@@ -123,6 +125,7 @@ test_skill_routes_resolve() {
     is_valid_skill "$tok" || viol+="unknown skill route: \`$tok\` (\`$tok\` skill/sub-agent)"$'\n'
   done <<< "$tokens"
 
+  # shellcheck disable=SC2016
   nstokens="$(grep -rhoE '`[a-z][a-z0-9-]*:[a-z0-9-]+`' "${SKILL_FILES[@]}" 2>/dev/null \
     | tr -d '`' | sort -u || true)"
   while IFS= read -r tok; do
@@ -181,6 +184,21 @@ test_remote_agent_host_contract() {
     'no sync under an active writer|(do not|never|must not).*(sync|synchroniz).*(active writer|writer.*active)|(active writer|writer.*active).*(do not|never|must not).*(sync|synchroniz)'
     'approval for ignored paths|(ignored (path|file)|gitignored).*(approval|approve|consent)|(approval|approve|consent).*(ignored (path|file)|gitignored)'
     'safe reclaim protocol|(reclaim|take over).*(stop|terminate|writer|ownership|safe)|(stop|terminate|writer|ownership|safe).*(reclaim|take over)'
+    'blocking lifecycle wait|(blocking|block).*(wait|event)|(wait|event).*(blocking|block)'
+    'monotonic wait cursor|(monotonic|increasing).*(cursor)|(cursor).*(monotonic|increasing)'
+    'bootstrap cursor for first wait|bootstrapCursor|bootstrap cursor'
+    'one nested status envelope|one status JSON object.*authority.*supervisor|status.*one JSON object.*authority.*supervisor'
+    'status cursor is nested under supervisor|supervisor\.bootstrapCursor|supervisor.*bootstrapCursor'
+    'start has a distinct bootstrap envelope|distinct start.*bootstrap|start.*distinct.*bootstrap'
+    'writer records remain active until protocol transition|writer record.*(live|active).*(explicit|safe).*(transition|clears)|explicit.*(transition|clears).*writer record'
+    'no PID or heartbeat stale inference|heartbeat signals to infer a stale writer|(do not|never).*(PID|heartbeat).*(stale|infer)'
+    'main and subagent completion are distinct|(main|main-turn).*(subagent).*(distinct|separate|different)|(subagent).*(main|main-turn).*(distinct|separate|different)'
+    'input-needed allowlist|permission_prompt.*idle_prompt.*elicitation_dialog'
+    'bounded capture after event wake|(wake|event).*(bounded).*(capture|inspect)|(capture|inspect).*(after|following).*(wake|event)'
+    'visible Terminal reveal|(reveal|show|open).*(Mini )?Terminal|(Mini )?Terminal.*(reveal|show|open)'
+    'exact reveal session|remote-agent--PROJECT--HARNESS'
+    'reveal keeps prompt out of argv|(reveal|Terminal).*(prompt).*(not|never|without).*(argv)|(prompt).*(not|never|without).*(argv).*(reveal|Terminal)'
+    'reveal does not replace the pane|(reveal|Terminal).*(not|never|without).*(replace|replacing).*(pane)|(not|never|without).*(replace|replacing).*(pane).*(reveal|Terminal)'
   )
 
   if [[ ! -f "$REMOTE_AGENT_HOST_SKILL" ]]; then
@@ -197,6 +215,11 @@ test_remote_agent_host_contract() {
 
   grep -Fq "\${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh" "$REMOTE_AGENT_HOST_SKILL" \
     || viol+="missing contract: helper invocation through CLAUDE_PLUGIN_ROOT"$'\n'
+
+  # shellcheck disable=SC2016
+  if grep -qiE 'first JSON line|second and final line|appended by a running `status`|stale-writer|stale ownership|break a stale writer' "$REMOTE_AGENT_HOST_SKILL"; then
+    viol+="obsolete remote status or stale-writer doctrine remains"$'\n'
+  fi
 
   if [[ -n "$viol" ]]; then
     fail "$name" "$viol"
@@ -219,6 +242,8 @@ test_conductor_routes_remote_agent_host() {
     'inspect-for-input Mini intent|(inspect|check).*(input|waiting|needs)|((input|waiting|needs).*(inspect|check))'
     'control Mini intent|(control|steer|send|tell).*Mini|Mini.*(control|steer|send|tell)'
     'reclaim Mini intent|(reclaim|take over).*Mini|Mini.*(reclaim|take over)'
+    'wait Mini lifecycle intent|(wait|watch|monitor).*(Mini|agent)|(Mini|agent).*(wait|watch|monitor)'
+    'reveal Mini Terminal intent|(reveal|show|open).*(Mini )?Terminal|(Mini )?Terminal.*(reveal|show|open)'
   )
 
   if [[ ! -f "$CONDUCTOR_SKILL" ]]; then

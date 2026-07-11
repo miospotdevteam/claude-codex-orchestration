@@ -18,6 +18,24 @@ clones this repo into Claude Code's marketplace cache;
 `claude plugin install orchestration@claude-codex-orchestration`
 then installs the plugin from the `orchestration/` subdir.
 
+`install.sh` resolves exactly one absolute `installPath` from `claude plugin
+list --json`, validates that cached artifact, and uses it as the canonical
+source. Claude loads its skills from the plugin cache; same-named plugin-owned
+directories are removed from `~/.claude/skills` rather than copied there. The
+seven injectable external-lane skills are copied from the installed artifact
+to `~/.codex/skills` and `~/.grok/skills`, while unowned skills remain intact.
+After install, restart Claude Code or run `/reload-plugins`. Never patch the
+cache or user Claude settings directly.
+
+Clean rollback removes `orchestration` and its marketplace with the Claude
+plugin CLI. `install.sh` always reinstalls the marketplace's current artifact,
+not the invoking checkout, so a historical rollback must be exposed as a
+marketplace version. The Mini-side `agent-supervisor` and `remote-agent-v1`
+have no fixed destination but must be installed together on the Mini's `PATH`;
+retain and restore them as a matched pair. Transfer rollback itself is owned by
+the private restore journal: verified restore leaves ownership unchanged, and
+failed restore preserves recovery-required evidence and the mutex.
+
 ## Directory tree
 
 ```
@@ -62,8 +80,9 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │
     ├── hooks/                           ← event handlers + manifest
     │   ├── hooks.json                   ← maps event names → handler scripts
-    │   ├── session-start.sh             ← SessionStart handler (read-only)
-    │   └── post-compact.sh              ← PostCompact handler (read-only)
+    │   ├── session-start.sh             ← read-only SessionStart notice handler
+    │   ├── post-compact.sh              ← read-only PostCompact notice handler
+    │   └── agent-event.sh               ← fail-open private-queue lifecycle observer
     │
     ├── scripts/                         ← codex wrappers + utilities
     │   ├── run-codex-impl.sh
@@ -72,7 +91,9 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   ├── run-grok-verify.sh
     │   ├── plan-utils.sh                ← read/write helpers for plan files
     │   ├── parse-contract.sh            ← extract the contract block
-    │   └── remote-agent.sh              ← guarded Mini lifecycle boundary
+    │   ├── remote-agent.sh              ← guarded host-side Mini boundary
+    │   ├── agent-supervisor             ← Mini session/event adapter
+    │   └── remote-agent-v1              ← Mini synchronization authority
     │
     ├── schemas/                         ← JSON schemas for plan files
     │   ├── plan.schema.json
@@ -83,12 +104,15 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │
     └── tests/                           ← hook + script tests
         ├── hooks/
+        │   ├── agent-event.test.sh
         │   ├── session-start.test.sh
         │   └── post-compact.test.sh
         └── scripts/
+            ├── agent-supervisor.test.sh
             ├── install.test.sh
             ├── parse-contract.test.sh
             ├── plan-utils.test.sh
+            ├── remote-agent-protocol.test.sh
             ├── remote-agent.test.sh
             ├── run-codex-impl.test.sh
             ├── run-codex-verify.test.sh
@@ -101,10 +125,11 @@ claude-codex-orchestration/              ← repo root = marketplace root
 Notes on shape:
 
 The shipped plugin subtree contains 18 Claude-side skills (9 core and 9
-auxiliary), 1 Codex-side skill body, 2 read-only hook handlers plus their
-manifest, 7 scripts (4 model wrappers and 3 helpers), 2 schemas, 1 template,
-and 12 test suites (10 script suites and 2 hook suites). The non-shipped
-routing eval adds 7 scripts and 5 test suites at the repo root.
+auxiliary), 1 Codex-side skill body, 2 read-only notice handlers and 1 fail-open
+private-queue observer with a six-event manifest, 9 scripts (4 model wrappers
+and 5 helpers), 2 schemas, 1 template, and 15 test suites (12 script suites and
+3 hook suites). The non-shipped routing eval adds 7 scripts and 5 test suites
+at the repo root.
 
 - **`.claude-plugin/` holds each manifest.** Claude Code's plugin
   schema places metadata under `.claude-plugin/` rather than at the
@@ -125,9 +150,13 @@ routing eval adds 7 scripts and 5 test suites at the repo root.
   encouraged skills to import each other's logic and tangled them.
   v2 skills only reference each other by name in prose, not by
   shared code.
-- **Hooks declared in `hooks/hooks.json`.** The two `.sh` files are
-  the actual handlers; the JSON file is how Claude Code learns which
-  events to fire them on. See `07-hooks.md` for the full event-mapping
+- **Hooks declared in `hooks/hooks.json`.** Three `.sh` files implement six
+  event registrations. `SessionStart` and `PostCompact` provide bounded
+  read-only plan notices. `Stop`, `SubagentStop`, `StopFailure`, and
+  `Notification` share one synchronous, fail-open, non-decision bridge into a
+  private labels-only queue. This explicitly supersedes the former
+  exactly-two-read-only-hooks design; it does not restore tool gates or permit
+  user-settings edits. See `07-hooks.md` for the event semantics and privacy
   contract.
 - **`scripts/` holds the wrappers and a small set of helpers.**
   `plan-utils.sh` provides idempotent read/write of `plan.json` and
@@ -136,17 +165,28 @@ routing eval adds 7 scripts and 5 test suites at the repo root.
   output and is used by both Codex wrappers. The four direction-locked
   wrappers remain `run-{codex,grok}-{impl,verify}.sh`; `remote-agent.sh` is a
   separate guarded transport/session helper, not a fifth model wrapper.
-- **Mini handoff has two artifacts.** `skills/remote-agent-host/SKILL.md`
+- **Mini handoff has four artifacts.** `skills/remote-agent-host/SKILL.md`
   translates natural language and enforces capture-before-input;
   `scripts/remote-agent.sh` exposes the closed help surface (`status`, `start`,
-  `inspect`, `continue`, `send`, `interrupt`, `kill`, `reclaim`; projects
+  `inspect`, `continue`, `send`, `interrupt`, `kill`, `wait`, `reveal`,
+  `reclaim`; projects
   `miospot` / `orchestration`; harnesses `claude` / `codex` / `grok`). The
   only options are `--host`, `--prompt-file`, `--active-plan`,
-  `--include-ignored`, and `--approve-ignored`; prompt content is read from the
+  `--include-ignored`, `--approve-ignored`, `--cursor`, and `--timeout`;
+  `PROJECT` selects the canonical local Git toplevel through the independent
+  `LOCAL_MIOSPOT_ROOT` / `LOCAL_ORCHESTRATION_ROOT` mappings (defaulting under
+  `$HOME/Projects`) rather than caller cwd;
+  prompt content is read from the
   named file and never placed in argv, and ignored paths require identical
-  literal include/approval values. The
-  helper assumes the remote protocol and harness launchers are already
-  provisioned. Its local state is diagnostic, while the Mini lease,
+  literal include/approval values. Successful `start` and running `status`
+  expose a bounded labels-only `bootstrapCursor` for the first direct `wait`.
+  `scripts/agent-supervisor` owns tmux,
+  bounded capture, private event queues, blocking wait, and Terminal reveal;
+  `scripts/remote-agent-v1` owns synchronization and lease proofs. Both
+  Mini-side executables must be installed together on the Mini's `PATH`; no
+  fixed destination directory is defined. The installed Claude/Codex/Grok
+  subscription TUIs must already be interactively authenticated. Local state
+  is diagnostic, while the Mini lease,
   generation, restore journal, and recovery evidence are authoritative. It
   provides one start/reclaim ownership handoff, not continuous sync, secret
   copying, chat persistence, backend bootstrap, or reboot survival.
@@ -168,7 +208,7 @@ The minimum the harness needs:
 ```json
 {
   "name": "orchestration",
-  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates."
+  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only plan notices, fail-open private-queue lifecycle observers, no gates."
 }
 ```
 
@@ -206,14 +246,14 @@ The marketplace metadata. For this repo (a one-plugin marketplace):
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-codex-orchestration",
-  "description": "Conductor-mode orchestrator for Claude Code: persistent plans, direction-locked Codex impl/verify, bounded prompt-contract I/O, read-only hooks.",
+  "description": "Conductor-mode orchestrator for Claude Code: persistent plans, direction-locked Codex impl/verify, bounded prompt-contract I/O, read-only plan notices and fail-open lifecycle observers.",
   "owner": {
     "name": "Miospot Dev Team"
   },
   "plugins": [
     {
       "name": "orchestration",
-      "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
+      "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only plan notices, fail-open private-queue lifecycle observers, no gates.",
       "source": "./orchestration",
       "category": "development"
     }
@@ -234,46 +274,26 @@ the repo, that's why this layout has both a repo-root
 Maps Claude Code event names to handler scripts via the
 `${CLAUDE_PLUGIN_ROOT}` variable Claude Code resolves at runtime:
 
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
-            "async": false,
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PostCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post-compact.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+The manifest has exactly six keys:
 
-Two points of nuance:
+| Event | Matcher | Handler | Timeout |
+|---|---|---|---|
+| `SessionStart` | `startup|resume|clear` | `session-start.sh` | 10 s, synchronous |
+| `PostCompact` | none | `post-compact.sh` | 10 s |
+| `Stop` | none | `agent-event.sh` | 2 s, synchronous |
+| `SubagentStop` | none | `agent-event.sh` | 2 s, synchronous |
+| `StopFailure` | none | `agent-event.sh` | 2 s, synchronous |
+| `Notification` | none | `agent-event.sh` | 2 s, synchronous |
 
-1. **The `SessionStart` matcher excludes `compact`** — `PostCompact`
-   handles that case. (v1 used a single `SessionStart` handler with
-   `compact` in its matcher; v2 splits them so each script has a
-   single clear responsibility.)
-2. **No `pre-*` hooks.** v2 ships exactly two events. Anyone proposing
-   a third hook (especially `PreToolUse`, `PostToolUse`, `Stop`)
-   must justify against `01-philosophy.md` first.
+`SessionStart` excludes `compact` because `PostCompact` owns that lifecycle.
+The four lifecycle observers perform their exact allowlisting inside the
+shared handler, emit no decision, and fail open. Their only mutation is an
+atomic append of closed scope/kind labels to private mode-`0700`/`0600`
+supervisor state; they do not retain hook payload text or edit user Claude
+settings. Full executable JSON lives in `orchestration/hooks/hooks.json`, and
+`docs/07-hooks.md` defines the semantic limits: main stop, subagent stop,
+failure, input-needed, tmux exit, and timeout are distinct wakes and none
+proves lease quiescence.
 
 ## Per-artifact source docs
 
@@ -289,6 +309,7 @@ Cross-reference: which doc(s) inform which file.
 | `hooks/hooks.json`                             | `07-hooks.md`, `08-plugin-layout.md`                      |
 | `hooks/session-start.sh`                       | `07-hooks.md`, `03-plan-format.md`                        |
 | `hooks/post-compact.sh`                        | `07-hooks.md`, `04-execution-loop.md`                     |
+| `hooks/agent-event.sh`                         | `07-hooks.md`, `05-skills-catalog.md`                     |
 | `skills/conductor/SKILL.md`                    | `02-conductor.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
 | `skills/engineering-discipline/SKILL.md`       | `01-philosophy.md`, `05-skills-catalog.md`                |
 | `skills/persistent-plans/SKILL.md`             | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
@@ -303,12 +324,17 @@ Cross-reference: which doc(s) inform which file.
 | `scripts/plan-utils.sh`                        | `03-plan-format.md`                                       |
 | `scripts/parse-contract.sh`                    | `06-codex-integration.md`                                 |
 | `scripts/remote-agent.sh`                      | `05-skills-catalog.md`, `08-plugin-layout.md`             |
+| `scripts/agent-supervisor`                     | `05-skills-catalog.md`, `07-hooks.md`, `08-plugin-layout.md` |
+| `scripts/remote-agent-v1`                      | `05-skills-catalog.md`, `08-plugin-layout.md`             |
 | `schemas/plan.schema.json`                     | `03-plan-format.md`                                       |
 | `schemas/progress.schema.json`                 | `03-plan-format.md`                                       |
 | `templates/masterPlan.template.md`             | `03-plan-format.md`                                       |
 | `tests/hooks/*.test.sh`                        | `07-hooks.md`                                             |
+| `tests/hooks/agent-event.test.sh`              | `07-hooks.md`, `05-skills-catalog.md`                     |
 | `tests/scripts/parse-contract.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
+| `tests/scripts/agent-supervisor.test.sh`       | `05-skills-catalog.md`, `07-hooks.md`                     |
+| `tests/scripts/remote-agent-protocol.test.sh`  | `05-skills-catalog.md`, `08-plugin-layout.md`             |
 | `tests/scripts/remote-agent.test.sh`           | `05-skills-catalog.md`, `08-plugin-layout.md`             |
 | `tests/scripts/run-codex-impl.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/run-codex-verify.test.sh`       | `06-codex-integration.md`                                 |
@@ -342,11 +368,12 @@ A sensible build sequence:
 5. **`scripts/run-grok-impl.sh` and `run-grok-verify.sh`** — the
    Grok wrappers, mirroring the Codex wrapper shape once the parser
    is solid.
-6. **`scripts/remote-agent.sh` + `skills/remote-agent-host/SKILL.md` +
-   tests** — keep the guarded helper's executable help and the
-   natural-language lifecycle contract aligned.
-7. **`hooks/session-start.sh` + `post-compact.sh` + tests** — both
-   thin and similar. Reuse `plan-utils.sh`.
+6. **`scripts/remote-agent-v1` + `agent-supervisor` + `remote-agent.sh` +
+   `skills/remote-agent-host/SKILL.md` + tests** — keep synchronization,
+   lifecycle events, executable help, and natural intent aligned.
+7. **`hooks/session-start.sh` + `post-compact.sh` + `agent-event.sh` + tests**
+   — keep context injection separate from the private labels-only lifecycle
+   bridge.
 8. **`skills/`** — write `conductor`, `persistent-plans`, and
    `codex-dispatch` first (they wire everything together), then the
    discipline skills.
@@ -367,8 +394,10 @@ To keep v2 from regressing into v1:
   `claude-review-*.md` siblings.
 - **No `digester/` skill.** Codex output is parsed directly; no
   middle layer.
-- **No `pre-*` hooks.** The two hooks listed are the entirety of the
-  hook surface.
+- **No `pre-*` hooks or extra lifecycle events.** The six manifest entries are
+  the entirety of the hook surface. The four Mini observers must remain
+  fail-open, non-decision, private-queue bridges and must never edit user
+  Claude settings.
 - **No `lib/` shared between skills.** Skills compose via prose
   references, not shared imports.
 - **No `enforcement/` mode flag.** v2 is gentle reminders only.
