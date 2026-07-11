@@ -90,6 +90,20 @@ private_state_fingerprint() {
   done < <(find "$STATE_ROOT" "$TRACE_ROOT" -mindepth 1 -print | LC_ALL=C sort)
 }
 
+protocol_stage_path() {
+  local candidate project=${1:-miospot}
+  for candidate in \
+    "$AUTHORITY_PATH/projects/$project/stage" \
+    "$AUTHORITY_PATH/projects/$project/.remote-agent-stage" \
+    "$REMOTE_ROOT/.remote-agent-stage"; do
+    if [[ -d $candidate ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 test_closed_vocabulary_and_private_authority() {
   expect_failure unknown-operation || return 1
   assert_contains "$STDERR" 'usage' || return 1
@@ -104,13 +118,15 @@ test_closed_vocabulary_and_private_authority() {
 }
 
 test_probe_classifies_all_relations() {
+  local stage
   expect_success adopt miospot common || return 1
   expect_success probe manifest-nul miospot remote-agent--miospot--claude main head common "$AUTHORITY_TOKEN" || return 1
   assert_contains "$STDOUT" '"relation":"equal"' || return 1
   expect_success probe manifest-nul miospot remote-agent--miospot--claude main head local-change "$AUTHORITY_TOKEN" || return 1
   assert_contains "$STDOUT" '"relation":"local-only"' || return 1
   expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
-  printf 'remote-change\n' >"$REMOTE_ROOT/.remote-agent-stage/tracked.txt"
+  stage=$(protocol_stage_path) || return 1
+  printf 'remote-change\n' >"$stage/tracked.txt"
   expect_success restore-journal mode=0600 miospot || return 1
   expect_success stage-verify miospot remote-change || return 1
   expect_success apply-exact miospot remote-change || return 1
@@ -148,15 +164,63 @@ test_generation_cas_never_clobbers() {
 }
 
 test_staging_apply_and_verified_restore() {
+  local stage
   expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
-  [[ -d $REMOTE_ROOT/.remote-agent-stage ]] || return 1
-  printf 'replacement\n' >"$REMOTE_ROOT/.remote-agent-stage/tracked.txt"
+  stage=$(protocol_stage_path) || return 1
+  printf 'replacement\n' >"$stage/tracked.txt"
   expect_success restore-journal mode=0600 miospot || return 1
   expect_success stage-verify miospot staged-digest || return 1
   REMOTE_AGENT_TEST_FAULT=apply-after-first-file run_protocol apply-exact miospot staged-digest
   [[ $STATUS -ne 0 ]] || return 1
   assert_contains "$STDOUT" '"restore":"verified"' || return 1
   [[ $(<"$REMOTE_ROOT/tracked.txt") == base ]]
+}
+
+test_stage_is_outside_worktree_and_removes_legacy_stage() {
+  local stage
+  mkdir -p "$REMOTE_ROOT/.remote-agent-stage"
+  printf 'legacy\n' >"$REMOTE_ROOT/.remote-agent-stage/legacy.txt"
+
+  expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+  [[ $stage != "$REMOTE_ROOT"/* ]] || return 1
+  [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]]
+}
+
+test_successful_apply_removes_stage() {
+  local stage
+  expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+  printf 'replacement\n' >"$stage/tracked.txt"
+  expect_success restore-journal mode=0600 miospot || return 1
+  expect_success stage-verify miospot staged-digest || return 1
+  expect_success apply-exact miospot staged-digest || return 1
+  [[ $(<"$REMOTE_ROOT/tracked.txt") == replacement ]] || return 1
+  [[ ! -e $stage && ! -e $REMOTE_ROOT/.remote-agent-stage ]]
+}
+
+test_failed_apply_restore_removes_stage() {
+  local stage
+  expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+  printf 'replacement\n' >"$stage/tracked.txt"
+  expect_success restore-journal mode=0600 miospot || return 1
+  expect_success stage-verify miospot staged-digest || return 1
+  REMOTE_AGENT_TEST_FAULT=apply-after-first-file run_protocol apply-exact miospot staged-digest
+  [[ $STATUS -ne 0 ]] || return 1
+  assert_contains "$STDOUT" '"restore":"verified"' || return 1
+  [[ $(<"$REMOTE_ROOT/tracked.txt") == base ]] || return 1
+  [[ ! -e $stage && ! -e $REMOTE_ROOT/.remote-agent-stage ]]
+}
+
+test_lease_abort_removes_stage() {
+  local session=remote-agent--miospot--claude stage
+  expect_success adopt miospot common || return 1
+  expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+  expect_success lease-provisional temp-rename miospot "$session" 0 owner "$AUTHORITY_TOKEN" || return 1
+  expect_success lease-abort temp-rename miospot "$session" 0 "$AUTHORITY_TOKEN" || return 1
+  [[ ! -e $stage && ! -e $REMOTE_ROOT/.remote-agent-stage ]]
 }
 
 test_operation_trace_is_private_and_ordered() {
@@ -322,6 +386,10 @@ run_test 'probe classifies equal, local-only, remote-only, and diverged' test_pr
 run_test 'the project mutex has exactly one concurrent winner' test_mutex_is_atomic_under_concurrency
 run_test 'generation CAS fails closed without clobbering state' test_generation_cas_never_clobbers
 run_test 'private staging applies exactly and restores on failure' test_staging_apply_and_verified_restore
+run_test 'stage is outside the worktree and replaces a legacy in-root stage' test_stage_is_outside_worktree_and_removes_legacy_stage
+run_test 'successful exact apply removes its private stage' test_successful_apply_removes_stage
+run_test 'failed exact apply removes its private stage after verified restore' test_failed_apply_restore_removes_stage
+run_test 'lease abort removes its private stage' test_lease_abort_removes_stage
 run_test 'the private operation trace records ordered mutations' test_operation_trace_is_private_and_ordered
 run_test 'a lease advances from provisional to active/live' test_lease_lifecycle_is_provisional_then_active
 run_test 'lease abort is exact, value-free, and provisional-only' test_lease_abort_clears_only_matching_provisional_state

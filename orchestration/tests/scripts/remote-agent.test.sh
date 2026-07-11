@@ -132,6 +132,11 @@ if [[ " $* " == *' agent-supervisor status '* ]]; then
   exit 0
 fi
 
+if [[ ${2:-} == remote-agent-v1 && ${3:-} == stage ]]; then
+  printf '{"stagePath":"%s/orchestration/remote-agent/projects/%s/stage"}\n' "$REMOTE_STATE" "$5"
+  exit 0
+fi
+
 case "${REMOTE_SCENARIO:-equal}" in
   fixture-self-test) printf 'fixture-ok\n' ;;
   no-session) printf '{"relation":"equal","writer":"none","generation":7}\n' ;;
@@ -628,6 +633,8 @@ test_start_local_only_transfer() {
   assert_contains "$COMMAND_LOG" 'stage' || return 1
   assert_contains "$COMMAND_LOG" 'restore-journal' || return 1
   assert_contains "$COMMAND_LOG" 'lease-commit' || return 1
+  [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]] || return 1
+  assert_lacks "$COMMAND_LOG" "$REMOTE_ROOT/.remote-agent-stage/" || return 1
   assert_contains "$COMMAND_LOG" 'remote-agent--miospot--codex'
   local apply_line baseline_line provisional_line
   apply_line=$(grep -n 'apply-exact' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
@@ -967,6 +974,8 @@ MOCK
   local safe_path="safe dir/O'Brien \$(touch PWNED).txt"
   REMOTE_ROOT="$REMOTE_HOME/Projects/miospot"
   mkdir -p "$REMOTE_ROOT" "$LOCAL_ROOT/${safe_path%/*}"
+  mkdir -p "$REMOTE_ROOT/.remote-agent-stage"
+  printf 'legacy\n' >"$REMOTE_ROOT/.remote-agent-stage/legacy.txt"
   printf 'quoted path\n' >"$LOCAL_ROOT/$safe_path"
   local authority_project="$REMOTE_STATE/orchestration/remote-agent/projects/miospot"
   mkdir -p "$authority_project"
@@ -975,6 +984,8 @@ MOCK
   printf '0\n' >"$authority_project/generation"
   printf '%s\n' "$secret" >"$CASE/prompt"
   MOCK_SAFE_PATH="$safe_path" expect_success equal start miospot claude --prompt-file "$CASE/prompt" || return 1
+  [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]] || return 1
+  assert_lacks "$COMMAND_LOG" "$REMOTE_ROOT/.remote-agent-stage/" || return 1
   [[ ! -e $LOCAL_ROOT/PWNED ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter.session") == "$session" ]] || return 1
   [[ $(<"$authority_project/lease-session") == "$session" ]] || return 1

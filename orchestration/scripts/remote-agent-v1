@@ -38,6 +38,15 @@ project_root() {
 
 project_dir() { printf '%s/projects/%s\n' "$authority" "$1"; }
 
+stage_dir() { printf '%s/stage\n' "$(project_dir "$1")"; }
+
+remove_stage() {
+  local project=$1 root directory
+  root=$(project_root "$project")
+  directory=$(project_dir "$project")
+  rm -rf "$directory/stage" "$root/.remote-agent-stage"
+}
+
 init_project() {
   valid_project "$1" || usage
   local directory
@@ -85,7 +94,6 @@ restore_snapshot() {
   [[ -d $journal ]] || return 1
   for entry in "$root/"* "$root/".[!.]* "$root/"..?*; do
     [[ -e $entry || -L $entry ]] || continue
-    [[ ${entry##*/} == .remote-agent-stage ]] && continue
     rm -rf "$entry"
   done
   copy_tree "$journal" "$root"
@@ -186,6 +194,7 @@ case $command in
     require_authority "$3"
     [[ -d $directory/mutex ]] || die 'mutex is not held'
     [[ $(read_value "$directory/mutex/owner" '') == "$2" ]] || die 'mutex owner mismatch'
+    remove_stage "$project"
     rm -rf "$directory/mutex"
     trace "$project" mutex-release
     ;;
@@ -218,11 +227,18 @@ case $command in
     [[ $1 == $'umask 077\nmode=0700' ]] || die 'invalid privacy directive'
     case $3 in outbound|inbound) ;; *) usage ;; esac
     require_authority "$4"
-    rm -rf "$root/.remote-agent-stage"
-    mkdir -p "$root/.remote-agent-stage"
-    chmod 700 "$root/.remote-agent-stage"
+    remove_stage "$project"
+    trap 'remove_stage "$project"' EXIT
+    stage=$(stage_dir "$project")
+    mkdir -p "$stage"
+    chmod 700 "$stage"
     atomic_write "$directory/stage-direction" "$3"
     trace "$project" stage
+    stage_response=$(printf '{"stagePath":"%s"}' "$stage")
+    stage_response_bytes=$(printf '%s\n' "$stage_response" | wc -c | tr -d ' ')
+    [[ $stage_response_bytes -le 4096 ]] || die 'stage response exceeds 4096-byte bound'
+    printf '%s\n' "$stage_response"
+    trap - EXIT
     ;;
 
   deletion-inventory)
@@ -243,47 +259,68 @@ case $command in
 
   restore-journal)
     [[ $# -eq 2 && $1 == mode=0600 ]] || usage
+    trap 'remove_stage "$project"' EXIT
     rm -rf "$directory/restore"
     mkdir -p "$directory/restore"
     chmod 700 "$directory/restore"
     copy_tree "$root" "$directory/restore"
-    rm -rf "$directory/restore/.remote-agent-stage"
     find "$directory/restore" -type d -exec chmod 700 {} +
     find "$directory/restore" -type f -exec chmod 600 {} +
     trace "$project" restore-journal
+    trap - EXIT
     ;;
 
   stage-verify)
-    [[ $# -eq 2 && -d $root/.remote-agent-stage ]] || die 'missing stage'
+    stage=$(stage_dir "$project")
+    if [[ $# -ne 2 || ! -d $stage ]]; then
+      remove_stage "$project"
+      die 'missing stage'
+    fi
+    trap 'remove_stage "$project"' EXIT
     atomic_write "$directory/stage-digest" "$2"
     trace "$project" stage-verify
+    trap - EXIT
     ;;
 
   apply-exact)
     [[ $# -eq 2 ]] || usage
-    [[ $(read_value "$directory/stage-digest" '') == "$2" ]] || die 'stage digest mismatch'
-    [[ -d $root/.remote-agent-stage && -d $directory/restore ]] || die 'stage or restore journal missing'
+    trap 'remove_stage "$project"' EXIT
+    stage=$(stage_dir "$project")
+    if [[ $(read_value "$directory/stage-digest" '') != "$2" ]]; then
+      remove_stage "$project"
+      die 'stage digest mismatch'
+    fi
+    if [[ ! -d $stage || ! -d $directory/restore ]]; then
+      remove_stage "$project"
+      die 'stage or restore journal missing'
+    fi
     if [[ -f $directory/inventory ]]; then
       while IFS= read -r path; do
-        valid_relative_path "$path" || die 'corrupt inventory path'
-        [[ -e $root/.remote-agent-stage/$path ]] || rm -rf "${root:?}/$path"
+        if ! valid_relative_path "$path"; then
+          remove_stage "$project"
+          die 'corrupt inventory path'
+        fi
+        [[ -e $stage/$path ]] || rm -rf "${root:?}/$path"
       done <"$directory/inventory"
     fi
     copied=0
-    for entry in "$root/.remote-agent-stage/"* "$root/.remote-agent-stage/".[!.]* "$root/.remote-agent-stage/"..?*; do
+    for entry in "$stage/"* "$stage/".[!.]* "$stage/"..?*; do
       [[ -e $entry || -L $entry ]] || continue
       cp -pR "$entry" "$root/"
       copied=$((copied + 1))
       if [[ ${REMOTE_AGENT_TEST_FAULT:-} == apply-after-first-file && $copied -eq 1 ]]; then
         if restore_snapshot "$project"; then
+          remove_stage "$project"
           printf '{"apply":"failed","restore":"verified"}\n'
         else
+          remove_stage "$project"
           printf '{"apply":"failed","restore":"failed"}\n'
         fi
         exit 1
       fi
     done
     atomic_write "$directory/remote" "$2"
+    remove_stage "$project"
     trace "$project" apply-exact
     printf '{"apply":"verified"}\n'
     ;;
@@ -295,6 +332,7 @@ case $command in
 
   recovery-required)
     [[ $# -eq 2 ]] || usage
+    remove_stage "$project"
     atomic_write "$directory/recovery-required" "$2"
     trace "$project" recovery-required
     ;;
@@ -328,6 +366,7 @@ case $command in
     [[ $lease_state == provisional ]] || die 'provisional lease required'
     [[ $(read_value "$directory/lease-session" '') == "$session" ]] || die 'lease session mismatch'
     [[ $(read_value "$directory/lease-generation" '') == "$expected" ]] || die 'lease generation mismatch'
+    remove_stage "$project"
     rm -f "$directory/lease-state" "$directory/lease-session" \
       "$directory/lease-owner" "$directory/lease-generation"
     trace "$project" lease-abort

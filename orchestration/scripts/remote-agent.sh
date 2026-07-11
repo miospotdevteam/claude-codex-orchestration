@@ -212,6 +212,22 @@ ssh_quiet() {
   ssh_call "$@" </dev/null >/dev/null
 }
 
+request_stage() {
+  local direction=$1 privacy_directive=$'umask 077\nmode=0700'
+  local response bytes
+  response=$(ssh_call "$PROTOCOL" stage "$privacy_directive" "$project" "$direction" "$authority_token" </dev/null) || die 'Mini stage creation failed'
+  bytes=$(printf '%s' "$response" | wc -c | tr -d ' ')
+  [[ $bytes -le 4096 ]] || die 'Mini stage response exceeds 4096-byte bound'
+  case $response in
+    *$'\n'*|*$'\r'*) die 'Mini stage response is not one bounded JSON line' ;;
+  esac
+  stage_path=$(printf '%s\n' "$response" | sed -n 's/^{"stagePath":"\([^"]*\)"}$/\1/p')
+  [[ -n $stage_path && $stage_path == /* ]] || die 'Mini returned an invalid stage path'
+  case $stage_path in
+    *..*|*[[:space:]]*) die 'Mini returned an unsafe stage path' ;;
+  esac
+}
+
 capture_session() {
   ssh_call agent-supervisor capture "$session" </dev/null
 }
@@ -540,14 +556,14 @@ run_guarded_apply() {
 
 transfer_outbound() {
   local post_snapshot=$work_dir/post-snapshot.nul path
-  local privacy_directive=$'umask 077\nmode=0700'
-  ssh_quiet "$PROTOCOL" stage "$privacy_directive" "$project" outbound "$authority_token"
+  local stage_path
+  request_stage outbound
   ssh_quiet "$PROTOCOL" deletion-inventory "$project" "$universe_digest"
   while IFS= read -r -d '' path; do
     ssh_quiet "$PROTOCOL" inventory-path "$project" "$path"
   done <"$manifest"
   ssh_quiet "$PROTOCOL" restore-journal mode=0600 "$project"
-  rsync -a --from0 --files-from="$manifest" -- "$local_root/" "$host:$remote_root/.remote-agent-stage/"
+  rsync -a --from0 --files-from="$manifest" -- "$local_root/" "$host:$stage_path/"
   ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
   snapshot_payload "$post_snapshot"
   cmp -s "$pre_snapshot" "$post_snapshot" || die 'source snapshot changed during outbound staging'
@@ -555,13 +571,13 @@ transfer_outbound() {
 }
 
 transfer_inbound() {
-  local privacy_directive=$'umask 077\nmode=0700' inbound_stage=$work_dir/inbound-stage
+  local inbound_stage=$work_dir/inbound-stage stage_path
   mkdir "$inbound_stage"
   chmod 700 "$inbound_stage"
-  ssh_quiet "$PROTOCOL" stage "$privacy_directive" "$project" inbound "$authority_token"
+  request_stage inbound
   ssh_quiet "$PROTOCOL" deletion-inventory "$project" "$universe_digest"
   ssh_quiet "$PROTOCOL" restore-journal mode=0600 "$project"
-  rsync -a -- "$host:$remote_root/.remote-agent-stage/" "$inbound_stage/"
+  rsync -a -- "$host:$stage_path/" "$inbound_stage/"
   ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
   run_guarded_apply
   rsync -a -- "$inbound_stage/" "$local_root/"
