@@ -33,7 +33,7 @@ Every plan lives in a single directory at:
 ├── plan.json         ← immutable definition (frozen: true after approval)
 ├── progress.json     ← mutable execution state
 ├── masterPlan.md     ← human-facing proposal (the doc the user reviews)
-└── logs/             ← Codex impl/verify logs (debugging only; conductor never reads)
+└── logs/             ← wrapper impl/verify logs (debugging only; conductor never reads)
 ```
 
 Boundaries:
@@ -44,7 +44,7 @@ Boundaries:
   execution.** Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/progress.schema.json`.
 - **`masterPlan.md` is for humans.** Not consumed by any tool; not part
   of the resumption protocol.
-- **`logs/` is opaque.** Wrappers write Codex streams there. The
+- **`logs/` is opaque.** Wrappers write executor streams there. The
   conductor never reads logs as part of orchestration.
 
 ## The canonical helper
@@ -55,9 +55,10 @@ All reads, writes, and frontier computations go through
 - `get-plan-dir <project-root>` — locate the active plan dir.
 - `read-plan <plan-dir>` / `read-progress <plan-dir>` — validated reads.
 - `init-progress <plan-dir>` — initialize progress.json from plan.json.
-- `start-step <plan-dir> <step-id> <executor> <model>` — atomically start a step and record its dispatch.
-- `set-step-status <plan-dir> <step-id> <status> [--degraded <reason>]` — atomic status update. The `done` transition enforces the dual-verify gate from the step's owner (codex-impl: grok-lane PASS; claude-impl/grok-impl: PASS in both lanes); `--degraded` permits a single-lane PASS when the other lane is down and appends the reason to `deviations`.
-- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json> [lane]` — write a verifier's result. Pass the lane (`codex` or `grok`) for every dual-verify verdict; it stores `verdicts.<lane>` and mirrors the authoritative lane to the top-level verdict. The no-lane form is the legacy single-verifier path only.
+- `start-step <plan-dir> <step-id> <executor> <model> <effort>` — atomically start a step and record its implementation dispatch.
+- `record-lane-dispatch <plan-dir> <step-id> <lane> <executor> <model> <effort>` — persist a verifier dispatch before it launches and clear that lane's stale verdict.
+- `set-step-status <plan-dir> <step-id> <status>` — atomic status update. The `done` transition reads the schema-backed matrix: claude-impl requires Codex+Grok, codex-impl requires Claude+Grok, and grok-impl requires Codex only. There is no degraded completion flag.
+- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json> [lane]` — write a verifier's result. Every implementation verifier supplies its `claude`, `codex`, or `grok` lane; lanes outside the owner's matrix row are refused.
 - `set-frontier <plan-dir> <ids…>` / `compute-frontier <plan-dir>` — manage the runnable frontier.
 
 Mutations are atomic (tmp file + rename). If a write fails mid-run,
@@ -82,15 +83,20 @@ parallel by default, serialized when two runnable steps overlap on
 files — see `codex-dispatch`).
 
 Before dispatch, invoke
-`${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step <plan-dir> <step-id> <executor> <model>`.
+`${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step <plan-dir> <step-id> <executor> <model> <effort>`.
 The helper atomically flips the step to `in_progress`, records the step's
 `startedAt`, and writes the full `dispatch` object —
-`{executor, model, startedAt}`, with `executor` one of
+`{executor, model, effort, startedAt}`, with `executor` one of
 `codex` | `grok` | `claude`. The dispatch record is overwritten on
 re-dispatch, so it always names the model behind the recorded verdict.
 On resumption, the conductor surfaces in-flight steps' dispatch info in
 its status line, so the user can see which models were mid-flight when
 the prior session ended.
+
+Before each verification call, invoke `record-lane-dispatch`. A
+`laneDispatches.<lane>` record without a current
+`verdicts.<lane>` record is durable evidence that the lane is
+`verifying`; resumption derives this state from disk, not memory.
 
 ## Resumption protocol
 

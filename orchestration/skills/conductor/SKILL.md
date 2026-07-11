@@ -11,45 +11,26 @@ central invariant is that **the conductor dispatches; it does not do
 the heavy work itself**. This skill is the contract for that
 invariant.
 
-## Hard rule: verification is cross-family, Grok always verifies, and every verify is Claude-session-dispatched
-
-**Every implementation step gets (a) a verifier whose model family
-differs from the implementer's, and (b) a Grok verify — always. When
-Grok is already the cross-family verifier, one Grok dispatch satisfies
-both. The verifier wrapper never calls the bridge directly.**
+## Hard rule: verification follows the exact owner matrix
 
 The verification policy, per owner:
 
-- `codex-impl` steps → verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; Grok is both the
-  cross-family verifier and the mandated Grok pass — one dispatch.
 - `claude-impl` steps → verified via
   `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family)
-  **and** `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` (the
-  mandatory Grok second pass). Dispatch both; the step is `done` only
-  when both final verdicts are PASS.
+  and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
+- `codex-impl` steps → verified via
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` and
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
 - `grok-impl` steps → verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family,
-  the authoritative gate) **and** a Grok second pass. The Grok pass is
-  same-family here — measured blind-eval self-scoring showed Grok does
-  not favor its own output, which is why it is acceptable as the
-  *second* voice; it is never the sole gate on its own work.
-- The invariants: at least one verifier is a **different model
-  family** than the implementer, and **Grok is always among the
-  verifiers** when its lane is available.
-- Findings from EITHER verifier enter the fix-and-re-verify loop; both
-  verifiers re-run after a fix.
-- Degradation, by role of the failing verifier: when Grok is the
-  **second** verifier (claude-impl / grok-impl), exit 4 or two
-  contract-parse failures → proceed on the already-run Codex verdict
-  with a `deviations` note — do not loop. When Grok is the **sole**
-  verifier (codex-impl), the same failures → **re-dispatch
-  verification via `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`**
-  (no Codex verdict exists yet) with a deviation note. If the Codex
-  lane is unavailable, verification is never skipped: the step stays
-  `in_progress` with a deviation until the lane returns — an
-  unverified step never flips `done` and never rides a milestone
-  commit.
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` only. Grok never
+  self-verifies, and no Claude-family verifier runs on Grok-owned work.
+- Findings from any required lane invalidate sibling PASS records;
+  after the fix, every verifier in the owner's row re-runs.
+- The degraded single-lane completion path is removed. If any required
+  lane is down, record a deviation and keep the step `in_progress`.
+  Recognizable capacity failures use the 10-minute retry rule below,
+  including the Claude verifier lane. An unverified step never flips
+  `done` and never rides a milestone commit.
 
 BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
 `claude-bridge` MCP call-back tools (`verify_step`,
@@ -80,7 +61,7 @@ machine-default model) — and consumes their consensus. Self-bias guard
 only if the other arbiter concurs; on a split over an own-family
 artifact, add a grok or opus tiebreak vote. Blind the artifacts when
 practical. This arbitration pair is distinct from step verification:
-verification stays cross-family (one verifier); quality arbitration
+verification follows the exact owner matrix above; quality arbitration
 runs both arbiters and consumes their consensus.
 
 ## Hard rule: always fix findings and re-verify
@@ -95,9 +76,8 @@ Concretely:
 
 - **FINDINGS verdict** → dispatch a fix-up sub-agent (at the scorecard
   tier, per the rule below), then re-dispatch **every verifier the
-  step's owner requires** (per the dual-verify hard rule above: the
-  Grok wrapper alone for `codex-impl`; both wrappers for `claude-impl`
-  / `grok-impl`) on the same step. Do not record the step as `done`
+   step's owner requires** (claude-impl: Codex+Grok; codex-impl:
+   Claude+Grok; grok-impl: Codex only) on the same step. Do not record the step as `done`
   with FINDINGS.
 - **FAIL verdict** → same loop. The findings array is the spec for
   the fix-up sub-agent.
@@ -113,7 +93,7 @@ Ask the user only when the loop fails to converge or the findings
 require judgment beyond mechanical fixing. Routine findings are the
 conductor's job, not the user's.
 
-## Hard rule: milestone commits, message drafted by Grok
+## Hard rule: milestone commits and Grok-authored diffs
 
 The conductor commits **autonomously at milestones** on `main`: when a
 step (or coherent group) reaches `done` with every required verifier
@@ -123,13 +103,11 @@ work or failing tests. Git stays append-only: `add`, `commit`, `push`,
 branch, or force-push, ever; divergence between machines is surfaced,
 never auto-merged.
 
-The commit message is **drafted by Grok**: dispatch an out-of-band
-read-only call through `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`
-with a synthetic step block over the staged diff asking for a
-conventional commit message; the returned `Summary` carries it (first
-line = subject ≤72 chars, remainder = body). If the grok lane is
-unavailable (exit 4) or the contract fails to parse twice, write the
-message yourself and note the fallback. Before starting NEW work in a
+When a milestone diff is predominantly Grok-authored, draft its commit
+message through an out-of-band read-only
+`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` synthetic step or
+write it in the conductor. Grok never summarizes its own diff. The
+returned `Summary` may carry the subject (≤72 chars) and body. Before starting NEW work in a
 repo shared with the second machine, run the sync protocol first:
 check `git status` on both machines (SSH), bring the working copy to
 par with HEAD via commit+push / `pull --ff-only`, and only then begin.
@@ -184,9 +162,10 @@ the step `in_progress`, announce the pause, wait 10 minutes, then repeat
 the identical dispatch on the same model and provider. Permit at most two
 delayed retries (three attempts total).
 
-After the delayed retries are exhausted, use an already-defined lane
-fallback when one exists; otherwise mark the step `blocked` and surface
-the capacity failure. This rule applies only to recognizable transient
+After the delayed retries are exhausted, a required verifier remains
+`in_progress` with a deviation; it is never replaced by another lane.
+An implementation executor may follow its defined blocked/reroute path.
+This rule applies only to recognizable transient
 capacity or overload responses. Authentication and configuration errors,
 missing binaries, invalid invocations, and malformed contracts follow
 their existing failure paths and must not enter the capacity retry loop.
@@ -205,10 +184,9 @@ user-visible line before it fires.** Exact format:
 - Omit the `· <skill>` segment when the step has no `skill`.
 - For `Agent` dispatches, `<model>` is the explicit `model` from the
   scorecard rule above.
-- For wrapper dispatches (`run-codex-*.sh`, `run-grok-*.sh`),
-  `<model>` is pinned in-script (Codex: machine default, no flag; Grok:
-  `-m grok-4.5`); callers never pass one. Announcement examples stay
-  `codex machine default` and `grok-4.5`.
+- For wrapper dispatches (`run-codex-*.sh`, `run-grok-*.sh`, and
+  `run-claude-verify.sh`), `<model>` is owned by the wrapper/runtime;
+  callers persist the actual model and effort but pass no model flag.
 
 For `Agent` dispatches, the tool's `description` parameter MUST also
 embed the step id and model, format `<step-id> · <model> · <short
@@ -219,7 +197,7 @@ what makes each sub-agent's model visible live — it complements the
 
 The line is for the user's live visibility only. The **durable**
 record is the `dispatch` object written into `progress.json` when the
-step flips to `in_progress`: `{executor, model, startedAt}`. The
+step flips to `in_progress`: `{executor, model, effort, startedAt}`. The
 announcement line is transient; the `dispatch` object is the audit
 trail.
 
@@ -236,8 +214,8 @@ Concretely:
 - Implementation touching more than ~3 files or needing sustained
   context → dispatch Codex via `codex-dispatch` (or a
   `general-purpose` sub-agent for `claude-impl` work).
-- Verification of any non-trivial change → dispatch Codex via
-  `codex-dispatch` (verify direction).
+- Verification of any non-trivial change → dispatch every required lane
+  via `codex-dispatch` (verify direction).
 
 The signal: when a task starts to feel like "I need to read several
 files to figure out what to do," hand it to a sub-agent.
@@ -369,24 +347,23 @@ The conductor:
    file overlap; cap ~4 simultaneous).
 4. Flips each step to `in_progress` before dispatch via
    `${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh start-step <plan-dir>
-   <step-id> <executor> <model>` — one atomic update of status plus the
-   `{executor, model, startedAt}` dispatch record (see `persistent-plans`
+   <step-id> <executor> <model> <effort>` — one atomic update of status plus the
+   `{executor, model, effort, startedAt}` dispatch record (see `persistent-plans`
    for the canonical description). Marks `done`/`blocked` after the
    verifier returns.
 
 Per-step routing:
 
 - `owner: codex-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`;
-  verified via `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` (Grok
-  is both the cross-family verifier and the mandatory Grok pass).
+  verified via `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` and
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
 - `owner: grok-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` (the
   `codex-dispatch` skill owns both wrapper lanes); verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (authoritative
-  cross-family gate) plus the mandatory Grok second pass.
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` only.
 - `owner: claude-impl` → dispatch `general-purpose` sub-agent to
   implement, then BOTH `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`
-  (cross-family) and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`
-  (mandatory Grok second pass); `done` requires both PASS.
+  and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; `done` requires
+  both PASS.
 - `owner: manual` → flip `blocked` with a note; continue with the
   rest of the frontier.
 

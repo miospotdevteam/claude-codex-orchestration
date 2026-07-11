@@ -53,6 +53,28 @@
       "type": "string",
       "minLength": 1
     },
+    "owner": {
+      "enum": [
+        "claude-impl",
+        "codex-impl",
+        "grok-impl",
+        "manual"
+      ],
+      "x-requiredVerifierLanes": {
+        "claude-impl": [
+          "codex",
+          "grok"
+        ],
+        "codex-impl": [
+          "claude",
+          "grok"
+        ],
+        "grok-impl": [
+          "codex"
+        ],
+        "manual": []
+      }
+    },
     "context": {
       "type": "object",
       "additionalProperties": false,
@@ -113,12 +135,7 @@
           }
         },
         "owner": {
-          "enum": [
-            "codex-impl",
-            "claude-impl",
-            "grok-impl",
-            "manual"
-          ]
+          "$ref": "#/$defs/owner"
         },
         "skill": {
           "type": "string"

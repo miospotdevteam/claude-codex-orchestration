@@ -49,6 +49,12 @@ assert_argv_has_pair() {
   awk -v flag="$flag" -v value="$value" 'previous == flag && $0 == value { found = 1 } { previous = $0 } END { exit found ? 0 : 1 }' "$argv_file"
 }
 
+argv_value_after() {
+  local argv_file="$1"
+  local flag="$2"
+  awk -v flag="$flag" 'previous == flag { print; exit } { previous = $0 }' "$argv_file"
+}
+
 deny_values() {
   local argv_file="$1"
   awk 'previous == "--deny" { printf "%s%s", separator, $0; separator = " " } { previous = $0 }' "$argv_file"
@@ -309,6 +315,7 @@ test_argv_and_prompt_assertions() {
   local status
   local deny_count
   local deny_sequence
+  local leader_socket
 
   mkdir -p "$root_dir"
   write_mock_grok "$bin_dir"
@@ -347,6 +354,11 @@ test_argv_and_prompt_assertions() {
     fail "$name" "argv missing --max-turns $EXPECTED_MAX_TURNS"
     return
   }
+  leader_socket=$(argv_value_after "$argv_file" "--leader-socket")
+  if [[ -z "$leader_socket" || "$(grep -cx -- '--leader-socket' "$argv_file")" -ne 1 ]]; then
+    fail "$name" "argv must contain exactly one nonempty --leader-socket"
+    return
+  fi
   assert_argv_lacks_line "$argv_file" "--model" || {
     fail "$name" "argv unexpectedly includes --model"
     return
@@ -384,6 +396,31 @@ test_argv_and_prompt_assertions() {
     return
   }
 
+  pass "$name"
+}
+
+test_leader_socket_is_distinct_per_invocation() {
+  local name="leader socket is distinct per invocation"
+  local case_dir="$TMP_DIR/distinct-leader-sockets"
+  local root_dir="$case_dir/root"
+  local bin_dir="$case_dir/bin"
+  local first_socket second_socket
+
+  mkdir -p "$root_dir"
+  write_mock_grok "$bin_dir"
+  PATH="$bin_dir:$ORIGINAL_PATH" GROK_MOCK_MODE=pass \
+    GROK_MOCK_ARGV="$case_dir/first-argv.txt" GROK_MOCK_PROMPT="$case_dir/first-prompt.txt" \
+    invoke_verify "$root_dir" >"$case_dir/first-stdout.txt" 2>"$case_dir/first-stderr.txt" || return 1
+  PATH="$bin_dir:$ORIGINAL_PATH" GROK_MOCK_MODE=pass \
+    GROK_MOCK_ARGV="$case_dir/second-argv.txt" GROK_MOCK_PROMPT="$case_dir/second-prompt.txt" \
+    invoke_verify "$root_dir" >"$case_dir/second-stdout.txt" 2>"$case_dir/second-stderr.txt" || return 1
+
+  first_socket=$(argv_value_after "$case_dir/first-argv.txt" "--leader-socket")
+  second_socket=$(argv_value_after "$case_dir/second-argv.txt" "--leader-socket")
+  if [[ -z "$first_socket" || -z "$second_socket" || "$first_socket" == "$second_socket" ]]; then
+    fail "$name" "expected two nonempty distinct socket paths"
+    return
+  fi
   pass "$name"
 }
 
@@ -699,6 +736,7 @@ test_logs_real_plan_vs_synthetic() {
 test_happy_path
 test_nonzero_exits_2
 test_argv_and_prompt_assertions
+test_leader_socket_is_distinct_per_invocation
 test_missing_contract_exits_3
 test_preamble_footer_exits_0
 test_two_blocks_last_wins

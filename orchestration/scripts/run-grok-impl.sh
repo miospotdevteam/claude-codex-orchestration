@@ -100,7 +100,9 @@ parse_err="$(mktemp "$logs_dir/parse-error.XXXXXX")"
 stdout_file="$(mktemp "$logs_dir/stdout.XXXXXX")"
 stderr_file="$(mktemp "$logs_dir/stderr.XXXXXX")"
 contract_file="$(mktemp "$logs_dir/contract.XXXXXX")"
-trap 'rm -f "$prompt_file" "$parse_err" "$stdout_file" "$stderr_file" "$contract_file"' EXIT
+leader_socket_dir="$(mktemp -d "${TMPDIR:-/tmp}/orchestration-grok.XXXXXX")"
+leader_socket="$leader_socket_dir/leader.sock"
+trap 'rm -f "$prompt_file" "$parse_err" "$stdout_file" "$stderr_file" "$contract_file"; rm -rf "$leader_socket_dir"' EXIT
 
 {
   cat <<EOF
@@ -143,6 +145,7 @@ grok \
   -m grok-4.5 \
   --always-approve \
   --max-turns 80 \
+  --leader-socket "$leader_socket" \
   >"$stdout_file" 2>"$stderr_file"
 grok_status=$?
 set -e

@@ -70,6 +70,7 @@
       "required": [
         "executor",
         "model",
+        "effort",
         "startedAt"
       ],
       "properties": {
@@ -81,9 +82,53 @@
           ]
         },
         "model": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
         },
         "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "laneDispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lane",
+        "executor",
+        "model",
+        "effort",
+        "dispatchedAt"
+      ],
+      "properties": {
+        "lane": {
+          "enum": [
+            "claude",
+            "codex",
+            "grok"
+          ]
+        },
+        "executor": {
+          "enum": [
+            "claude",
+            "codex",
+            "grok"
+          ]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dispatchedAt": {
           "type": "string",
           "format": "date-time"
         }
@@ -124,6 +169,46 @@
         "dispatch": {
           "$ref": "#/$defs/dispatch"
         },
+        "laneDispatches": {
+          "description": "Latest durable verifier dispatch per lane. A lane dispatch without a corresponding current verdict is actively verifying.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "claude": {
+              "$ref": "#/$defs/laneDispatch",
+              "properties": {
+                "lane": {
+                  "const": "claude"
+                },
+                "executor": {
+                  "const": "claude"
+                }
+              }
+            },
+            "codex": {
+              "$ref": "#/$defs/laneDispatch",
+              "properties": {
+                "lane": {
+                  "const": "codex"
+                },
+                "executor": {
+                  "const": "codex"
+                }
+              }
+            },
+            "grok": {
+              "$ref": "#/$defs/laneDispatch",
+              "properties": {
+                "lane": {
+                  "const": "grok"
+                },
+                "executor": {
+                  "const": "grok"
+                }
+              }
+            }
+          }
+        },
         "verdict": {
           "description": "Authoritative single-verdict field (legacy flat record). Lane-scoped history lives under verdicts.",
           "enum": [
@@ -142,10 +227,13 @@
           "type": "string"
         },
         "verdicts": {
-          "description": "Per-lane verifier records (codex / grok). Optional; dual-mandate done-gating reads these.",
+          "description": "Per-lane verifier records (claude / codex / grok). Owner-matrix done-gating reads these.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "claude": {
+              "$ref": "#/$defs/laneVerdict"
+            },
             "codex": {
               "$ref": "#/$defs/laneVerdict"
             },

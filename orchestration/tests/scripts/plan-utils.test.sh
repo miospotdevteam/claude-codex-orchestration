@@ -9,6 +9,8 @@ NOW_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 PLAN_UTILS="$SCRIPT_DIR/../../scripts/plan-utils.sh"
+PLAN_SCHEMA="$SCRIPT_DIR/../../schemas/plan.schema.json"
+PROGRESS_SCHEMA="$SCRIPT_DIR/../../schemas/progress.schema.json"
 REAL_JQ=$(command -v jq)
 
 PASS_COUNT=0
@@ -138,7 +140,7 @@ test_start_step_records_dispatch() {
   local dir="$SANDBOX/start-step"
   create_plan_dir "$dir"
   "$PLAN_UTILS" init-progress "$dir"
-  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
 
   assert_jq "$dir/progress.json" '
     .steps["step-1"].status == "in_progress"
@@ -146,6 +148,7 @@ test_start_step_records_dispatch() {
     and .steps["step-1"].dispatch == {
       executor: "codex",
       model: "gpt-5.6-codex",
+      effort: "xhigh",
       startedAt: .steps["step-1"].startedAt
     }
     and (.steps["step-1"] | has("completedAt") | not)
@@ -158,15 +161,24 @@ test_start_step_rejects_invalid_input_without_writing() {
   "$PLAN_UTILS" init-progress "$dir"
   cp "$dir/progress.json" "$SANDBOX/start-step-invalid.before"
 
-  if "$PLAN_UTILS" start-step "$dir" step-1 invalid model >/dev/null 2>&1; then
+  if "$PLAN_UTILS" start-step "$dir" step-1 invalid model high >/dev/null 2>&1; then
     return 1
   fi
   cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
-  if "$PLAN_UTILS" start-step "$dir" step-1 codex '' >/dev/null 2>&1; then
+  if "$PLAN_UTILS" start-step "$dir" step-1 codex '' high >/dev/null 2>&1; then
     return 1
   fi
   cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
-  if "$PLAN_UTILS" start-step "$dir" missing-step codex model >/dev/null 2>&1; then
+  if "$PLAN_UTILS" start-step "$dir" missing-step codex model high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" start-step "$dir" step-1 codex model '' >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json" || return 1
+  # The former four-argument signature must not silently invent effort.
+  if "$PLAN_UTILS" start-step "$dir" step-1 codex model >/dev/null 2>&1; then
     return 1
   fi
   cmp -s "$SANDBOX/start-step-invalid.before" "$dir/progress.json"
@@ -194,11 +206,144 @@ SH
   chmod +x "$fake_bin/jq"
 
   if REAL_JQ="$REAL_JQ" PATH="$fake_bin:$PATH" \
-    "$PLAN_UTILS" start-step "$dir" step-1 claude opus >/dev/null 2>&1; then
+    "$PLAN_UTILS" start-step "$dir" step-1 claude opus high >/dev/null 2>&1; then
     return 1
   fi
   cmp -s "$SANDBOX/start-step-atomic.before" "$dir/progress.json" || return 1
   ! compgen -G "$dir/.progress.json.tmp.*" >/dev/null
+}
+
+test_record_lane_dispatch_persists_per_lane_and_clears_stale_verdict() {
+  local dir="$SANDBOX/lane-dispatch"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "stale claude" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "stale grok" '[]' '[]' grok
+
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "in_progress"
+    and .steps["step-1"].laneDispatches.claude == {
+      lane: "claude",
+      executor: "claude",
+      model: "fable",
+      effort: "xhigh",
+      dispatchedAt: .steps["step-1"].laneDispatches.claude.dispatchedAt
+    }
+    and (.steps["step-1"].laneDispatches.claude.dispatchedAt | test("Z$"))
+    and (.steps["step-1"].verdicts | has("claude") | not)
+    and .steps["step-1"].verdicts.grok.verdict == "PASS"
+    and .steps["step-1"].verdict == "PASS"
+    and .steps["step-1"].result == "stale grok"' || return 1
+
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 grok grok grok-4.5 high
+  assert_jq "$dir/progress.json" '
+    (.steps["step-1"].laneDispatches | keys | sort) == ["claude", "grok"]
+    and .steps["step-1"].laneDispatches.grok.lane == "grok"
+    and .steps["step-1"].laneDispatches.grok.executor == "grok"
+    and .steps["step-1"].laneDispatches.grok.model == "grok-4.5"
+    and .steps["step-1"].laneDispatches.grok.effort == "high"
+    and (.steps["step-1"].verdicts | has("grok") | not)'
+}
+
+test_record_lane_dispatch_rejects_invalid_input_without_writing() {
+  local dir="$SANDBOX/lane-dispatch-invalid"
+  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/lane-dispatch-invalid.before"
+
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 grok grok grok-4.5 high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/lane-dispatch-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/lane-dispatch-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 codex grok model high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/lane-dispatch-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 codex codex '' high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/lane-dispatch-invalid.before" "$dir/progress.json" || return 1
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 codex codex model '' >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/lane-dispatch-invalid.before" "$dir/progress.json"
+}
+
+test_manual_steps_refuse_lane_dispatch_and_verdict() {
+  local dir="$SANDBOX/manual-no-verifier-lanes"
+  create_plan_dir "$dir" manual manual manual
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/manual-no-verifier-lanes.before"
+
+  if "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude model high >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/manual-no-verifier-lanes.before" "$dir/progress.json" || return 1
+
+  if "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "unexpected" '[]' '[]' claude >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/manual-no-verifier-lanes.before" "$dir/progress.json"
+}
+
+test_lane_down_records_deviation_and_remains_in_progress() {
+  local dir="$SANDBOX/lane-down-deviation"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
+  "$PLAN_UTILS" record-deviation "$dir" step-1 verifier-lane-down \
+    "claude lane remained at capacity after the bounded 10-minute retries" '[]'
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 grok grok grok-4.5 high
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok passed" '[]' '[]' grok
+
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "in_progress"
+    and .steps["step-1"].deviations[-1] == {
+      type: "verifier-lane-down",
+      description: "claude lane remained at capacity after the bounded 10-minute retries",
+      files: []
+    }
+    and .steps["step-1"].verdicts.grok.verdict == "PASS"
+    and (.steps["step-1"].verdicts | has("claude") | not)'
+}
+
+test_schemas_encode_owner_matrix_and_all_persisted_records() {
+  assert_jq "$PLAN_SCHEMA" '
+    .["$defs"].owner.enum == ["claude-impl", "codex-impl", "grok-impl", "manual"]
+    and .["$defs"].owner["x-requiredVerifierLanes"] == {
+      "claude-impl": ["codex", "grok"],
+      "codex-impl": ["claude", "grok"],
+      "grok-impl": ["codex"],
+      "manual": []
+    }
+    and .["$defs"].step.properties.owner["$ref"] == "#/$defs/owner"' || return 1
+
+  assert_jq "$PROGRESS_SCHEMA" '
+    (.["$defs"].dispatch.required | sort) == ["effort", "executor", "model", "startedAt"]
+    and (.["$defs"].laneDispatch.required | sort) == ["dispatchedAt", "effort", "executor", "lane", "model"]
+    and .["$defs"].laneDispatch.properties.lane.enum == ["claude", "codex", "grok"]
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.claude["$ref"] == "#/$defs/laneDispatch"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.claude.properties.lane.const == "claude"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.claude.properties.executor.const == "claude"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.codex["$ref"] == "#/$defs/laneDispatch"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.codex.properties.lane.const == "codex"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.codex.properties.executor.const == "codex"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.grok["$ref"] == "#/$defs/laneDispatch"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.grok.properties.lane.const == "grok"
+    and .["$defs"].stepProgress.properties.laneDispatches.properties.grok.properties.executor.const == "grok"
+    and .["$defs"].stepProgress.properties.verdicts.properties.claude["$ref"] == "#/$defs/laneVerdict"
+    and .["$defs"].stepProgress.properties.verdicts.properties.codex["$ref"] == "#/$defs/laneVerdict"
+    and .["$defs"].stepProgress.properties.verdicts.properties.grok["$ref"] == "#/$defs/laneVerdict"'
 }
 
 test_set_step_status_round_trip() {
@@ -209,8 +354,8 @@ test_set_step_status_round_trip() {
   "$PLAN_UTILS" set-step-status "$dir" step-1 in_progress
   started=$(jq -r '.steps["step-1"].startedAt' "$dir/progress.json")
   [[ "$started" != "null" && -n "$started" ]] || return 1
-  # Legacy no-lane path: top-level PASS is required before done for codex-impl.
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy pass" '[]' '[]'
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude pass" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok pass" '[]' '[]' grok
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   completed=$(jq -r '.steps["step-1"].completedAt' "$dir/progress.json")
   [[ "$completed" != "null" && -n "$completed" ]] || return 1
@@ -248,8 +393,10 @@ test_compute_frontier() {
   local actual
   create_plan_dir "$dir"
   "$PLAN_UTILS" init-progress "$dir"
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "ok" '[]' '[]'
-  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "ok" '[]' '[]'
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude ok" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok ok" '[]' '[]' grok
+  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "claude ok" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "grok ok" '[]' '[]' grok
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   "$PLAN_UTILS" set-step-status "$dir" step-2 done
   actual=$("$PLAN_UTILS" compute-frontier "$dir")
@@ -275,11 +422,12 @@ test_record_verdict_lane_mirrors_authoritative_for_codex_impl() {
     and .steps["step-1"].result == "grok ok"
     and .steps["step-1"].filesTouched == ["g.txt"]' || return 1
 
-  # Non-authoritative codex lane on codex-impl: store lane only, no top-level overwrite.
-  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "codex second" '["c"]' '["c.txt"]' codex
+  # Claude is the other required lane for codex-owned work. It is stored
+  # without overwriting the Grok-authored compatibility mirror.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude ok" '[]' '["c.txt"]' claude
   assert_jq "$dir/progress.json" '
-    .steps["step-1"].verdicts.codex.verdict == "FINDINGS"
-    and .steps["step-1"].verdicts.codex.summary == "codex second"
+    .steps["step-1"].verdicts.claude.verdict == "PASS"
+    and .steps["step-1"].verdicts.claude.summary == "claude ok"
     and .steps["step-1"].verdict == "PASS"
     and .steps["step-1"].result == "grok ok"'
 }
@@ -296,10 +444,10 @@ test_record_verdict_lane_mirrors_authoritative_for_claude_impl() {
     and .steps["step-1"].verdict == "PASS"
     and .steps["step-1"].result == "codex gate"' || return 1
 
-  # Non-authoritative grok lane: store without overwriting top-level.
-  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "grok second" '["g"]' '["g.txt"]' grok
+  # Non-authoritative Grok PASS: store without overwriting top-level.
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok second" '[]' '["g.txt"]' grok
   assert_jq "$dir/progress.json" '
-    .steps["step-1"].verdicts.grok.verdict == "FINDINGS"
+    .steps["step-1"].verdicts.grok.verdict == "PASS"
     and .steps["step-1"].verdict == "PASS"
     and .steps["step-1"].result == "codex gate"'
 }
@@ -314,11 +462,16 @@ test_record_verdict_lane_mirrors_authoritative_for_grok_impl() {
     .steps["step-1"].verdicts.codex.verdict == "PASS"
     and .steps["step-1"].verdict == "PASS"' || return 1
 
-  "$PLAN_UTILS" record-verdict "$dir" step-1 FAIL "grok self" '["x"]' '[]' grok
-  assert_jq "$dir/progress.json" '
-    .steps["step-1"].verdicts.grok.verdict == "FAIL"
-    and .steps["step-1"].verdict == "PASS"
-    and .steps["step-1"].result == "codex auth"'
+  cp "$dir/progress.json" "$SANDBOX/grok-self-verdict.before"
+  if "$PLAN_UTILS" record-verdict "$dir" step-1 FAIL "grok self" '["x"]' '[]' grok >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/grok-self-verdict.before" "$dir/progress.json" || return 1
+
+  if "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude family" '[]' '[]' claude >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/grok-self-verdict.before" "$dir/progress.json"
 }
 
 test_done_refused_when_only_one_dual_lane_pass() {
@@ -335,60 +488,54 @@ test_done_refused_when_only_one_dual_lane_pass() {
   assert_jq "$dir/progress.json" '.steps["step-1"].status != "done"'
 }
 
-test_done_accepted_with_degraded_and_deviation() {
-  local dir="$SANDBOX/done-degraded"
+test_degraded_flag_is_removed_without_writing() {
+  local dir="$SANDBOX/done-degraded-removed"
+  local err status
   create_plan_dir "$dir" claude-impl claude-impl claude-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex only" '[]' '[]' codex
+  cp "$dir/progress.json" "$SANDBOX/done-degraded-removed.before"
 
-  "$PLAN_UTILS" set-step-status "$dir" step-1 done --degraded "grok lane unavailable"
-  assert_jq "$dir/progress.json" '
-    .steps["step-1"].status == "done"
-    and (.steps["step-1"].completedAt | test("Z$"))
-    and (.deviations | length) >= 1
-    and (.deviations[-1].note | test("grok lane unavailable"))
-    and (.deviations[-1].at | test("Z$"))'
+  set +e
+  err=$("$PLAN_UTILS" set-step-status "$dir" step-1 done --degraded "grok lane unavailable" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || return 1
+  [[ "$err" == *"--degraded"* && ${#err} -lt 500 ]] || return 1
+  cmp -s "$SANDBOX/done-degraded-removed.before" "$dir/progress.json"
 }
 
-test_done_degraded_refused_without_lane_pass() {
-  local dir="$SANDBOX/done-degraded-no-lane"
-  create_plan_dir "$dir" claude-impl claude-impl claude-impl
-  "$PLAN_UTILS" init-progress "$dir"
-  # Legacy top-level PASS only (no lane argument): --degraded must refuse.
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy top-level only" '[]' '[]'
-
-  if "$PLAN_UTILS" set-step-status "$dir" step-1 done --degraded "grok lane unavailable" >/dev/null 2>&1; then
-    return 1
-  fi
-  assert_jq "$dir/progress.json" '.steps["step-1"].status != "done"'
-}
-
-test_done_codex_impl_with_grok_lane_pass() {
-  local dir="$SANDBOX/done-codex-impl-grok"
+test_done_codex_impl_requires_claude_and_grok_pass() {
+  local dir="$SANDBOX/done-codex-impl-two-lanes"
   create_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok sole" '[]' '["x.txt"]' grok
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok pass" '[]' '["x.txt"]' grok
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude pass" '[]' '[]' claude
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   assert_jq "$dir/progress.json" '
     .steps["step-1"].status == "done"
     and .steps["step-1"].verdicts.grok.verdict == "PASS"
+    and .steps["step-1"].verdicts.claude.verdict == "PASS"
     and .steps["step-1"].verdict == "PASS"'
 }
 
-test_done_dual_lanes_both_pass() {
-  local dir="$SANDBOX/done-dual-both"
+test_done_grok_impl_requires_codex_pass_only() {
+  local dir="$SANDBOX/done-grok-impl-codex-only"
   create_plan_dir "$dir" grok-impl grok-impl grok-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex" '[]' '[]' codex
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok" '[]' '[]' grok
-  assert_jq "$dir/progress.json" '
-    .steps["step-1"].verdicts.codex.verdict == "PASS"
-    and .steps["step-1"].verdicts.grok.verdict == "PASS"' || return 1
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
-  assert_jq "$dir/progress.json" '.steps["step-1"].status == "done"'
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "done"
+    and .steps["step-1"].verdicts.codex.verdict == "PASS"
+    and (.steps["step-1"].verdicts | has("grok") | not)
+    and (.steps["step-1"].verdicts | has("claude") | not)'
 }
 
-test_legacy_no_lane_record_and_done() {
+test_legacy_no_lane_pass_never_satisfies_implementation_gate() {
   local dir="$SANDBOX/legacy-no-lane"
   create_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
@@ -397,8 +544,53 @@ test_legacy_no_lane_record_and_done() {
     .steps["step-1"].verdict == "PASS"
     and .steps["step-1"].result == "legacy"
     and (.steps["step-1"] | has("verdicts") | not)' || return 1
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  assert_jq "$dir/progress.json" '.steps["step-1"].status == "pending"'
+}
+
+test_findings_invalidate_all_required_lane_passes() {
+  local dir="$SANDBOX/findings-invalidate-required-lanes"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude first pass" '[]' '[]' claude
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 grok grok grok-4.5 high
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok first pass" '[]' '[]' grok
+  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "grok found an issue" '["fix it"]' '[]' grok
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.grok.verdict == "FINDINGS"
+    and (.steps["step-1"].verdicts | has("claude") | not)
+    and .steps["step-1"].laneDispatches.grok.lane == "grok"
+    and (.steps["step-1"].laneDispatches | has("claude") | not)' || return 1
+
+  "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 grok grok grok-4.5 high
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok after fix" '[]' '[]' grok
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude after fix" '[]' '[]' claude
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   assert_jq "$dir/progress.json" '.steps["step-1"].status == "done"'
+}
+
+test_non_pass_verdict_reopens_completed_step() {
+  local dir="$SANDBOX/non-pass-reopens-done"
+  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex pass" '[]' '[]' codex
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done
+  "$PLAN_UTILS" record-verdict "$dir" step-1 FINDINGS "late finding" '["fix it"]' '[]' codex
+
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "in_progress"
+    and (.steps["step-1"] | has("completedAt") | not)
+    and .steps["step-1"].verdicts.codex.verdict == "FINDINGS"
+    and .steps["step-1"].verdict == "FINDINGS"'
 }
 
 test_done_refused_without_pass_no_partial_write() {
@@ -542,6 +734,11 @@ run_test "read-plan and read-progress return validated files" test_read_plan_and
 run_test "start-step records status and full dispatch atomically" test_start_step_records_dispatch
 run_test "start-step rejects invalid input without writing" test_start_step_rejects_invalid_input_without_writing
 run_test "start-step preserves progress on atomic update failure" test_start_step_atomic_failure_preserves_original
+run_test "record-lane-dispatch persists per lane and clears its stale verdict" test_record_lane_dispatch_persists_per_lane_and_clears_stale_verdict
+run_test "record-lane-dispatch rejects invalid input without writing" test_record_lane_dispatch_rejects_invalid_input_without_writing
+run_test "manual steps refuse verifier lane records" test_manual_steps_refuse_lane_dispatch_and_verdict
+run_test "lane down records a deviation and remains in_progress" test_lane_down_records_deviation_and_remains_in_progress
+run_test "schemas encode the owner matrix and persisted record shapes" test_schemas_encode_owner_matrix_and_all_persisted_records
 run_test "set-step-status preserves startedAt and sets completedAt" test_set_step_status_round_trip
 run_test "record-verdict writes PASS FINDINGS and FAIL shapes" test_record_verdict_shapes
 run_test "compute-frontier emits dependent step after dependencies done" test_compute_frontier
@@ -551,11 +748,14 @@ run_test "record-verdict lane mirrors authoritative for codex-impl" test_record_
 run_test "record-verdict lane mirrors authoritative for claude-impl" test_record_verdict_lane_mirrors_authoritative_for_claude_impl
 run_test "record-verdict lane mirrors authoritative for grok-impl" test_record_verdict_lane_mirrors_authoritative_for_grok_impl
 run_test "done refused when only one of two dual lanes has PASS" test_done_refused_when_only_one_dual_lane_pass
-run_test "done accepted with --degraded and deviation recorded" test_done_accepted_with_degraded_and_deviation
-run_test "done refused with --degraded when no lane has PASS" test_done_degraded_refused_without_lane_pass
-run_test "done for codex-impl with grok-lane PASS" test_done_codex_impl_with_grok_lane_pass
-run_test "done for dual-mandate when both lanes PASS" test_done_dual_lanes_both_pass
-run_test "legacy no-lane record-verdict and done still green" test_legacy_no_lane_record_and_done
+# Disposition (FORCED F3): the prior green degraded-completion cases were
+# deleted because implementation steps may never complete on a single lane.
+run_test "--degraded is removed and refuses without writing" test_degraded_flag_is_removed_without_writing
+run_test "done for codex-impl requires Claude and Grok PASS" test_done_codex_impl_requires_claude_and_grok_pass
+run_test "done for grok-impl requires Codex PASS only" test_done_grok_impl_requires_codex_pass_only
+run_test "legacy no-lane PASS never satisfies an implementation gate" test_legacy_no_lane_pass_never_satisfies_implementation_gate
+run_test "findings invalidate every required lane PASS" test_findings_invalidate_all_required_lane_passes
+run_test "a non-PASS required-lane verdict reopens a completed step" test_non_pass_verdict_reopens_completed_step
 run_test "done refused without PASS and no partial write" test_done_refused_without_pass_no_partial_write
 run_test "archive-plan refuses when a step is in_progress" test_archive_plan_refuses_in_progress
 run_test "archive-plan moves finished plan to archive/" test_archive_plan_success_moves_dir

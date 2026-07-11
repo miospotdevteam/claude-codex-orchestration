@@ -96,6 +96,7 @@ PROMPT_FILE="$TMP_DIR/prompt.txt"
 GROK_STDOUT_FILE="$TMP_DIR/grok-stdout.txt"
 GROK_STDERR_FILE="$TMP_DIR/grok-stderr.txt"
 CONTRACT_FILE="$TMP_DIR/contract.txt"
+LEADER_SOCKET="$TMP_DIR/leader.sock"
 
 # Validate the diff input BEFORE the grok-availability check, so a bad invocation
 # exits 1 (invocation error), not 4 (grok missing).
@@ -189,6 +190,7 @@ grok \
   --cwd "$ROOT_DIR" \
   -m grok-4.5 \
   --max-turns 80 \
+  --leader-socket "$LEADER_SOCKET" \
   --deny 'Write' \
   --deny 'Edit' \
   --deny 'Bash' \

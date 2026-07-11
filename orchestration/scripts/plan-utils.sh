@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+PLAN_SCHEMA="$SCRIPT_DIR/../schemas/plan.schema.json"
+
 usage() {
   cat >&2 <<'USAGE'
 Usage: plan-utils.sh <subcommand> [args...]
@@ -10,8 +13,10 @@ Subcommands:
   read-plan <plan-dir>
   read-progress <plan-dir>
   init-progress [--force] <plan-dir>
-  start-step <plan-dir> <step-id> <executor> <model>
-  set-step-status <plan-dir> <step-id> <status> [--degraded <reason>]
+  start-step <plan-dir> <step-id> <executor> <model> <effort>
+  set-step-status <plan-dir> <step-id> <status>
+  record-lane-dispatch <plan-dir> <step-id> <lane> <executor> <model> <effort>
+  record-deviation <plan-dir> <step-id> <type> <description> <files-json-array>
   record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array> [lane]
   set-frontier <plan-dir> <space-separated-step-ids>
   compute-frontier <plan-dir>
@@ -88,9 +93,37 @@ valid_executor() {
 
 valid_lane() {
   case "$1" in
-    codex | grok) return 0 ;;
+    claude | codex | grok) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+owner_is_implementation() {
+  case "$1" in
+    claude-impl | codex-impl | grok-impl) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+lane_is_required() {
+  local owner=$1
+  local lane=$2
+  local required_json
+  required_json=$(required_lanes_json_for_owner "$owner")
+  jq -e --arg lane "$lane" 'index($lane) != null' <<<"$required_json" >/dev/null
+}
+
+required_lanes_json_for_owner() {
+  local owner=$1
+  [[ -f "$PLAN_SCHEMA" ]] || die "missing plan schema: $PLAN_SCHEMA"
+  jq -ce --arg owner "$owner" '
+    .["$defs"].owner["x-requiredVerifierLanes"] as $matrix
+    | if $matrix | has($owner) then
+        $matrix[$owner]
+      else
+        error("owner is absent from x-requiredVerifierLanes")
+      end
+  ' "$PLAN_SCHEMA" 2>/dev/null || die "invalid step owner or verifier matrix: $owner"
 }
 
 # Owner from plan.json for a step id. Empty string if missing.
@@ -218,15 +251,17 @@ cmd_init_progress() {
 }
 
 cmd_start_step() {
-  [[ $# -eq 4 ]] || die "start-step requires <plan-dir> <step-id> <executor> <model>"
+  [[ $# -eq 5 ]] || die "start-step requires <plan-dir> <step-id> <executor> <model> <effort>"
 
-  local plan_dir step_id executor model now
+  local plan_dir step_id executor model effort now
   plan_dir=$(abs_dir "$1")
   step_id=$2
   executor=$3
   model=$4
+  effort=$5
   valid_executor "$executor" || die "invalid executor: $executor"
   [[ -n "$model" ]] || die "model must not be empty"
+  [[ -n "$effort" ]] || die "effort must not be empty"
   require_file_json "$plan_dir/progress.json"
   jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
     die "unknown step id: $step_id"
@@ -241,114 +276,165 @@ cmd_start_step() {
     | .steps[$id].dispatch = {
         executor: $executor,
         model: $model,
+        effort: $effort,
         startedAt: $now
       }
-    | del(.steps[$id].completedAt)
+    | .steps[$id] |= del(
+        .completedAt,
+        .laneDispatches,
+        .verdicts,
+        .verdict,
+        .result,
+        .findings,
+        .filesTouched
+      )
   ' \
     --arg id "$step_id" \
     --arg executor "$executor" \
     --arg model "$model" \
+    --arg effort "$effort" \
     --arg now "$now"
 }
 
-# Parse optional --degraded <reason> from argv; remaining positionals go to stdout
-# as lines (bash 3.2 safe — no nameref).
-parse_degraded_flag() {
-  degraded_reason=""
-  _parse_pos=()
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --degraded)
-        [[ $# -ge 2 ]] || die "--degraded requires a reason"
-        [[ -n "$2" ]] || die "--degraded reason must not be empty"
-        degraded_reason=$2
-        shift 2
-        ;;
-      *)
-        _parse_pos+=("$1")
-        shift
-        ;;
-    esac
-  done
+cmd_record_lane_dispatch() {
+  [[ $# -eq 6 ]] ||
+    die "record-lane-dispatch requires <plan-dir> <step-id> <lane> <executor> <model> <effort>"
+
+  local plan_dir step_id lane executor model effort owner now clear_mirror
+  plan_dir=$(abs_dir "$1")
+  step_id=$2
+  lane=$3
+  executor=$4
+  model=$5
+  effort=$6
+  valid_lane "$lane" || die "invalid lane: $lane (expected claude, codex, or grok)"
+  valid_executor "$executor" || die "invalid executor: $executor"
+  [[ "$lane" == "$executor" ]] || die "lane '$lane' must use executor '$lane'"
+  [[ -n "$model" ]] || die "model must not be empty"
+  [[ -n "$effort" ]] || die "effort must not be empty"
+  require_file_json "$plan_dir/progress.json"
+  jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
+    die "unknown step id: $step_id"
+  owner=$(step_owner_from_plan "$plan_dir" "$step_id")
+  [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+  if ! lane_is_required "$owner" "$lane"; then
+    die "lane '$lane' may not verify $owner step '$step_id'"
+  fi
+  clear_mirror=false
+  if lane_is_authoritative "$owner" "$lane"; then
+    clear_mirror=true
+  fi
+
+  now=$(utc_now)
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
+  atomic_update_progress "$plan_dir" '
+    .lastUpdatedAt = $now
+    | .steps[$id].status = "in_progress"
+    | .steps[$id].startedAt = (.steps[$id].startedAt // $now)
+    | .steps[$id].laneDispatches = ((.steps[$id].laneDispatches // {}) + {
+        ($lane): {
+          lane: $lane,
+          executor: $executor,
+          model: $model,
+          effort: $effort,
+          dispatchedAt: $now
+        }
+      })
+    | del(.steps[$id].completedAt, .steps[$id].verdicts[$lane])
+    | if $clear_mirror then
+        del(
+          .steps[$id].verdict,
+          .steps[$id].result,
+          .steps[$id].findings,
+          .steps[$id].filesTouched
+        )
+      else
+        .
+      end
+  ' \
+    --arg id "$step_id" \
+    --arg lane "$lane" \
+    --arg executor "$executor" \
+    --arg model "$model" \
+    --arg effort "$effort" \
+    --argjson clear_mirror "$clear_mirror" \
+    --arg now "$now"
 }
 
-# Dual-verifier done gate. Sets gate_use_degraded=true/false or exits on refusal.
-# Reads progress.json + plan.json; does not write.
+cmd_record_deviation() {
+  [[ $# -eq 5 ]] ||
+    die "record-deviation requires <plan-dir> <step-id> <type> <description> <files-json-array>"
+
+  local plan_dir step_id deviation_type description files_json now
+  plan_dir=$(abs_dir "$1")
+  step_id=$2
+  deviation_type=$3
+  description=$4
+  files_json=$5
+  [[ -n "$deviation_type" ]] || die "deviation type must not be empty"
+  [[ -n "$description" ]] || die "deviation description must not be empty"
+  jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+    <<<"$files_json" >/dev/null || die "deviation files must be a JSON array of nonempty strings"
+  require_file_json "$plan_dir/progress.json"
+  jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
+    die "unknown step id: $step_id"
+
+  now=$(utc_now)
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
+  atomic_update_progress "$plan_dir" '
+    .lastUpdatedAt = $now
+    | .steps[$id].status = "in_progress"
+    | .steps[$id].startedAt = (.steps[$id].startedAt // $now)
+    | .steps[$id].deviations = ((.steps[$id].deviations // []) + [{
+        type: $type,
+        description: $description,
+        files: $files
+      }])
+    | del(.steps[$id].completedAt)
+  ' \
+    --arg id "$step_id" \
+    --arg type "$deviation_type" \
+    --arg description "$description" \
+    --argjson files "$files_json" \
+    --arg now "$now"
+}
+
+# Owner-to-lanes done gate. Reads progress.json + plan.json; does not write.
 check_done_gate() {
   local plan_dir=$1
   local step_id=$2
-  local degraded=$3
 
   local owner progress_file
   progress_file="$plan_dir/progress.json"
   owner=$(step_owner_from_plan "$plan_dir" "$step_id")
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
 
-  local codex_v grok_v top_v has_lane
-  codex_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.codex.verdict // empty' "$progress_file")
-  grok_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.grok.verdict // empty' "$progress_file")
-  top_v=$(jq -r --arg id "$step_id" '.steps[$id].verdict // empty' "$progress_file")
-  has_lane=false
-  if [[ -n "$codex_v" || -n "$grok_v" ]]; then
-    has_lane=true
-  fi
-
-  local codex_pass=false grok_pass=false top_pass=false any_pass=false
-  [[ "$codex_v" == "PASS" ]] && codex_pass=true
-  [[ "$grok_v" == "PASS" ]] && grok_pass=true
-  [[ "$top_v" == "PASS" ]] && top_pass=true
-  # any_pass gates --degraded: it requires a real per-lane PASS. The
-  # legacy top-level verdict never satisfies a degraded completion —
-  # degraded means "one of the two required lanes is down", not "no
-  # lane ever ran".
-  if [[ "$codex_pass" == true || "$grok_pass" == true ]]; then
-    any_pass=true
-  fi
-
-  gate_use_degraded=false
-
-  case "$owner" in
-    codex-impl)
-      if [[ "$grok_pass" == true ]]; then
-        :
-      elif [[ "$has_lane" == false && "$top_pass" == true ]]; then
-        # Legacy path: no per-lane data, top-level PASS is enough.
-        :
-      elif [[ -n "$degraded" && "$any_pass" == true ]]; then
-        gate_use_degraded=true
-      else
-        die "cannot mark step '$step_id' done: codex-impl requires grok-lane PASS (or legacy top-level PASS when no lane data); got grok='${grok_v:-none}' top='${top_v:-none}'"
-      fi
-      ;;
-    claude-impl | grok-impl)
-      if [[ "$codex_pass" == true && "$grok_pass" == true ]]; then
-        :
-      elif [[ -n "$degraded" && "$any_pass" == true ]]; then
-        gate_use_degraded=true
-      else
-        die "cannot mark step '$step_id' done: $owner requires PASS in both verdicts.codex and verdicts.grok (or --degraded <reason> with a single-lane PASS); got codex='${codex_v:-none}' grok='${grok_v:-none}'"
-      fi
-      ;;
-    *)
-      # manual / unknown: no dual mandate
-      :
-      ;;
-  esac
+  local required_json lane lane_verdict
+  required_json=$(required_lanes_json_for_owner "$owner")
+  while IFS= read -r lane; do
+    [[ -n "$lane" ]] || continue
+    lane_verdict=$(jq -r --arg id "$step_id" --arg lane "$lane" \
+      '.steps[$id].verdicts[$lane].verdict // empty' "$progress_file")
+    [[ "$lane_verdict" == "PASS" ]] ||
+      die "cannot mark step '$step_id' done: $owner requires $lane-lane PASS; got '${lane_verdict:-none}'"
+  done < <(jq -r '.[]' <<<"$required_json")
 }
 
 cmd_set_step_status() {
-  parse_degraded_flag "$@"
-  set -- "${_parse_pos[@]}"
-  [[ $# -eq 3 ]] || die "set-step-status requires <plan-dir> <step-id> <status> [--degraded <reason>]"
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" != "--degraded" ]] ||
+      die "--degraded has been removed; required verifier lanes must all record PASS"
+  done
+  [[ $# -eq 3 ]] || die "set-step-status requires <plan-dir> <step-id> <status>"
 
   local plan_dir step_id status now
   plan_dir=$(abs_dir "$1")
   step_id=$2
   status=$3
   valid_status "$status" || die "invalid status: $status"
-  if [[ -n "$degraded_reason" && "$status" != "done" ]]; then
-    die "--degraded is only valid when setting status to done"
-  fi
   require_file_json "$plan_dir/progress.json"
   jq -e --arg id "$step_id" '.steps[$id] != null' "$plan_dir/progress.json" >/dev/null ||
     die "unknown step id: $step_id"
@@ -356,18 +442,7 @@ cmd_set_step_status() {
   now=$(utc_now)
 
   if [[ "$status" == "done" ]]; then
-    check_done_gate "$plan_dir" "$step_id" "$degraded_reason"
-    if [[ "$gate_use_degraded" == true ]]; then
-      # The single-quoted argument is jq code; its $variables must reach jq literally.
-      # shellcheck disable=SC2016
-      atomic_update_progress "$plan_dir" '
-        .lastUpdatedAt = $now
-        | .steps[$id].status = "done"
-        | .steps[$id].completedAt = $now
-        | .deviations = ((.deviations // []) + [{at: $now, note: $note}])
-      ' --arg id "$step_id" --arg now "$now" --arg note "$degraded_reason"
-      return 0
-    fi
+    check_done_gate "$plan_dir" "$step_id"
   fi
 
   # The single-quoted argument is jq code; its $variables must reach jq literally.
@@ -402,7 +477,7 @@ cmd_record_verdict() {
   lane=""
   if [[ $# -eq 7 ]]; then
     lane=$7
-    valid_lane "$lane" || die "invalid lane: $lane (expected codex or grok)"
+    valid_lane "$lane" || die "invalid lane: $lane (expected claude, codex, or grok)"
   fi
   valid_verdict "$verdict" || die "invalid verdict: $verdict"
   require_file_json "$plan_dir/progress.json"
@@ -435,61 +510,67 @@ cmd_record_verdict() {
 
   owner=$(step_owner_from_plan "$plan_dir" "$step_id")
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+  if ! lane_is_required "$owner" "$lane"; then
+    die "lane '$lane' may not verify $owner step '$step_id'"
+  fi
 
-  local mirror=false
+  local mirror=false invalidate=false
   if lane_is_authoritative "$owner" "$lane"; then
     mirror=true
   fi
-
-  if [[ "$mirror" == true ]]; then
-    # The single-quoted argument is jq code; its $variables must reach jq literally.
-    # shellcheck disable=SC2016
-    atomic_update_progress "$plan_dir" '
-      .lastUpdatedAt = $now
-      | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
-          ($lane): {
-            verdict: $verdict,
-            summary: $summary,
-            findings: $findings,
-            filesTouched: $files,
-            timestamp: $now
-          }
-        })
-      | .steps[$id].verdict = $verdict
-      | .steps[$id].result = $summary
-      | .steps[$id].findings = $findings
-      | .steps[$id].filesTouched = $files
-    ' \
-      --arg id "$step_id" \
-      --arg lane "$lane" \
-      --arg verdict "$verdict" \
-      --arg summary "$summary" \
-      --argjson findings "$findings_json" \
-      --argjson files "$files_json" \
-      --arg now "$now"
-  else
-    # The single-quoted argument is jq code; its $variables must reach jq literally.
-    # shellcheck disable=SC2016
-    atomic_update_progress "$plan_dir" '
-      .lastUpdatedAt = $now
-      | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
-          ($lane): {
-            verdict: $verdict,
-            summary: $summary,
-            findings: $findings,
-            filesTouched: $files,
-            timestamp: $now
-          }
-        })
-    ' \
-      --arg id "$step_id" \
-      --arg lane "$lane" \
-      --arg verdict "$verdict" \
-      --arg summary "$summary" \
-      --argjson findings "$findings_json" \
-      --argjson files "$files_json" \
-      --arg now "$now"
+  if [[ "$verdict" != "PASS" ]] && owner_is_implementation "$owner"; then
+    invalidate=true
   fi
+
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
+  atomic_update_progress "$plan_dir" '
+    .lastUpdatedAt = $now
+    | if $invalidate then
+        .steps[$id] |= (
+          .status = "in_progress"
+          | .startedAt = (.startedAt // $now)
+          | .laneDispatches = (
+            (.laneDispatches // {})
+            | with_entries(select(.key == $lane))
+          )
+          | if (.laneDispatches | length) == 0 then
+              del(.laneDispatches)
+            else
+              .
+            end
+          | del(.completedAt, .verdicts, .verdict, .result, .findings, .filesTouched)
+        )
+      else
+        .
+      end
+    | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
+        ($lane): {
+          verdict: $verdict,
+          summary: $summary,
+          findings: $findings,
+          filesTouched: $files,
+          timestamp: $now
+        }
+      })
+    | if $mirror then
+        .steps[$id].verdict = $verdict
+        | .steps[$id].result = $summary
+        | .steps[$id].findings = $findings
+        | .steps[$id].filesTouched = $files
+      else
+        .
+      end
+  ' \
+    --arg id "$step_id" \
+    --arg lane "$lane" \
+    --arg verdict "$verdict" \
+    --arg summary "$summary" \
+    --argjson findings "$findings_json" \
+    --argjson files "$files_json" \
+    --argjson mirror "$mirror" \
+    --argjson invalidate "$invalidate" \
+    --arg now "$now"
 }
 
 cmd_set_frontier() {
@@ -661,6 +742,8 @@ main() {
     read-progress) cmd_read_progress "$@" ;;
     init-progress) cmd_init_progress "$@" ;;
     start-step) cmd_start_step "$@" ;;
+    record-lane-dispatch) cmd_record_lane_dispatch "$@" ;;
+    record-deviation) cmd_record_deviation "$@" ;;
     set-step-status) cmd_set_step_status "$@" ;;
     record-verdict) cmd_record_verdict "$@" ;;
     set-frontier) cmd_set_frontier "$@" ;;
