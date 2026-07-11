@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
+# The plan status enum intentionally passes the literal argument `done`.
+# shellcheck disable=SC1010
 set -euo pipefail
+
+# Fresh timestamp for "recent" fixtures — hardcoded dates rot past the
+# 7-day staleness window and would flip these tests.
+NOW_TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 PLAN_UTILS="$SCRIPT_DIR/../../scripts/plan-utils.sh"
@@ -426,6 +432,110 @@ test_init_progress_force() {
   assert_jq "$dir/progress.json" '.currentFrontier == ["step-1", "step-2"]'
 }
 
+test_archive_plan_refuses_in_progress() {
+  local root="$SANDBOX/archive-in-progress"
+  local plan_dir="$root/.temp/plan-mode/active/busy-plan"
+  local err
+  create_plan_dir "$plan_dir"
+  "$PLAN_UTILS" init-progress "$plan_dir"
+  "$PLAN_UTILS" set-step-status "$plan_dir" step-1 in_progress
+  cp -R "$plan_dir" "$SANDBOX/archive-in-progress.before"
+
+  set +e
+  err=$("$PLAN_UTILS" archive-plan "$plan_dir" 2>&1)
+  local status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || return 1
+  [[ "$err" == *in_progress* ]] || return 1
+  [[ -d "$plan_dir" ]] || return 1
+  [[ ! -d "$root/.temp/plan-mode/archive/busy-plan" ]] || return 1
+  cmp -s "$SANDBOX/archive-in-progress.before/progress.json" "$plan_dir/progress.json"
+}
+
+test_archive_plan_success_moves_dir() {
+  local root="$SANDBOX/archive-success"
+  local plan_dir="$root/.temp/plan-mode/active/done-plan"
+  local dest actual
+  create_plan_dir "$plan_dir"
+  "$PLAN_UTILS" init-progress "$plan_dir"
+  # All pending is fine — no in_progress.
+  actual=$("$PLAN_UTILS" archive-plan "$plan_dir")
+  dest=$(cd "$root/.temp/plan-mode/archive/done-plan" && pwd -P)
+  [[ "$actual" == "$dest" ]] || return 1
+  [[ ! -d "$plan_dir" ]] || return 1
+  [[ -f "$dest/plan.json" ]] || return 1
+  [[ -f "$dest/progress.json" ]]
+}
+
+test_archive_plan_force_overrides_in_progress() {
+  local root="$SANDBOX/archive-force"
+  local plan_dir="$root/.temp/plan-mode/active/forced-plan"
+  local dest actual
+  create_plan_dir "$plan_dir"
+  "$PLAN_UTILS" init-progress "$plan_dir"
+  "$PLAN_UTILS" set-step-status "$plan_dir" step-1 in_progress
+  actual=$("$PLAN_UTILS" archive-plan --force "$plan_dir")
+  dest=$(cd "$root/.temp/plan-mode/archive/forced-plan" && pwd -P)
+  [[ "$actual" == "$dest" ]] || return 1
+  [[ ! -d "$plan_dir" ]] || return 1
+  [[ -d "$dest" ]]
+}
+
+test_archive_plan_refuses_missing_plan_json() {
+  local root="$SANDBOX/archive-missing-plan"
+  local plan_dir="$root/.temp/plan-mode/active/debris-only"
+  local err
+  mkdir -p "$plan_dir/logs"
+  printf 'noise\n' >"$plan_dir/logs/x.log"
+
+  set +e
+  err=$("$PLAN_UTILS" archive-plan "$plan_dir" 2>&1)
+  local status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || return 1
+  [[ "$err" == *plan.json* ]] || return 1
+  [[ -d "$plan_dir" ]] || return 1
+  [[ ! -d "$root/.temp/plan-mode/archive/debris-only" ]]
+}
+
+test_list_plans_real_debris_stale() {
+  local root="$SANDBOX/list-plans"
+  local real_dir="$root/.temp/plan-mode/active/real-plan"
+  local debris_dir="$root/.temp/plan-mode/active/debris-dir"
+  local stale_dir="$root/.temp/plan-mode/active/stale-plan"
+  local out
+
+  create_plan_dir "$real_dir"
+  "$PLAN_UTILS" init-progress "$real_dir"
+  jq --arg now "$NOW_TS" '.lastUpdatedAt = $now' "$real_dir/progress.json" >"$real_dir/progress.next.json"
+  mv "$real_dir/progress.next.json" "$real_dir/progress.json"
+
+  mkdir -p "$debris_dir/logs"
+  printf 'junk\n' >"$debris_dir/logs/x.log"
+
+  create_plan_dir "$stale_dir"
+  "$PLAN_UTILS" init-progress "$stale_dir"
+  "$PLAN_UTILS" set-step-status "$stale_dir" step-1 in_progress
+  jq '.lastUpdatedAt = "2026-01-01T00:00:00Z"' "$stale_dir/progress.json" >"$stale_dir/progress.next.json"
+  mv "$stale_dir/progress.next.json" "$stale_dir/progress.json"
+
+  out=$("$PLAN_UTILS" list-plans "$root")
+  printf '%s\n' "$out" | grep -q 'real-plan' || return 1
+  printf '%s\n' "$out" | grep -q 'debris-dir' || return 1
+  printf '%s\n' "$out" | grep -q 'stale-plan' || return 1
+  # real vs debris markers
+  printf '%s\n' "$out" | grep 'real-plan' | grep -Eq 'real|plan\.json' || return 1
+  printf '%s\n' "$out" | grep 'debris-dir' | grep -Eq 'debris|no plan\.json' || return 1
+  # status counts appear for real plans
+  printf '%s\n' "$out" | grep 'real-plan' | grep -q 'pending' || return 1
+  # staleness marker on old lastUpdatedAt
+  printf '%s\n' "$out" | grep 'stale-plan' | grep -qi 'stale' || return 1
+  # recent real plan is not marked stale
+  ! printf '%s\n' "$out" | grep 'real-plan' | grep -qi 'stale' || return 1
+  # lastUpdatedAt surfaces
+  printf '%s\n' "$out" | grep 'stale-plan' | grep -q '2026-01-01T00:00:00Z'
+}
+
 run_test "init-progress creates root frontier and pending steps" test_init_progress
 run_test "get-plan-dir selects the most recently updated plan" test_get_plan_dir_selects_most_recent
 run_test "read-plan and read-progress return validated files" test_read_plan_and_progress
@@ -447,6 +557,11 @@ run_test "done for codex-impl with grok-lane PASS" test_done_codex_impl_with_gro
 run_test "done for dual-mandate when both lanes PASS" test_done_dual_lanes_both_pass
 run_test "legacy no-lane record-verdict and done still green" test_legacy_no_lane_record_and_done
 run_test "done refused without PASS and no partial write" test_done_refused_without_pass_no_partial_write
+run_test "archive-plan refuses when a step is in_progress" test_archive_plan_refuses_in_progress
+run_test "archive-plan moves finished plan to archive/" test_archive_plan_success_moves_dir
+run_test "archive-plan --force overrides in_progress refusal" test_archive_plan_force_overrides_in_progress
+run_test "archive-plan refuses missing plan.json without moving" test_archive_plan_refuses_missing_plan_json
+run_test "list-plans reports real debris and stale fixtures" test_list_plans_real_debris_stale
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

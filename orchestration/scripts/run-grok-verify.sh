@@ -76,6 +76,8 @@ while (($# > 0)); do
 done
 
 [[ -n "$PLAN_ID" ]] || die_invocation "--plan-id is required"
+case "$PLAN_ID" in */* | *..*) die_invocation "--plan-id must be a plain identifier (no / or ..)" ;; esac
+case "$STEP_ID" in */* | *..*) die_invocation "--step-id must be a plain identifier (no / or ..)" ;; esac
 [[ -n "$STEP_ID" ]] || die_invocation "--step-id is required"
 [[ -n "$ROOT_DIR" ]] || die_invocation "--root-dir is required"
 [[ "$ROOT_DIR" = /* ]] || die_invocation "--root-dir must be an absolute path"
@@ -126,9 +128,25 @@ if ! command -v grok >/dev/null 2>&1; then
   die_missing_grok
 fi
 
-LOG_DIR="$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/logs"
+# Real plans keep logs beside plan.json; synthetic/out-of-band ids must not
+# mkdir plan-less debris under active/.
+if [[ -f "$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/plan.json" ]]; then
+  LOG_DIR="$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/logs"
+else
+  LOG_DIR="$ROOT_DIR/.temp/plan-mode/logs/$PLAN_ID"
+fi
 LOG_FILE="$LOG_DIR/grok-verify-$STEP_ID.log"
 mkdir -p "$LOG_DIR"
+# Recheck after mkdir: if archive-plan moved the plan between the
+# plan.json check and mkdir, drop the recreated debris dir and fall
+# back to the out-of-band location.
+if [[ "$LOG_DIR" == "$ROOT_DIR/.temp/plan-mode/active/"* && ! -f "$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID/plan.json" ]]; then
+  rmdir "$LOG_DIR" 2>/dev/null || true
+  rmdir "$ROOT_DIR/.temp/plan-mode/active/$PLAN_ID" 2>/dev/null || true
+  LOG_DIR="$ROOT_DIR/.temp/plan-mode/logs/$PLAN_ID"
+  LOG_FILE="$LOG_DIR/grok-verify-$STEP_ID.log"
+  mkdir -p "$LOG_DIR"
+fi
 
 {
   cat <<'EOF'

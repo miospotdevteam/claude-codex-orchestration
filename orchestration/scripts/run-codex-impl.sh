@@ -51,6 +51,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$plan_id" ]] || die_usage "--plan-id is required"
+case "$plan_id" in */* | *..*) die_usage "--plan-id must be a plain identifier (no / or ..)" ;; esac
+case "$step_id" in */* | *..*) die_usage "--step-id must be a plain identifier (no / or ..)" ;; esac
 [[ -n "$step_id" ]] || die_usage "--step-id is required"
 [[ -n "$root_dir" ]] || die_usage "--root-dir is required"
 [[ "$root_dir" = /* ]] || die_usage "--root-dir must be an absolute path"
@@ -61,9 +63,25 @@ parser="$script_dir/parse-contract.sh"
 [[ -x "$parser" ]] || die_usage "missing executable parser: $parser"
 
 step_block="$(cat)"
-logs_dir="$root_dir/.temp/plan-mode/active/$plan_id/logs"
+# Real plans keep logs beside plan.json; synthetic/out-of-band ids must not
+# mkdir plan-less debris under active/.
+if [[ -f "$root_dir/.temp/plan-mode/active/$plan_id/plan.json" ]]; then
+  logs_dir="$root_dir/.temp/plan-mode/active/$plan_id/logs"
+else
+  logs_dir="$root_dir/.temp/plan-mode/logs/$plan_id"
+fi
 log_file="$logs_dir/codex-impl-$step_id.log"
 mkdir -p "$logs_dir"
+# Recheck after mkdir: if archive-plan moved the plan between the
+# plan.json check and mkdir, drop the recreated debris dir and fall
+# back to the out-of-band location.
+if [[ "$logs_dir" == "$root_dir/.temp/plan-mode/active/"* && ! -f "$root_dir/.temp/plan-mode/active/$plan_id/plan.json" ]]; then
+  rmdir "$logs_dir" 2>/dev/null || true
+  rmdir "$root_dir/.temp/plan-mode/active/$plan_id" 2>/dev/null || true
+  logs_dir="$root_dir/.temp/plan-mode/logs/$plan_id"
+  log_file="$logs_dir/codex-impl-$step_id.log"
+  mkdir -p "$logs_dir"
+fi
 
 last_message_file="$(mktemp "$logs_dir/last-message.XXXXXX")"
 prompt_file="$(mktemp "$logs_dir/prompt.XXXXXX")"

@@ -44,8 +44,9 @@ break if I get this wrong?", discovery is not done.
 
 **Input**: the discovery output.
 
-**Output**: the three plan files (`plan.json`, `progress.json`,
-`masterPlan.md`) in `.temp/plan-mode/active/<planId>/`.
+**Output**: `plan.json` and `masterPlan.md` drafted in
+`.temp/plan-mode/active/<planId>/`; `progress.json` is created exactly
+once, at approval, via `init-progress` — never at draft time.
 
 **Who drafts**: the conductor, with the `writing-plans` skill. The
 skill enforces TDD-granularity steps (one component / one behavior
@@ -61,8 +62,11 @@ The **plan-mode handoff** trick is critical here: planning often
 fills the conductor's context with discovery details. To enter the
 execution phase with a clean window:
 
-1. The conductor enters plan mode (`EnterPlanMode`).
-2. Inside plan mode it writes the three plan files to disk.
+1. The plan files already exist on disk (`plan.json` + `masterPlan.md`
+   from drafting; `progress.json` from approval-time `init-progress`).
+   The conductor enters plan mode (`EnterPlanMode`).
+2. Inside plan mode it writes only a one-line scratchpad pointing at
+   the plan directory.
 3. It exits plan mode (`ExitPlanMode`).
 4. The harness compacts; the next turn starts with a small context.
 5. The `post-compact` hook re-injects the active plan path and

@@ -56,8 +56,8 @@ All reads, writes, and frontier computations go through
 - `read-plan <plan-dir>` / `read-progress <plan-dir>` — validated reads.
 - `init-progress <plan-dir>` — initialize progress.json from plan.json.
 - `start-step <plan-dir> <step-id> <executor> <model>` — atomically start a step and record its dispatch.
-- `set-step-status <plan-dir> <step-id> <status>` — atomic status update.
-- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json>` — write the verifier's result.
+- `set-step-status <plan-dir> <step-id> <status> [--degraded <reason>]` — atomic status update. The `done` transition enforces the dual-verify gate from the step's owner (codex-impl: grok-lane PASS; claude-impl/grok-impl: PASS in both lanes); `--degraded` permits a single-lane PASS when the other lane is down and appends the reason to `deviations`.
+- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json> [lane]` — write a verifier's result. Pass the lane (`codex` or `grok`) for every dual-verify verdict; it stores `verdicts.<lane>` and mirrors the authoritative lane to the top-level verdict. The no-lane form is the legacy single-verifier path only.
 - `set-frontier <plan-dir> <ids…>` / `compute-frontier <plan-dir>` — manage the runnable frontier.
 
 Mutations are atomic (tmp file + rename). If a write fails mid-run,
@@ -105,7 +105,20 @@ When a fresh context window starts (cold start or post-compaction):
 5. **Mirror progress into a TaskList.** One `TaskCreate` per step.
    Mark each task's status from `progress.steps[id].status`.
 6. **Recompute the frontier** via `compute-frontier`.
-7. **Resume execution.** Dispatch the frontier per the
+7. **Settle orphaned `in_progress` steps** — `compute-frontier` lists
+   only `pending` steps, so anything left `in_progress` by the
+   interrupted session must be settled explicitly, per its recorded
+   evidence:
+   - Every required verifier lane already has PASS in
+     `verdicts` → flip `done` (the gate re-checks).
+   - The implementation demonstrably finished (its `files[]` show the
+     change; some lane verdict exists or the diff is present) but a
+     required verify is missing → dispatch the missing verifier(s)
+     only.
+   - No evidence the implementation completed → re-dispatch the step
+     from the top via `start-step` (fresh dispatch record; the old
+     one is overwritten, which is the intended audit trail).
+8. **Resume execution.** Dispatch the frontier per the
    `codex-dispatch` skill.
 
 No source files are re-read. No discovery is re-run. No Codex output

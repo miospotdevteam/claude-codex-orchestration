@@ -15,6 +15,8 @@ Subcommands:
   record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json-array> <files-json-array> [lane]
   set-frontier <plan-dir> <space-separated-step-ids>
   compute-frontier <plan-dir>
+  archive-plan [--force] <plan-dir>
+  list-plans <project-root>
 USAGE
 }
 
@@ -230,6 +232,8 @@ cmd_start_step() {
     die "unknown step id: $step_id"
 
   now=$(utc_now)
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
   atomic_update_progress "$plan_dir" '
     .lastUpdatedAt = $now
     | .steps[$id].status = "in_progress"
@@ -268,7 +272,7 @@ parse_degraded_flag() {
   done
 }
 
-# Dual-verifier done gate. Sets gate_ok=true/false and gate_use_degraded=true/false.
+# Dual-verifier done gate. Sets gate_use_degraded=true/false or exits on refusal.
 # Reads progress.json + plan.json; does not write.
 check_done_gate() {
   local plan_dir=$1
@@ -301,18 +305,16 @@ check_done_gate() {
     any_pass=true
   fi
 
-  gate_ok=false
   gate_use_degraded=false
 
   case "$owner" in
     codex-impl)
       if [[ "$grok_pass" == true ]]; then
-        gate_ok=true
+        :
       elif [[ "$has_lane" == false && "$top_pass" == true ]]; then
         # Legacy path: no per-lane data, top-level PASS is enough.
-        gate_ok=true
+        :
       elif [[ -n "$degraded" && "$any_pass" == true ]]; then
-        gate_ok=true
         gate_use_degraded=true
       else
         die "cannot mark step '$step_id' done: codex-impl requires grok-lane PASS (or legacy top-level PASS when no lane data); got grok='${grok_v:-none}' top='${top_v:-none}'"
@@ -320,9 +322,8 @@ check_done_gate() {
       ;;
     claude-impl | grok-impl)
       if [[ "$codex_pass" == true && "$grok_pass" == true ]]; then
-        gate_ok=true
+        :
       elif [[ -n "$degraded" && "$any_pass" == true ]]; then
-        gate_ok=true
         gate_use_degraded=true
       else
         die "cannot mark step '$step_id' done: $owner requires PASS in both verdicts.codex and verdicts.grok (or --degraded <reason> with a single-lane PASS); got codex='${codex_v:-none}' grok='${grok_v:-none}'"
@@ -330,7 +331,7 @@ check_done_gate() {
       ;;
     *)
       # manual / unknown: no dual mandate
-      gate_ok=true
+      :
       ;;
   esac
 }
@@ -357,6 +358,8 @@ cmd_set_step_status() {
   if [[ "$status" == "done" ]]; then
     check_done_gate "$plan_dir" "$step_id" "$degraded_reason"
     if [[ "$gate_use_degraded" == true ]]; then
+      # The single-quoted argument is jq code; its $variables must reach jq literally.
+      # shellcheck disable=SC2016
       atomic_update_progress "$plan_dir" '
         .lastUpdatedAt = $now
         | .steps[$id].status = "done"
@@ -367,6 +370,8 @@ cmd_set_step_status() {
     fi
   fi
 
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
   atomic_update_progress "$plan_dir" '
     .lastUpdatedAt = $now
     | .steps[$id].status = $status
@@ -410,6 +415,8 @@ cmd_record_verdict() {
 
   if [[ -z "$lane" ]]; then
     # Legacy path: top-level fields only.
+    # The single-quoted argument is jq code; its $variables must reach jq literally.
+    # shellcheck disable=SC2016
     atomic_update_progress "$plan_dir" '
       .lastUpdatedAt = $now
       | .steps[$id].verdict = $verdict
@@ -435,6 +442,8 @@ cmd_record_verdict() {
   fi
 
   if [[ "$mirror" == true ]]; then
+    # The single-quoted argument is jq code; its $variables must reach jq literally.
+    # shellcheck disable=SC2016
     atomic_update_progress "$plan_dir" '
       .lastUpdatedAt = $now
       | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
@@ -459,6 +468,8 @@ cmd_record_verdict() {
       --argjson files "$files_json" \
       --arg now "$now"
   else
+    # The single-quoted argument is jq code; its $variables must reach jq literally.
+    # shellcheck disable=SC2016
     atomic_update_progress "$plan_dir" '
       .lastUpdatedAt = $now
       | .steps[$id].verdicts = ((.steps[$id].verdicts // {}) + {
@@ -491,6 +502,8 @@ cmd_set_frontier() {
 
   frontier_json=$(printf '%s\n' "$@" | tr ' ' '\n' | awk 'NF > 0' | jq -R . | jq -s .)
   now=$(utc_now)
+  # The single-quoted argument is jq code; its $variables must reach jq literally.
+  # shellcheck disable=SC2016
   atomic_update_progress "$plan_dir" '
     .lastUpdatedAt = $now
     | .currentFrontier = $frontier
@@ -514,6 +527,125 @@ cmd_compute_frontier() {
   ' "$plan_dir/plan.json"
 }
 
+# Parse ISO-8601 Z timestamps to epoch seconds (BSD date then GNU date).
+iso_to_epoch() {
+  local ts=$1
+  local epoch
+  if epoch=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ts" '+%s' 2>/dev/null); then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  if epoch=$(date -u -d "$ts" '+%s' 2>/dev/null); then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+# True when lastUpdatedAt is older than 7 days.
+is_stale_timestamp() {
+  local ts=$1
+  local epoch now age
+  [[ -n "$ts" ]] || return 1
+  epoch=$(iso_to_epoch "$ts") || return 1
+  now=$(date -u '+%s')
+  age=$((now - epoch))
+  [[ "$age" -gt $((7 * 24 * 60 * 60)) ]]
+}
+
+cmd_archive_plan() {
+  local force=false
+  if [[ $# -gt 0 && "$1" == "--force" ]]; then
+    force=true
+    shift
+  fi
+  if [[ $# -gt 0 && "${!#}" == "--force" ]]; then
+    force=true
+    set -- "${@:1:$(($# - 1))}"
+  fi
+  [[ $# -eq 1 ]] || die "archive-plan requires [--force] <plan-dir>"
+
+  local plan_dir plan_file progress_file name parent archive_root dest in_progress_count
+  plan_dir=$(abs_dir "$1")
+  plan_file="$plan_dir/plan.json"
+  progress_file="$plan_dir/progress.json"
+  [[ -f "$plan_file" ]] || die "missing plan.json in $plan_dir; refusing to archive debris"
+
+  if [[ -f "$progress_file" ]]; then
+    in_progress_count=$(jq -r '
+      [(.steps // {}) | to_entries[] | select(.value.status == "in_progress")] | length
+    ' "$progress_file" 2>/dev/null || printf '0')
+    if [[ "$in_progress_count" -gt 0 && "$force" != true ]]; then
+      die "refusing to archive: $in_progress_count step(s) in_progress (pass --force to override)"
+    fi
+  fi
+
+  name=$(basename "$plan_dir")
+  parent=$(dirname "$plan_dir")
+  # Scope guard: only immediate children of .temp/plan-mode/active are
+  # archivable — never an arbitrary directory that happens to contain a
+  # plan.json.
+  case "$parent" in
+    */.temp/plan-mode/active) ;;
+    *) die "refusing to archive: $plan_dir is not an immediate child of .temp/plan-mode/active" ;;
+  esac
+  archive_root="$(dirname "$parent")/archive"
+  dest="$archive_root/$name"
+
+  [[ ! -e "$dest" ]] || die "archive destination already exists: $dest"
+
+  mkdir -p "$archive_root"
+  mv "$plan_dir" "$dest"
+  abs_dir "$dest"
+}
+
+cmd_list_plans() {
+  [[ $# -eq 1 ]] || die "list-plans requires <project-root>"
+
+  local project_root active_dir
+  project_root=$(abs_dir "$1")
+  active_dir="$project_root/.temp/plan-mode/active"
+  [[ -d "$active_dir" ]] || return 0
+
+  local plan_dir name kind last_updated counts stale_marker
+  # Sort by basename for stable output.
+  while IFS= read -r plan_dir; do
+    [[ -n "$plan_dir" ]] || continue
+    name=$(basename "$plan_dir")
+    last_updated="-"
+    counts="-"
+    stale_marker=""
+    if [[ -f "$plan_dir/plan.json" ]]; then
+      kind="real"
+      if [[ -f "$plan_dir/progress.json" ]]; then
+        last_updated=$(jq -r '.lastUpdatedAt // "-"' "$plan_dir/progress.json" 2>/dev/null || printf '-')
+        counts=$(jq -r '
+          .steps // {}
+          | {
+              done: ([to_entries[] | select(.value.status == "done")] | length),
+              in_progress: ([to_entries[] | select(.value.status == "in_progress")] | length),
+              pending: ([to_entries[] | select(.value.status == "pending")] | length),
+              blocked: ([to_entries[] | select(.value.status == "blocked")] | length),
+              skipped: ([to_entries[] | select(.value.status == "skipped")] | length)
+            }
+          | "done=\(.done) in_progress=\(.in_progress) pending=\(.pending) blocked=\(.blocked) skipped=\(.skipped)"
+        ' "$plan_dir/progress.json" 2>/dev/null || printf '-')
+        if [[ "$last_updated" != "-" ]] && is_stale_timestamp "$last_updated"; then
+          stale_marker="STALE"
+        fi
+      fi
+    else
+      kind="debris"
+    fi
+
+    if [[ -n "$stale_marker" ]]; then
+      printf '%s  %s  lastUpdatedAt=%s  %s  %s\n' "$name" "$kind" "$last_updated" "$counts" "$stale_marker"
+    else
+      printf '%s  %s  lastUpdatedAt=%s  %s\n' "$name" "$kind" "$last_updated" "$counts"
+    fi
+  done < <(find "$active_dir" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+}
+
 main() {
   need_jq
   [[ $# -ge 1 ]] || {
@@ -533,6 +665,8 @@ main() {
     record-verdict) cmd_record_verdict "$@" ;;
     set-frontier) cmd_set_frontier "$@" ;;
     compute-frontier) cmd_compute_frontier "$@" ;;
+    archive-plan) cmd_archive_plan "$@" ;;
+    list-plans) cmd_list_plans "$@" ;;
     -h | --help | help)
       usage
       ;;

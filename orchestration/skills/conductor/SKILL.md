@@ -94,8 +94,11 @@ follow-up step.** The loop is: dispatch → verify → if not PASS, fix
 Concretely:
 
 - **FINDINGS verdict** → dispatch a fix-up sub-agent (at the scorecard
-  tier, per the rule below), then re-dispatch `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` on the same
-  step. Do not record the step as `done` with FINDINGS.
+  tier, per the rule below), then re-dispatch **every verifier the
+  step's owner requires** (per the dual-verify hard rule above: the
+  Grok wrapper alone for `codex-impl`; both wrappers for `claude-impl`
+  / `grok-impl`) on the same step. Do not record the step as `done`
+  with FINDINGS.
 - **FAIL verdict** → same loop. The findings array is the spec for
   the fix-up sub-agent.
 - **Surface progress to the user between iterations** (one-sentence
@@ -459,7 +462,7 @@ The conductor invokes other skills as the situation demands:
 | New behavior in a tested project | `test-driven-development` |
 | Reported bug, failed test, FAIL verdict | `systematic-debugging` |
 | Cold start / post-compaction resume | `persistent-plans` |
-| Start or launch Mini work; continue or resume Mini work; inspect or check whether it needs input; control, steer, or send instructions to Mini; reclaim or take over Mini work | `remote-agent-host` |
+| Start or launch Mini work; continue or resume Mini work; inspect or check whether it needs input; wait for or monitor a Mini agent; reveal or show its Mini Terminal; control, steer, interrupt, kill, or send instructions to Mini; reclaim or take over Mini work | `remote-agent-host` |
 | Every code edit, full stop | `engineering-discipline` (always) |
 
 `engineering-discipline` is the floor under everything. It is
@@ -467,9 +470,10 @@ invoked alongside whichever workflow skill fires.
 
 The `remote-agent-host` route is an intent route, not a plan-step owner or an
 external wrapper lane. When a user asks to start, continue, inspect for input,
-control, or reclaim a supported Mini session, invoke that skill and let it own
-the guarded helper interaction and safety checks. The conductor consumes only
-its bounded captured-state report; it never improvises SSH or rsync commands.
+wait for or monitor a Mini agent, reveal or show its Mini Terminal, control,
+interrupt, kill, or reclaim a supported Mini session, invoke that skill and let it own the guarded
+helper interaction and safety checks. The conductor consumes only its bounded
+captured-state report; it never improvises SSH or rsync commands.
 
 ## Resumption
 
@@ -496,6 +500,7 @@ re-fetched. The plan files contain everything.
 | Codex (via wrappers) | One parsed JSON: `{summary, verdict, findings, filesTouched}` |
 | Grok (via wrappers) | One parsed JSON: `{summary, verdict, findings, filesTouched}` |
 | Hook (`session-start` / `post-compact`) | Short markdown notice (≤ 12 lines) |
+| Mini lifecycle wait | Labels-only envelope `{epoch, cursor, session, wake, scope?, kind?}` followed by one bounded `inspect` capture (≤ 40 lines or 4 KiB) |
 
 Anything outside these shapes is a bug. Re-dispatch with a tighter
 prompt rather than reading over-large content.

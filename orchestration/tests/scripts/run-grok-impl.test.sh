@@ -233,7 +233,8 @@ run_with_mock() {
   fi
 
   if [[ -n "$expected_log_text" ]]; then
-    local log_file="$root_dir/.temp/plan-mode/active/grok-wrapper-tests/logs/grok-impl-step-06-wrapper-tests.log"
+    # Synthetic plan ids land under plan-mode/logs/ (not active/) so they leave no debris.
+    local log_file="$root_dir/.temp/plan-mode/logs/grok-wrapper-tests/grok-impl-step-06-wrapper-tests.log"
     if ! assert_file_contains "$log_file" "$expected_log_text"; then
       fail "$name" "raw stdout was not preserved in log: $log_file"
       return
@@ -525,6 +526,67 @@ EOF
   pass "$name"
 }
 
+test_logs_real_plan_vs_synthetic() {
+  local name="logs: real plan uses active/<id>/logs; synthetic uses plan-mode/logs/<id>"
+  local case_dir="$TMP_DIR/log-destinations"
+  local root_real="$case_dir/real-root"
+  local root_synth="$case_dir/synth-root"
+  local bin_dir="$case_dir/bin"
+  local plan_id="grok-wrapper-tests"
+  local step_id="step-06-wrapper-tests"
+  local real_log="$root_real/.temp/plan-mode/active/$plan_id/logs/grok-impl-$step_id.log"
+  local synth_log="$root_synth/.temp/plan-mode/logs/$plan_id/grok-impl-$step_id.log"
+  local status
+
+  mkdir -p "$root_real/.temp/plan-mode/active/$plan_id" "$root_synth" "$bin_dir"
+  printf '{"planId":"%s"}\n' "$plan_id" >"$root_real/.temp/plan-mode/active/$plan_id/plan.json"
+  write_mock_grok "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    GROK_MOCK_MODE="pass" \
+    GROK_MOCK_ARGV="$case_dir/real-argv.txt" \
+    GROK_MOCK_PROMPT="$case_dir/real-prompt.txt" \
+    invoke_impl "$root_real" >"$case_dir/real-stdout.txt" 2>"$case_dir/real-stderr.txt"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    fail "$name" "real-plan invoke exit $status; stderr=$(<"$case_dir/real-stderr.txt")"
+    return
+  fi
+  if [[ ! -f "$real_log" ]]; then
+    fail "$name" "expected real-plan log at $real_log"
+    return
+  fi
+  if [[ -e "$root_real/.temp/plan-mode/logs" ]]; then
+    fail "$name" "real plan should not write under plan-mode/logs/"
+    return
+  fi
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    GROK_MOCK_MODE="pass" \
+    GROK_MOCK_ARGV="$case_dir/synth-argv.txt" \
+    GROK_MOCK_PROMPT="$case_dir/synth-prompt.txt" \
+    invoke_impl "$root_synth" >"$case_dir/synth-stdout.txt" 2>"$case_dir/synth-stderr.txt"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    fail "$name" "synthetic invoke exit $status; stderr=$(<"$case_dir/synth-stderr.txt")"
+    return
+  fi
+  if [[ ! -f "$synth_log" ]]; then
+    fail "$name" "expected synthetic log at $synth_log"
+    return
+  fi
+  if [[ -e "$root_synth/.temp/plan-mode/active" ]]; then
+    fail "$name" "synthetic id must not create active/ debris"
+    return
+  fi
+
+  pass "$name"
+}
+
 test_happy_path
 test_nonzero_exits_2
 test_argv_and_prompt_assertions
@@ -538,6 +600,7 @@ test_stderr_noise_exits_0
 test_max_turns_cap
 test_relative_root_dir_exits_1
 test_validation_precedence_exits_1
+test_logs_real_plan_vs_synthetic
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

@@ -97,8 +97,9 @@ disk and the resumption protocol.
 
 ## 4. `writing-plans`
 
-**One-line**: Draft `plan.json`, `progress.json`, and `masterPlan.md`
-from a completed discovery, then drive the Orbit review.
+**One-line**: Draft `plan.json` and `masterPlan.md` from a completed
+discovery, drive the Orbit review, then initialize `progress.json`
+exactly once at approval via `init-progress`.
 
 **Triggers**
 - Discovery is complete and the user wants to commit to a plan.
@@ -302,38 +303,67 @@ auto-discovers them by scanning `skills/<name>/SKILL.md` — no list in
 | `react-native-mobile` | Premium native-feeling React Native mobile apps; dual-installable (Claude for UI/UX, Codex for code-heavy) | Conditional — see RN-mobile Routing Directive in `docs/09-routing-matrix.md` |
 | `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Codex-default with Claude design for test plans |
 | `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Claude-only (meta) |
-| `remote-agent-host` | Guarded natural-language start, inspect, control, and reclaim lifecycle for supported Mac Mini sessions | Claude-only (host orchestration) |
+| `remote-agent-host` | Guarded natural-language start, continue, wait, inspect, reveal, interrupt, kill, and reclaim lifecycle for supported Mac Mini sessions | Claude-only (host orchestration) |
 
 ### `remote-agent-host` lifecycle contract
 
-This skill triggers only when the user asks to start, continue, inspect,
-control, stop, or reclaim work on the configured Mini. It does not trigger for
-ordinary local execution, arbitrary remote administration, or unsupported
-projects and hosts. Its sole executable boundary is:
+This skill triggers only when the user asks to start, continue, wait for,
+inspect, reveal, control, interrupt, kill, or reclaim work on the configured
+Mini. It does not trigger for ordinary local execution, arbitrary remote
+administration, or unsupported projects and hosts. Its sole executable
+boundary is:
 
 ```text
 ${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
 ```
 
 The closed command set is `status`, `start`, `inspect`, `continue`, `send`,
-`interrupt`, `kill`, and `reclaim`; projects are exactly `miospot` and
-`orchestration`; harnesses are exactly `claude`, `codex`, and `grok`. The skill
-uses only `--host`, `--prompt-file`, `--active-plan`, `--include-ignored`, and
-`--approve-ignored` options. It maps natural language to that interface,
+`interrupt`, `kill`, `wait`, `reveal`, and `reclaim`; projects are exactly
+`miospot` and `orchestration`; harnesses are exactly `claude`, `codex`, and
+`grok`. The skill uses only `--host`, `--prompt-file`, `--active-plan`,
+`--include-ignored`, `--approve-ignored`, `--cursor`, and `--timeout`. It maps
+natural language to that interface. `PROJECT` also selects the local checkout
+independently of caller cwd: `LOCAL_MIOSPOT_ROOT` or `$HOME/Projects/miospot`,
+and `LOCAL_ORCHESTRATION_ROOT` or `$HOME/Projects/orchestration`. It
 defaults the harness to Claude only
 when no family was named, puts prompts in private temporary files, and reports
 a bounded `inspect` capture before every input. A launch is therefore
-`status` → promptless `start` → `inspect` and report → `send`, even though the
-lower-level helper permits an optional prompt on `start`.
+`status` → promptless `start` and retain `bootstrapCursor` → `inspect` and
+report → `send`, even though the lower-level helper permits an optional prompt
+on `start`.
+
+Wait is `${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh wait PROJECT HARNESS
+--cursor EPOCH:NUMBER --timeout SECONDS`, with a retained monotonic cursor and
+a 1–300 second bound. It is one blocking call, followed by one bounded
+`inspect`, never repeated inspection or screenshot polling. `reveal` opens
+Terminal on the exact existing `remote-agent--PROJECT--HARNESS` session and
+does not send input, replace its pane, synchronize files, or alter ownership.
+The first wait uses the bounded labels-only top-level `bootstrapCursor`
+returned by a successful `start`, or `supervisor.bootstrapCursor` from the one
+nested JSON object returned by a running `status`; later waits retain the most
+recent returned epoch and cursor, including across supervisor restarts.
+
+Claude `Stop`, `SubagentStop`, and `StopFailure` map respectively to main
+completed, subagent completed, and main failed; the scopes stay distinct. Only
+`permission_prompt`, `idle_prompt`, and `elicitation_dialog` are accepted as
+input-needed notifications. Tmux exit and timeout are separate wake results.
+No event, exit, or timeout proves the writer lease is quiescent; only guarded
+kill/reclaim protocol checks do. Event records contain closed labels only, in
+private state; prompt, transcript, model, environment, and terminal text are
+never queued. Codex and Grok normally produce only exit/timeout wakes because
+the lifecycle observers are Claude plugin hooks.
 
 Ownership is a lease, not continuous synchronization. `start` accepts equal
 or local-only state and makes the Mini the single writer. `inspect`,
 `continue`, `send`, `interrupt`, and `kill` do not synchronize project files;
 even a quiescent `kill` does not reclaim them or release the lease. Safe
 reclaim checks `status` and `inspect`, obtains termination permission when
-needed, kills and verifies quiescence, requires remote-only state, then pulls
-through private verified staging and releases ownership last. Stale writers
-require explicit administration and are never broken by reclaim.
+needed, and kills and verifies quiescence. Remote-only state then pulls through
+private verified staging and releases ownership last; equal+quiescent state is
+post-verified and released with zero content transfer. Every writer record is
+treated as live/active until an explicit safe protocol transition clears it;
+quiescent reclaim is that transition, and PID or heartbeat state never creates
+an inferred stale class.
 
 The normal transfer universe is tracked and ordinary untracked regular files.
 Ignored content requires exact per-path consent and identical literal values
@@ -345,11 +375,14 @@ Destination apply uses a private restore journal: verified restore leaves
 ownership unchanged; failed restore retains authoritative recovery evidence
 and the mutex. The local state mirror is diagnostic only. The helper assumes
 the Mini protocol, launchers, worktrees, authentication, and transport are
-already provisioned; it promises no backend bootstrap, implicit secret copy,
+already provisioned. The supervisor launches the installed subscription TUI
+for Claude, Codex, or Grok, which must already be authenticated interactively
+on the Mini; it promises no backend bootstrap, implicit secret copy,
 continuous sync, chat persistence, or reboot survival. A human may attach on
-the Mini to `remote-agent--PROJECT--HARNESS`, but attachment neither changes
-ownership nor substitutes for reclaim; the skill itself never improvises raw
-tmux or transport commands.
+the Mini only through the guarded `reveal` intent; visibility neither changes
+ownership nor substitutes for reclaim. The skill never improvises raw tmux or
+transport commands, never edits user Claude settings, and uses Computer Use
+only for exceptional explicit interaction after a wake—not as a polling loop.
 
 ### Codex-side skill bodies (`codex-skills/`)
 

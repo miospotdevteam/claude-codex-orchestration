@@ -20,8 +20,7 @@ resolve_project_root() {
   fi
 
   if [[ -n "$payload" ]] && command -v jq >/dev/null 2>&1; then
-    cwd_from_stdin=$(printf '%s' "$payload" | jq -er '.cwd // empty' 2>/dev/null)
-    if [[ $? -eq 0 && -n "$cwd_from_stdin" ]]; then
+    if cwd_from_stdin=$(printf '%s' "$payload" | jq -er '.cwd // empty' 2>/dev/null) && [[ -n "$cwd_from_stdin" ]]; then
       printf '%s\n' "$cwd_from_stdin"
       return 0
     fi
@@ -38,6 +37,31 @@ resolve_project_root() {
 fallback_and_exit() {
   emit_no_plan
   exit 0
+}
+
+# Parse ISO-8601 Z timestamps to epoch seconds (BSD date then GNU date).
+iso_to_epoch() {
+  local ts=$1
+  local epoch
+  if epoch=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ts" '+%s' 2>/dev/null); then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  if epoch=$(date -u -d "$ts" '+%s' 2>/dev/null); then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+is_stale_timestamp() {
+  local ts=$1
+  local epoch now age
+  [[ -n "$ts" ]] || return 1
+  epoch=$(iso_to_epoch "$ts") || return 1
+  now=$(date -u '+%s')
+  age=$((now - epoch))
+  [[ "$age" -gt $((7 * 24 * 60 * 60)) ]]
 }
 
 project_root=$(resolve_project_root)
@@ -63,43 +87,119 @@ if [[ ${#plan_dirs[@]} -eq 0 ]]; then
   fallback_and_exit
 fi
 
+# Partition active/ entries into real plans (have plan.json) vs debris.
+debris_names=()
+real_dirs=()
 tab=$(printf '\t')
 records=""
 for plan_dir in "${plan_dirs[@]}"; do
+  name=$(basename "$plan_dir")
+  if [[ ! -f "$plan_dir/plan.json" ]]; then
+    debris_names+=("$name")
+    continue
+  fi
+
   progress_file="$plan_dir/progress.json"
   if [[ ! -f "$progress_file" ]]; then
-    fallback_and_exit
+    # plan.json without progress is still a real plan for selection skip —
+    # treat as non-selectable but not debris (has plan.json).
+    real_dirs+=("$plan_dir")
+    continue
   fi
 
-  updated=$(jq -er '.lastUpdatedAt // ""' "$progress_file" 2>/dev/null)
-  if [[ $? -ne 0 ]]; then
-    fallback_and_exit
+  if ! updated=$(jq -er '.lastUpdatedAt // ""' "$progress_file" 2>/dev/null); then
+    real_dirs+=("$plan_dir")
+    continue
   fi
 
-  name=$(basename "$plan_dir")
+  real_dirs+=("$plan_dir")
   records="${records}${updated}${tab}${name}${tab}${plan_dir}"$'\n'
 done
 
+# Hygiene scanners over all real plans (not only the selected one).
+done_plan_names=()
+stale_in_progress_names=()
+for plan_dir in "${real_dirs[@]}"; do
+  name=$(basename "$plan_dir")
+  progress_file="$plan_dir/progress.json"
+  [[ -f "$progress_file" ]] || continue
+  jq -e . "$progress_file" >/dev/null 2>&1 || continue
+
+  # Fully-done: every step status is done (and at least one step exists).
+  if jq -e '
+    (.steps // {}) as $s
+    | ($s | length) > 0
+    and all($s[]; .status == "done")
+  ' "$progress_file" >/dev/null 2>&1; then
+    done_plan_names+=("$name")
+  fi
+
+  # Stale in_progress: any in_progress step and lastUpdatedAt older than 7 days.
+  if jq -e '
+    ([(.steps // {}) | to_entries[] | select(.value.status == "in_progress")] | length) > 0
+  ' "$progress_file" >/dev/null 2>&1; then
+    updated=$(jq -er '.lastUpdatedAt // empty' "$progress_file" 2>/dev/null)
+    if [[ -n "$updated" ]] && is_stale_timestamp "$updated"; then
+      stale_in_progress_names+=("$name")
+    fi
+  fi
+done
+
+# One combined hygiene line keeps the worst-case notice within the
+# ≤12-line bound even when every flag fires alongside the multi-plan
+# warning (a 13-line overflow was observed with per-flag lines).
+emit_hygiene_lines() {
+  local parts="" joined
+  if [[ ${#debris_names[@]} -gt 0 ]]; then
+    joined=$(printf '`%s`, ' "${debris_names[@]}")
+    parts+="debris (no plan.json): ${joined%, }; "
+  fi
+  if [[ ${#done_plan_names[@]} -gt 0 ]]; then
+    joined=$(printf '`%s`, ' "${done_plan_names[@]}")
+    parts+="fully done, run \`archive-plan\`: ${joined%, }; "
+  fi
+  if [[ ${#stale_in_progress_names[@]} -gt 0 ]]; then
+    joined=$(printf '`%s`, ' "${stale_in_progress_names[@]}")
+    parts+="stale in_progress (>7d): ${joined%, }; "
+  fi
+  if [[ -n "$parts" ]]; then
+    printf -- '- Hygiene: %s\n' "${parts%; }"
+  fi
+}
+
+if [[ -z "$records" ]]; then
+  # No selectable real plan with progress — emit no-plan notice plus any hygiene.
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
+fi
+
 selected_dir=$(printf '%s' "$records" | sort -t "$tab" -k1,1r -k2,2 | awk -F "$tab" 'NR == 1 { print $3 }')
 if [[ -z "$selected_dir" ]]; then
-  fallback_and_exit
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
 fi
 
 selected_name=$(basename "$selected_dir")
 selected_plan="$selected_dir/plan.json"
 selected_progress="$selected_dir/progress.json"
 if [[ ! -f "$selected_plan" || ! -f "$selected_progress" ]]; then
-  fallback_and_exit
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
 fi
 
-jq -e . "$selected_plan" >/dev/null 2>&1
-if [[ $? -ne 0 ]]; then
-  fallback_and_exit
+if ! jq -e . "$selected_plan" >/dev/null 2>&1; then
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
 fi
 
-jq -e . "$selected_progress" >/dev/null 2>&1
-if [[ $? -ne 0 ]]; then
-  fallback_and_exit
+if ! jq -e . "$selected_progress" >/dev/null 2>&1; then
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
 fi
 
 rel_path=".temp/plan-mode/active/${selected_name}/"
@@ -148,14 +248,17 @@ notice=$(
 )
 
 if [[ $? -ne 0 || -z "$notice" ]]; then
-  fallback_and_exit
+  emit_no_plan
+  emit_hygiene_lines
+  exit 0
 fi
 
 printf '%s\n' "$notice"
 
-if [[ ${#plan_dirs[@]} -gt 1 ]]; then
+# Multi-plan warning (other real plans only).
+if [[ ${#real_dirs[@]} -gt 1 ]]; then
   other_ids=""
-  for plan_dir in "${plan_dirs[@]}"; do
+  for plan_dir in "${real_dirs[@]}"; do
     if [[ "$plan_dir" == "$selected_dir" ]]; then
       continue
     fi
@@ -175,5 +278,7 @@ if [[ ${#plan_dirs[@]} -gt 1 ]]; then
     printf 'Warning: other active plans exist and were not selected: %s.\n' "$other_ids"
   fi
 fi
+
+emit_hygiene_lines
 
 exit 0

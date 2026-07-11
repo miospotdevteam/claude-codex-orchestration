@@ -265,31 +265,37 @@ inlining is easier:
     --root-dir "$ROOT_DIR"
 ```
 
-### After the call — write the verdict back
+### After the call — write the verdict back, per lane
 
-Always go through `plan-utils.sh`. Atomic writes; no jq one-offs:
+Always go through `plan-utils.sh`. Atomic writes; no jq one-offs.
+Every verify verdict is recorded WITH its lane (`codex` or `grok`) so
+the dual-verify gate has per-lane records to check:
 
 ```bash
+# One record-verdict call per verifier that ran, each with its lane:
 "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
   "$PLAN_DIR" "$STEP_ID" \
-  "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON"
+  "$CODEX_VERDICT" "$CODEX_SUMMARY" "$CODEX_FINDINGS_JSON" "$CODEX_FILES_JSON" codex
+"${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
+  "$PLAN_DIR" "$STEP_ID" \
+  "$GROK_VERDICT" "$GROK_SUMMARY" "$GROK_FINDINGS_JSON" "$GROK_FILES_JSON" grok
 
-# Then flip status — only PASS marks the step done. FINDINGS and FAIL
-# both keep the step in_progress and trigger a fix + re-verify pass
-# (the conductor's "always fix findings and re-verify" hard rule); the
-# step reaches done only on a subsequent PASS. Pause the loop only
-# after three non-converging iterations or a genuine design question.
-case "$VERDICT" in
-  PASS)
-    "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
-      set-step-status "$PLAN_DIR" "$STEP_ID" done ;;
-  FINDINGS|FAIL)
-    # Step is already in_progress from its dispatch-time start-step, so
-    # no status write is needed here. Re-dispatch the fix-up through
-    # start-step (recording the fix's executor+model in a fresh dispatch
-    # object) — never a bare set-step-status flip. See persistent-plans.
-    : ;;
-esac
+# Then flip status — the done gate enforces the dual mandate from
+# plan.json's owner (codex-impl needs the grok lane's PASS; claude-impl
+# and grok-impl need PASS in BOTH lanes), so attempt done only when
+# every required verifier has returned PASS. FINDINGS or FAIL from
+# EITHER lane keeps the step in_progress and triggers fix + re-verify
+# of both verifiers (the conductor's hard rule); pause only after
+# three non-converging iterations or a genuine design question.
+if [[ "$ALL_REQUIRED_VERDICTS_PASS" == true ]]; then
+  "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
+    set-step-status "$PLAN_DIR" "$STEP_ID" done
+  # Degraded single-lane completion (one lane down, deviation recorded):
+  #   set-step-status "$PLAN_DIR" "$STEP_ID" done --degraded "<reason>"
+fi
+# On FINDINGS/FAIL: the step is already in_progress from its
+# dispatch-time start-step; re-dispatch the fix-up through start-step
+# (fresh dispatch record) — never a bare set-step-status flip.
 ```
 
 After every status change, recompute the frontier with
@@ -425,6 +431,14 @@ Codex verdict handling:
   call would produce edits where the conductor expected a read-only
   check. The script identity prevents this from being possible if the
   wrappers are chosen by `step.owner`, not by prompt content.
+- **Self-editing wrapper** — a dispatch whose `files[]` include the
+  wrapper scripts themselves will edit the script the running bash
+  process is still reading, and bash re-reads shifted bytes
+  mid-execution (observed twice, 2026-07-10/11: a stray `ot: command
+  not found` from a half-shifted word). Before such a dispatch, copy
+  the wrapper AND `parse-contract.sh` to a scratch directory and
+  invoke the snapshot copy; the executor edits the repo originals
+  safely.
 - **Skipped file-overlap guard** — two parallel steps both edit
   `src/auth/session.ts`. The second commit silently overwrites the
   first. Always check overlap before parallelizing.

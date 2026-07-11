@@ -258,10 +258,12 @@ the direction.
 - **Wrapper exits `2` (`codex` itself exited non-zero)** → conductor
   surfaces the failure and the merged log path; step becomes
   `blocked`.
-- **Codex returns FAIL** → conductor surfaces findings; does not
-  auto-retry.
-- **Codex returns FINDINGS** → step is `done` with the findings
-  recorded; conductor surfaces them.
+- **Codex returns FAIL or FINDINGS** → the conductor fixes the
+  findings and re-runs every verifier the step's owner requires,
+  looping until PASS (see the fix-and-re-verify policy in
+  `04-execution-loop.md`). Neither verdict marks a step `done`; the
+  conductor pauses only after three non-converging iterations or when
+  a finding raises a genuine design question.
 - **Codex edits files during verify** → bug. Conductor reports and
   refuses the verdict.
 
