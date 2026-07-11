@@ -28,15 +28,19 @@ receipts and signatures.
 - Eight discipline skills (`engineering-discipline`, `persistent-plans`,
   `writing-plans`, `codex-dispatch`, `refactoring`,
   `test-driven-development`, `systematic-debugging`, `brainstorming`).
-- Eight auxiliary craft skills the orchestrator routes to
+- Nine auxiliary skills the orchestrator routes to
   (`doc-coauthoring`, `frontend-design`, `svg-art`, `immersive-frontend`,
   `mcp-builder`, `react-native-mobile`, `webapp-testing`,
-  `skill-review-standard`), auto-discovered from `skills/<name>/SKILL.md`.
+  `skill-review-standard`, `remote-agent-host`), auto-discovered from
+  `skills/<name>/SKILL.md`.
 - Exactly two hooks, both read-only: `session-start` and `post-compact`.
 - Direction-locked Codex wrappers (`run-codex-impl.sh`, `run-codex-verify.sh`)
   with a fixed Summary / Verdict / Findings prompt contract.
 - A parallel Grok lane (`run-grok-impl.sh`, `run-grok-verify.sh`) sharing
   the same direction-locked contract; see `docs/10-grok-integration.md`.
+- Seven plugin-root scripts total: those four wrappers plus
+  `plan-utils.sh`, `parse-contract.sh`, and the guarded `remote-agent.sh` Mini
+  handoff helper.
 - JSON Schemas for `plan.json` and `progress.json`, plus a `masterPlan.md`
   template.
 
@@ -59,10 +63,10 @@ claude-codex-orchestration/      ← repo root = marketplace root
 ├── orchestration/               ← plugin root (marketplace source: "./orchestration")
 │   ├── .claude-plugin/
 │   │   └── plugin.json          ← minimal plugin manifest (name, description)
-│   ├── skills/                  ← 9 core + 8 auxiliary skills
+│   ├── skills/                  ← 9 core + 9 auxiliary skills
 │   ├── codex-skills/            ← Codex-side bodies for dual-install skills
 │   ├── hooks/                   ← hooks.json + two read-only handler scripts
-│   ├── scripts/                 ← codex/grok wrappers + plan/contract helpers
+│   ├── scripts/                 ← four wrappers + plan/contract/remote helpers
 │   ├── schemas/                 ← JSON schemas for plan + progress files
 │   ├── templates/               ← starter templates (e.g. masterPlan)
 │   └── tests/                   ← hook + script tests
@@ -87,6 +91,17 @@ Prerequisites:
   orbit-mcp` (or follow Orbit's own install docs).
 - `jq` on `PATH` — used by the plan helpers, the contract parser, and
   the hooks.
+
+The optional Mac Mini handoff additionally requires local `git`, `ssh`,
+`rsync`, and a SHA-256 implementation, plus an already provisioned Mini.
+Run it from the requested project's local Git worktree on an attached branch.
+The Mini must already expose the `remote-agent-v1` protocol, the
+`agent-supervisor` launcher for Claude/Grok, the `mini-agent` launcher for
+Codex, and real worktrees at the configured project roots. Configure its SSH
+host with `--host`, `REMOTE_AGENT_HOST`, or the single-line
+`${XDG_STATE_HOME:-$HOME/.local/state}/orchestration-remote-host` file. The
+helper neither installs this backend nor copies SSH keys, API keys, shell
+profiles, harness authentication, or other secrets.
 
 ### One-liner install (recommended)
 
@@ -161,21 +176,95 @@ For trivial work — a typo, a one-line config tweak — say "just do it"
 and the conductor skips the plan. The discipline is gentle on
 purpose.
 
+### Mac Mini handoff
+
+The `remote-agent-host` skill turns natural-language requests into the guarded
+`${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh` interface. Its exact CLI is:
+
+```text
+remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
+commands: status, start, inspect, continue, send, interrupt, kill, reclaim
+projects: miospot, orchestration
+harnesses: claude, codex, grok
+options: --prompt-file FILE --active-plan NAME
+         --include-ignored PATH --approve-ignored PATH
+```
+
+Ask naturally: “start Claude on the Mini for orchestration”, “check what the
+Mini Codex session needs”, “continue the Mini Grok session with these
+instructions”, “interrupt the Mini agent”, or “reclaim the Mini work locally”.
+The project must be exactly `miospot` or `orchestration`; the harness defaults
+to `claude` only when no family was named. Prompts go through a private file,
+never command-line text. For a new session the skill runs `status`, starts
+without a prompt, inspects and reports a bounded capture, then sends the first
+prompt. Before any later input it also inspects and reports first.
+
+The command lifecycle is single-writer:
+
+| Command | Meaning |
+|---|---|
+| `status` | Compare the exact local transfer snapshot with the Mini and report its relation; it is a preflight, not a session transcript. |
+| `start` | Accept only equal or local-only state, transfer if needed, launch the exact session, and commit the Mini lease. Remote-only work must be reclaimed first. |
+| `inspect` | Capture the bounded session state without synchronizing files. |
+| `continue` | Capture, then send one required `--prompt-file`; no file synchronization. |
+| `send` | Send one required prompt to an existing session; the natural-language skill performs a separate `inspect` first. |
+| `interrupt` | Request an immediate interrupt; it does not release project ownership. |
+| `kill` | Terminate the session and verify quiescence; it still does not reclaim files or release the project lease. |
+| `reclaim` | Only from remote-only state with no live writer: stage and verify Mini results locally, then release the lease last. |
+
+`start` snapshots the current branch, HEAD, and content of tracked files plus
+ordinary untracked regular files. Ignored files, symlinks, `.git`, and files
+outside that universe are excluded. One ignored file may be added only when
+the user approves one exact literal project-relative path and the identical
+string is passed to both `--include-ignored` and `--approve-ignored`; globs,
+directories, absolute paths, and inferred neighbors are refused. An active
+plan is opt-in with `--active-plan NAME` and adds only
+`plan.json`, `progress.json`, and `masterPlan.md` from that one
+`.temp/plan-mode/active/NAME/` directory. A changed source snapshot aborts the
+handoff. There is no continuous or bidirectional sync while the Mini owns the
+lease.
+
+Transfers use private staging and a restore journal. If destination apply
+fails and restoration verifies, ownership does not advance. If restoration
+also fails, the Mini retains authoritative `recovery-required` evidence and
+the mutex; stop and perform explicit administrative recovery rather than
+retrying, reclaiming, or bypassing the helper. Stale writers, two-sided
+divergence, lost generation checks, live-writer conflicts, and post-sync
+mismatches likewise fail closed. Local state under
+`${XDG_STATE_HOME:-$HOME/.local/state}/orchestration/remote-agent/` is only a
+private diagnostic mirror, not an authoritative backup; the protocol state
+and restore journal on the Mini are authoritative.
+
+For a human already logged into the Mini, direct interactive attachment is an
+explicit escape hatch: `tmux attach -t remote-agent--PROJECT--HARNESS`, with
+the same exact project and harness atoms above. This does not transfer files,
+change the lease, or replace `reclaim`; detach rather than killing the tmux
+session if work should continue. A live tmux session can outlast a local chat
+or SSH disconnect, but this plugin does not provide chat-transport
+persistence, a Mini boot service, or reboot survival.
+
 ## Testing
 
-Run the six test suites against the helpers and hooks:
+Run the twelve shipped plugin test suites against installation, helpers,
+skills, wrappers, and hooks:
 
 ```bash
 cd orchestration
 bash tests/scripts/parse-contract.test.sh    # 9 contract-block parsing cases
 bash tests/scripts/plan-utils.test.sh        # 6 plan-file helper cases
+bash tests/scripts/remote-agent.test.sh      # guarded Mini lifecycle cases
+bash tests/scripts/run-codex-impl.test.sh    # Codex impl wrapper cases
+bash tests/scripts/run-codex-verify.test.sh  # Codex verify wrapper cases
 bash tests/scripts/run-grok-impl.test.sh     # Grok impl wrapper cases
 bash tests/scripts/run-grok-verify.test.sh   # Grok verify wrapper cases
+bash tests/scripts/skill-contracts.test.sh   # cross-skill contracts
+bash tests/scripts/validate-structure.test.sh # skill structure checker
+bash tests/scripts/install.test.sh           # install/cache synchronization
 bash tests/hooks/session-start.test.sh       # 5 session-start hook cases
 bash tests/hooks/post-compact.test.sh        # 4 post-compact hook cases
 ```
 
-All six suites use plain-bash assertions, sandbox under `mktemp -d`,
+All twelve suites use shell test harnesses, sandbox under `mktemp -d`,
 and clean up after themselves. Each exits non-zero on any failure.
 
 Syntax / lint checks for the shell scripts:
@@ -226,5 +315,7 @@ no third hook.
 - No tool-blocking or state-mutating hooks.
 - No `lib/` shared between skills. Skills reference each other by
   name in prose, not by shared imports.
+- No Mini backend bootstrap, secret copying, continuous synchronization,
+  chat persistence, or Mini reboot-survival guarantee.
 
 See `docs/01-philosophy.md` for the full rationale.

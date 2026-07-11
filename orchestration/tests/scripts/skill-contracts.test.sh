@@ -10,6 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILLS_DIR="$SCRIPT_DIR/../../skills"
 CODEX_SKILLS_DIR="$SCRIPT_DIR/../../codex-skills"
+REMOTE_AGENT_HOST_SKILL="$SKILLS_DIR/remote-agent-host/SKILL.md"
+CONDUCTOR_SKILL="$SKILLS_DIR/conductor/SKILL.md"
 
 # Shipped skill bodies we audit (one SKILL.md per skill directory,
 # both the Claude-side skills/ and the external codex-skills/ lane).
@@ -162,11 +164,89 @@ test_no_stale_verdict_phrases() {
   fi
 }
 
+# (f) The remote agent host publishes the complete natural-language Mini
+#     intent surface and the safety rules that keep the local checkout from
+#     racing a remote writer. Keep these as prose contracts: the conductor
+#     routes user intent to this skill, while the skill owns the mechanics.
+test_remote_agent_host_contract() {
+  local name="remote-agent-host declares Mini intents and safety invariants"
+  local viol="" requirement label pattern
+  local requirements=(
+    'start Mini intent|(start|launch).*Mini|Mini.*(start|launch)'
+    'continue Mini intent|(continue|resume).*Mini|Mini.*(continue|resume)'
+    'inspect-for-input Mini intent|(inspect|check).*(input|waiting|needs)|((input|waiting|needs).*(inspect|check))'
+    'control Mini intent|(control|steer|send|tell).*Mini|Mini.*(control|steer|send|tell)'
+    'reclaim Mini intent|(reclaim|take over).*Mini|Mini.*(reclaim|take over)'
+    'capture before prompting|(capture|snapshot).*(before|prior to).*(prompt|message)|(before|prior to).*(prompt|message).*(capture|snapshot)'
+    'no sync under an active writer|(do not|never|must not).*(sync|synchroniz).*(active writer|writer.*active)|(active writer|writer.*active).*(do not|never|must not).*(sync|synchroniz)'
+    'approval for ignored paths|(ignored (path|file)|gitignored).*(approval|approve|consent)|(approval|approve|consent).*(ignored (path|file)|gitignored)'
+    'safe reclaim protocol|(reclaim|take over).*(stop|terminate|writer|ownership|safe)|(stop|terminate|writer|ownership|safe).*(reclaim|take over)'
+  )
+
+  if [[ ! -f "$REMOTE_AGENT_HOST_SKILL" ]]; then
+    fail "$name" "missing skill body: $REMOTE_AGENT_HOST_SKILL"
+    return
+  fi
+
+  for requirement in "${requirements[@]}"; do
+    label="${requirement%%|*}"
+    pattern="${requirement#*|}"
+    grep -qiE "$pattern" "$REMOTE_AGENT_HOST_SKILL" \
+      || viol+="missing contract: $label"$'\n'
+  done
+
+  grep -Fq "\${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh" "$REMOTE_AGENT_HOST_SKILL" \
+    || viol+="missing contract: helper invocation through CLAUDE_PLUGIN_ROOT"$'\n'
+
+  if [[ -n "$viol" ]]; then
+    fail "$name" "$viol"
+  else
+    pass "$name"
+  fi
+}
+
+# (g) The conductor recognizes the same user-facing Mini intent families and
+#     sends them to remote-agent-host. This is deliberately checked apart
+#     from skill discovery so a missing route cannot hide behind a missing
+#     implementation.
+test_conductor_routes_remote_agent_host() {
+  local name="conductor routes natural-language Mini intents to remote-agent-host"
+  local viol="" requirement label pattern
+  local requirements=(
+    "remote-agent-host route|\`remote-agent-host\`"
+    'start Mini intent|(start|launch).*Mini|Mini.*(start|launch)'
+    'continue Mini intent|(continue|resume).*Mini|Mini.*(continue|resume)'
+    'inspect-for-input Mini intent|(inspect|check).*(input|waiting|needs)|((input|waiting|needs).*(inspect|check))'
+    'control Mini intent|(control|steer|send|tell).*Mini|Mini.*(control|steer|send|tell)'
+    'reclaim Mini intent|(reclaim|take over).*Mini|Mini.*(reclaim|take over)'
+  )
+
+  if [[ ! -f "$CONDUCTOR_SKILL" ]]; then
+    fail "$name" "missing conductor skill body: $CONDUCTOR_SKILL"
+    return
+  fi
+
+  for requirement in "${requirements[@]}"; do
+    label="${requirement%%|*}"
+    pattern="${requirement#*|}"
+    grep -qiE "$pattern" "$CONDUCTOR_SKILL" \
+      || viol+="missing route contract: $label"$'\n'
+  done
+
+  if [[ -n "$viol" ]]; then
+    fail "$name" "$viol"
+  else
+    pass "$name"
+  fi
+}
+
 test_no_dangling_doc_citations
 test_scripts_are_plugin_root_prefixed
 test_owner_vocab_is_enum
 test_skill_routes_resolve
 test_no_stale_verdict_phrases
+test_remote_agent_host_contract
+test_conductor_routes_remote_agent_host
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

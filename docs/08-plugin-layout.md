@@ -52,7 +52,8 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   ├── mcp-builder/                 ← auxiliary: MCP server dev
     │   ├── react-native-mobile/         ← auxiliary: RN apps (dual-install)
     │   ├── webapp-testing/              ← auxiliary: Playwright / E2E
-    │   └── skill-review-standard/       ← auxiliary: skill QA gate
+    │   ├── skill-review-standard/       ← auxiliary: skill QA gate
+    │   └── remote-agent-host/           ← auxiliary: guarded Mini handoff
     │       (each skill dir contains SKILL.md and optional references/, scripts/)
     │
     ├── codex-skills/                    ← Codex-side bodies for dual-install skills
@@ -70,7 +71,8 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   ├── run-grok-impl.sh
     │   ├── run-grok-verify.sh
     │   ├── plan-utils.sh                ← read/write helpers for plan files
-    │   └── parse-contract.sh            ← extract the contract block
+    │   ├── parse-contract.sh            ← extract the contract block
+    │   └── remote-agent.sh              ← guarded Mini lifecycle boundary
     │
     ├── schemas/                         ← JSON schemas for plan files
     │   ├── plan.schema.json
@@ -87,6 +89,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
             ├── install.test.sh
             ├── parse-contract.test.sh
             ├── plan-utils.test.sh
+            ├── remote-agent.test.sh
             ├── run-codex-impl.test.sh
             ├── run-codex-verify.test.sh
             ├── run-grok-impl.test.sh
@@ -96,6 +99,12 @@ claude-codex-orchestration/              ← repo root = marketplace root
 ```
 
 Notes on shape:
+
+The shipped plugin subtree contains 18 Claude-side skills (9 core and 9
+auxiliary), 1 Codex-side skill body, 2 read-only hook handlers plus their
+manifest, 7 scripts (4 model wrappers and 3 helpers), 2 schemas, 1 template,
+and 12 test suites (10 script suites and 2 hook suites). The non-shipped
+routing eval adds 7 scripts and 5 test suites at the repo root.
 
 - **`.claude-plugin/` holds each manifest.** Claude Code's plugin
   schema places metadata under `.claude-plugin/` rather than at the
@@ -124,7 +133,23 @@ Notes on shape:
   `plan-utils.sh` provides idempotent read/write of `plan.json` and
   `progress.json` so the conductor doesn't reinvent jq invocations.
   `parse-contract.sh` extracts the contract block from raw Codex
-  output and is used by both Codex wrappers.
+  output and is used by both Codex wrappers. The four direction-locked
+  wrappers remain `run-{codex,grok}-{impl,verify}.sh`; `remote-agent.sh` is a
+  separate guarded transport/session helper, not a fifth model wrapper.
+- **Mini handoff has two artifacts.** `skills/remote-agent-host/SKILL.md`
+  translates natural language and enforces capture-before-input;
+  `scripts/remote-agent.sh` exposes the closed help surface (`status`, `start`,
+  `inspect`, `continue`, `send`, `interrupt`, `kill`, `reclaim`; projects
+  `miospot` / `orchestration`; harnesses `claude` / `codex` / `grok`). The
+  only options are `--host`, `--prompt-file`, `--active-plan`,
+  `--include-ignored`, and `--approve-ignored`; prompt content is read from the
+  named file and never placed in argv, and ignored paths require identical
+  literal include/approval values. The
+  helper assumes the remote protocol and harness launchers are already
+  provisioned. Its local state is diagnostic, while the Mini lease,
+  generation, restore journal, and recovery evidence are authoritative. It
+  provides one start/reclaim ownership handoff, not continuous sync, secret
+  copying, chat persistence, backend bootstrap, or reboot survival.
 - **`eval/` is a repo-root, non-shipped developer tool.** The routing
   eval harness lives in an `eval/` directory at the repo root — a
   sibling of `docs/` and `orchestration/`, **not** a subdirectory of
@@ -269,6 +294,7 @@ Cross-reference: which doc(s) inform which file.
 | `skills/persistent-plans/SKILL.md`             | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md` |
 | `skills/writing-plans/SKILL.md`                | `03-plan-format.md`, `04-execution-loop.md`, `05-skills-catalog.md`, `09-routing-matrix.md` |
 | `skills/codex-dispatch/SKILL.md`               | `06-codex-integration.md`, `05-skills-catalog.md`         |
+| `skills/remote-agent-host/SKILL.md`             | `05-skills-catalog.md`, `08-plugin-layout.md`              |
 | Other `skills/*/SKILL.md` (core and auxiliary) | `05-skills-catalog.md` (+ skill-specific docs)            |
 | `scripts/run-codex-impl.sh`                    | `06-codex-integration.md`                                 |
 | `scripts/run-codex-verify.sh`                  | `06-codex-integration.md`                                 |
@@ -276,12 +302,14 @@ Cross-reference: which doc(s) inform which file.
 | `scripts/run-grok-verify.sh`                   | `10-grok-integration.md`                                  |
 | `scripts/plan-utils.sh`                        | `03-plan-format.md`                                       |
 | `scripts/parse-contract.sh`                    | `06-codex-integration.md`                                 |
+| `scripts/remote-agent.sh`                      | `05-skills-catalog.md`, `08-plugin-layout.md`             |
 | `schemas/plan.schema.json`                     | `03-plan-format.md`                                       |
 | `schemas/progress.schema.json`                 | `03-plan-format.md`                                       |
 | `templates/masterPlan.template.md`             | `03-plan-format.md`                                       |
 | `tests/hooks/*.test.sh`                        | `07-hooks.md`                                             |
 | `tests/scripts/parse-contract.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/plan-utils.test.sh`             | `03-plan-format.md`                                       |
+| `tests/scripts/remote-agent.test.sh`           | `05-skills-catalog.md`, `08-plugin-layout.md`             |
 | `tests/scripts/run-codex-impl.test.sh`         | `06-codex-integration.md`                                 |
 | `tests/scripts/run-codex-verify.test.sh`       | `06-codex-integration.md`                                 |
 | `tests/scripts/run-grok-impl.test.sh`          | `10-grok-integration.md`                                  |
@@ -314,15 +342,18 @@ A sensible build sequence:
 5. **`scripts/run-grok-impl.sh` and `run-grok-verify.sh`** — the
    Grok wrappers, mirroring the Codex wrapper shape once the parser
    is solid.
-6. **`hooks/session-start.sh` + `post-compact.sh` + tests** — both
+6. **`scripts/remote-agent.sh` + `skills/remote-agent-host/SKILL.md` +
+   tests** — keep the guarded helper's executable help and the
+   natural-language lifecycle contract aligned.
+7. **`hooks/session-start.sh` + `post-compact.sh` + tests** — both
    thin and similar. Reuse `plan-utils.sh`.
-7. **`skills/`** — write `conductor`, `persistent-plans`, and
+8. **`skills/`** — write `conductor`, `persistent-plans`, and
    `codex-dispatch` first (they wire everything together), then the
    discipline skills.
-8. **`.claude-plugin/plugin.json`**, **`hooks/hooks.json`**, and
+9. **`.claude-plugin/plugin.json`**, **`hooks/hooks.json`**, and
    **`.claude-plugin/marketplace.json`** — the manifests. Trivial
    once the rest is solid.
-9. **`README.md`**, **`AGENTS.md`**, **`install.sh`** — last, when
+10. **`README.md`**, **`AGENTS.md`**, **`install.sh`** — last, when
    everything else is testable.
 
 ## What the implementer should NOT add

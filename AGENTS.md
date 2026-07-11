@@ -108,6 +108,10 @@ for cross-family verification policy.
   exploring too widely, to fit in the main thread budget.
 - Conductor → Codex/Grok: when a step is well-defined enough to implement
   or verify against acceptance criteria.
+- Conductor → `remote-agent-host`: when natural language explicitly asks to
+  start, inspect, steer, stop, or reclaim one of the supported Mini sessions.
+  This Claude-only route uses the guarded helper, inspects before every input,
+  and is not dispatched as a Codex/Grok plan step.
 - Sub-agent → Conductor: every sub-agent terminates with one summary
   message. No multi-turn dialogue.
 - Codex/Grok → Conductor: one bounded Summary/Verdict/Findings block per
@@ -133,11 +137,11 @@ below are relative to `orchestration/` unless noted):
   requires the plugin to live in a real subdirectory — `"source": "."`
   in marketplace.json is rejected as "unsupported".
 - **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
-  skills plus 8 auxiliary skills (`doc-coauthoring`, `frontend-design`,
+  skills plus 9 auxiliary skills (`doc-coauthoring`, `frontend-design`,
   `svg-art`, `immersive-frontend`, `mcp-builder`, `react-native-mobile`,
-  `webapp-testing`, `skill-review-standard`). The conductor invokes them
-  via the `Skill` tool; the harness auto-discovers them by scanning
-  `skills/<name>/SKILL.md` (no manifest list needed).
+  `webapp-testing`, `skill-review-standard`, `remote-agent-host`). The
+  conductor invokes them via the `Skill` tool; the harness auto-discovers
+  them by scanning `skills/<name>/SKILL.md` (no manifest list needed).
 - **Codex-side skill bodies** — `codex-skills/<skill>/SKILL.md` for the
   dual-install pattern. Currently only `react-native-mobile` ships a
   Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
@@ -150,6 +154,22 @@ below are relative to `orchestration/` unless noted):
 - **Plan + contract utilities** — `scripts/plan-utils.sh` (read/write
   plan files atomically) and `scripts/parse-contract.sh` (extract the
   shared external-wrapper contract block).
+- **Mini handoff** — `skills/remote-agent-host/SKILL.md` owns the
+  natural-language route; `scripts/remote-agent.sh` is its only transport and
+  session-control entry point. It supports only `miospot` / `orchestration`
+  and `claude` / `codex` / `grok`, with `status`, `start`, `inspect`,
+  `continue`, `send`, `interrupt`, `kill`, and `reclaim`. `start` transfers
+  ownership to one exact Mini writer; session controls do not synchronize or
+  release that ownership; verified remote-only `reclaim` releases it last.
+  The only options are `--host`, `--prompt-file`, `--active-plan`,
+  `--include-ignored`, and `--approve-ignored`; prompt text is file-backed and
+  never placed in argv.
+  Transfers cover tracked and ordinary untracked regular files, plus at most
+  one identically included-and-approved ignored path and the three explicitly
+  selected active-plan files. The Mini protocol state and restore journal are
+  authoritative; the local state file is diagnostic only. No role may bypass
+  a live/stale writer, divergence, CAS, changed-snapshot, restore, or
+  recovery-required refusal with raw SSH, rsync, or tmux commands.
 - **Hooks** — `hooks/session-start.sh` (active-plan notice on session
   open) and `hooks/post-compact.sh` (resumption notice after
   compaction). Both read-only, always exit 0. Event mapping lives in
@@ -161,6 +181,9 @@ below are relative to `orchestration/` unless noted):
 - **Templates** — `templates/masterPlan.template.md` is the starter
   for `writing-plans`.
 - **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
+  There are 12 plugin suites: 10 script suites (including
+  `remote-agent.test.sh`) and 2 hook suites. The repo-root routing eval adds 5
+  suites under `eval/tests/` but is not shipped with the plugin.
 
 The full design spec sits under `docs/01-philosophy.md` …
 `docs/11-routing-eval.md`. Read `docs/02-conductor.md` for the
