@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mini-side synchronization authority. Session/event lifecycle deliberately
+# lives in agent-supervisor and is not part of this vocabulary.
+umask 077
+
+usage() {
+  printf '%s\n' 'usage: remote-agent-v1 probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture ...' >&2
+  exit 64
+}
+
+die() { printf 'remote-agent-v1: %s\n' "$*" >&2; exit 1; }
+valid_uint() { case ${1:-} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+valid_project() { case ${1:-} in miospot|orchestration) return 0 ;; *) return 1 ;; esac; }
+valid_session() {
+  case ${1:-} in
+    remote-agent--miospot--claude|remote-agent--miospot--codex|remote-agent--miospot--grok|\
+    remote-agent--orchestration--claude|remote-agent--orchestration--codex|remote-agent--orchestration--grok) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+valid_relative_path() {
+  case ${1:-} in ''|/*|../*|*/../*|*/..|..|*//*|*[$'\n\r']*) return 1 ;; *) return 0 ;; esac
+}
+
+readonly authority="${XDG_STATE_HOME:-$HOME/.local/state}/orchestration/remote-agent"
+readonly authority_token=authority-root-v1
+readonly trace_root="${REMOTE_AGENT_TRACE_ROOT:-$authority/trace}"
+
+project_root() {
+  case $1 in
+    miospot) printf '%s\n' "${REMOTE_AGENT_ROOT_MIOSPOT:-$HOME/Projects/miospot}" ;;
+    orchestration) printf '%s\n' "${REMOTE_AGENT_ROOT_ORCHESTRATION:-$HOME/Projects/orchestration}" ;;
+    *) return 1 ;;
+  esac
+}
+
+project_dir() { printf '%s/projects/%s\n' "$authority" "$1"; }
+
+init_project() {
+  valid_project "$1" || usage
+  local directory
+  directory=$(project_dir "$1")
+  mkdir -p "$authority/projects" "$directory" "$trace_root"
+  chmod 700 "$authority" "$authority/projects" "$directory" "$trace_root"
+}
+
+atomic_write() {
+  local destination=$1 value=$2 temporary="${1}.tmp.$$.$RANDOM"
+  printf '%s\n' "$value" >"$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$destination"
+}
+
+read_value() {
+  local path=$1 fallback=$2 value
+  value=$fallback
+  if [[ -f $path ]]; then IFS= read -r value <"$path"; fi
+  printf '%s\n' "$value"
+}
+
+trace() {
+  local project=$1 operation=$2 file="$trace_root/$1.trace"
+  printf '%s\n' "$operation" >>"$file"
+  chmod 600 "$file"
+}
+
+generation() { read_value "$(project_dir "$1")/generation" 0; }
+
+require_authority() { [[ ${1:-} == "$authority_token" ]] || die 'authority root mismatch'; }
+
+copy_tree() {
+  local source=$1 destination=$2
+  mkdir -p "$destination"
+  chmod 700 "$destination"
+  if [[ -d $source ]]; then cp -pR "$source/." "$destination/"; fi
+}
+
+restore_snapshot() {
+  local project=$1 root directory journal entry
+  root=$(project_root "$project")
+  directory=$(project_dir "$project")
+  journal=$directory/restore
+  [[ -d $journal ]] || return 1
+  for entry in "$root/"* "$root/".[!.]* "$root/"..?*; do
+    [[ -e $entry || -L $entry ]] || continue
+    [[ ${entry##*/} == .remote-agent-stage ]] && continue
+    rm -rf "$entry"
+  done
+  copy_tree "$journal" "$root"
+}
+
+command=${1:-}
+case $command in
+  probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture) ;;
+  *) usage ;;
+esac
+shift
+
+case $command in
+  capture)
+    [[ $# -eq 1 ]] || usage
+    valid_session "$1" || usage
+    if [[ -n ${REMOTE_AGENT_TEST_CAPTURE_FILE:-} ]]; then
+      tail -n 40 "$REMOTE_AGENT_TEST_CAPTURE_FILE" | tail -c 4096
+    elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "$1" 2>/dev/null; then
+      tmux capture-pane -p -t "$1" -S -200 | tail -n 40 | tail -c 4096
+    fi
+    exit 0
+    ;;
+esac
+
+project=${2:-${1:-}}
+case $command in
+  probe) project=${2:-} ;;
+  stage) project=${2:-} ;;
+  restore-journal) project=${2:-} ;;
+  common-state-cas|lease-provisional|lease-abort|lease-commit|lease-release) project=${2:-} ;;
+  quiescent)
+    valid_session "${1:-}" || usage
+    project=${1#remote-agent--}
+    project=${project%%--*}
+    ;;
+  *) project=${1:-} ;;
+esac
+valid_project "$project" || usage
+init_project "$project"
+directory=$(project_dir "$project")
+root=$(project_root "$project")
+
+case $command in
+  probe)
+    [[ $# -eq 7 && $1 == manifest-nul ]] || usage
+    session=$3 local_digest=$6 supplied_authority=$7
+    valid_session "$session" || usage
+    [[ $session == remote-agent--$project--* ]] || usage
+    require_authority "$supplied_authority"
+    common=$(read_value "$directory/common" "$local_digest")
+    remote=$(read_value "$directory/remote" "$common")
+    if [[ $local_digest == "$common" && $remote == "$common" ]]; then relation=equal
+    elif [[ $local_digest != "$common" && $remote == "$common" ]]; then relation=local-only
+    elif [[ $local_digest == "$common" && $remote != "$common" ]]; then relation='remote-only'
+    else relation=diverged
+    fi
+    gen=$(generation "$project")
+    writer=none lease=none
+    if [[ -f $directory/lease-state ]]; then
+      lease=$(read_value "$directory/lease-state" none)
+      if [[ -f $directory/quiescent ]]; then writer=quiescent
+      elif [[ $lease == active ]]; then writer=live
+      else writer=provisional
+      fi
+    fi
+    if [[ -d $directory/mutex ]]; then
+      owner=$(read_value "$directory/mutex/owner" unknown)
+      printf '{"mutex":"held","owner":"%s","generation":%s}\n' "$owner" "$gen"
+    else
+      printf '{"relation":"%s","writer":"%s","lease":"%s","generation":%s}\n' "$relation" "$writer" "$lease" "$gen"
+    fi
+    ;;
+
+  adopt)
+    [[ $# -eq 2 ]] || usage
+    atomic_write "$directory/common" "$2"
+    atomic_write "$directory/remote" "$2"
+    [[ -f $directory/generation ]] || atomic_write "$directory/generation" 0
+    trace "$project" adopt
+    ;;
+
+  mutex-acquire)
+    [[ $# -eq 3 ]] || usage
+    require_authority "$3"
+    if mkdir "$directory/mutex" 2>/dev/null; then
+      chmod 700 "$directory/mutex"
+      atomic_write "$directory/mutex/owner" "$2"
+      trace "$project" mutex-acquire
+      printf '{"mutex":"acquired"}\n'
+    else
+      die 'mutex is held'
+    fi
+    ;;
+
+  mutex-release)
+    [[ $# -eq 3 ]] || usage
+    require_authority "$3"
+    [[ -d $directory/mutex ]] || die 'mutex is not held'
+    [[ $(read_value "$directory/mutex/owner" '') == "$2" ]] || die 'mutex owner mismatch'
+    rm -rf "$directory/mutex"
+    trace "$project" mutex-release
+    ;;
+
+  generation-check)
+    [[ $# -eq 3 ]] || usage
+    require_authority "$3"
+    valid_uint "$2" || usage
+    actual=$(generation "$project")
+    [[ $2 == "$actual" ]] || die 'generation mismatch'
+    ;;
+
+  common-state-cas)
+    [[ $# -eq 4 && $1 == temp-rename ]] || usage
+    require_authority "$4"
+    expected=$3 actual=$(generation "$project")
+    if [[ $expected == first-contact ]]; then expected=0; fi
+    valid_uint "$expected" || usage
+    if [[ $expected != "$actual" ]]; then
+      printf '{"cas":"lost","reason":"generation","expected":%s,"actual":%s}\n' "$expected" "$actual" >&2
+      exit 1
+    fi
+    atomic_write "$directory/generation" "$((actual + 1))"
+    atomic_write "$directory/transaction-generation" "$expected"
+    trace "$project" common-state-cas
+    ;;
+
+  stage)
+    [[ $# -eq 4 ]] || usage
+    [[ $1 == $'umask 077\nmode=0700' ]] || die 'invalid privacy directive'
+    case $3 in outbound|inbound) ;; *) usage ;; esac
+    require_authority "$4"
+    rm -rf "$root/.remote-agent-stage"
+    mkdir -p "$root/.remote-agent-stage"
+    chmod 700 "$root/.remote-agent-stage"
+    atomic_write "$directory/stage-direction" "$3"
+    trace "$project" stage
+    ;;
+
+  deletion-inventory)
+    [[ $# -eq 2 ]] || usage
+    : >"$directory/inventory"
+    chmod 600 "$directory/inventory"
+    atomic_write "$directory/inventory-digest" "$2"
+    trace "$project" deletion-inventory
+    ;;
+
+  inventory-path)
+    [[ $# -eq 2 ]] || usage
+    valid_relative_path "$2" || die 'unsafe inventory path'
+    printf '%s\n' "$2" >>"$directory/inventory"
+    chmod 600 "$directory/inventory"
+    trace "$project" inventory-path
+    ;;
+
+  restore-journal)
+    [[ $# -eq 2 && $1 == mode=0600 ]] || usage
+    rm -rf "$directory/restore"
+    mkdir -p "$directory/restore"
+    chmod 700 "$directory/restore"
+    copy_tree "$root" "$directory/restore"
+    rm -rf "$directory/restore/.remote-agent-stage"
+    find "$directory/restore" -type d -exec chmod 700 {} +
+    find "$directory/restore" -type f -exec chmod 600 {} +
+    trace "$project" restore-journal
+    ;;
+
+  stage-verify)
+    [[ $# -eq 2 && -d $root/.remote-agent-stage ]] || die 'missing stage'
+    atomic_write "$directory/stage-digest" "$2"
+    trace "$project" stage-verify
+    ;;
+
+  apply-exact)
+    [[ $# -eq 2 ]] || usage
+    [[ $(read_value "$directory/stage-digest" '') == "$2" ]] || die 'stage digest mismatch'
+    [[ -d $root/.remote-agent-stage && -d $directory/restore ]] || die 'stage or restore journal missing'
+    if [[ -f $directory/inventory ]]; then
+      while IFS= read -r path; do
+        valid_relative_path "$path" || die 'corrupt inventory path'
+        [[ -e $root/.remote-agent-stage/$path ]] || rm -rf "${root:?}/$path"
+      done <"$directory/inventory"
+    fi
+    copied=0
+    for entry in "$root/.remote-agent-stage/"* "$root/.remote-agent-stage/".[!.]* "$root/.remote-agent-stage/"..?*; do
+      [[ -e $entry || -L $entry ]] || continue
+      cp -pR "$entry" "$root/"
+      copied=$((copied + 1))
+      if [[ ${REMOTE_AGENT_TEST_FAULT:-} == apply-after-first-file && $copied -eq 1 ]]; then
+        if restore_snapshot "$project"; then
+          printf '{"apply":"failed","restore":"verified"}\n'
+        else
+          printf '{"apply":"failed","restore":"failed"}\n'
+        fi
+        exit 1
+      fi
+    done
+    atomic_write "$directory/remote" "$2"
+    trace "$project" apply-exact
+    printf '{"apply":"verified"}\n'
+    ;;
+
+  restore-verify)
+    [[ $# -eq 1 && -d $directory/restore ]] || die 'restore journal missing'
+    trace "$project" restore-verify
+    ;;
+
+  recovery-required)
+    [[ $# -eq 2 ]] || usage
+    atomic_write "$directory/recovery-required" "$2"
+    trace "$project" recovery-required
+    ;;
+
+  lease-provisional)
+    [[ $# -eq 6 && $1 == temp-rename ]] || usage
+    require_authority "$6"
+    session=$3 expected=$4
+    valid_session "$session" || usage
+    [[ $session == remote-agent--$project--* ]] || usage
+    actual=$(generation "$project")
+    transaction=$(read_value "$directory/transaction-generation" "$actual")
+    [[ $expected == "$actual" || $expected == "$transaction" ]] || die 'lease generation mismatch'
+    [[ ! -f $directory/lease-state ]] || die 'lease already exists'
+    atomic_write "$directory/lease-session" "$session"
+    atomic_write "$directory/lease-owner" "$5"
+    atomic_write "$directory/lease-generation" "$expected"
+    atomic_write "$directory/lease-state" provisional
+    rm -f "$directory/quiescent" "$directory/post-sync-verified"
+    trace "$project" lease-provisional
+    ;;
+
+  lease-abort)
+    [[ $# -eq 5 && $1 == temp-rename ]] || usage
+    require_authority "$5"
+    session=$3 expected=$4
+    valid_session "$session" || usage
+    [[ $session == remote-agent--$project--* ]] || usage
+    lease_state=$(read_value "$directory/lease-state" '')
+    [[ -n $lease_state ]] || die 'no provisional lease'
+    [[ $lease_state == provisional ]] || die 'provisional lease required'
+    [[ $(read_value "$directory/lease-session" '') == "$session" ]] || die 'lease session mismatch'
+    [[ $(read_value "$directory/lease-generation" '') == "$expected" ]] || die 'lease generation mismatch'
+    rm -f "$directory/lease-state" "$directory/lease-session" \
+      "$directory/lease-owner" "$directory/lease-generation"
+    trace "$project" lease-abort
+    ;;
+
+  lease-commit)
+    [[ $# -eq 5 && $1 == temp-rename ]] || usage
+    require_authority "$5"
+    session=$3 expected=$4
+    [[ $(read_value "$directory/lease-state" '') == provisional ]] || die 'no provisional lease'
+    [[ $(read_value "$directory/lease-session" '') == "$session" ]] || die 'lease session mismatch'
+    [[ $(read_value "$directory/lease-generation" '') == "$expected" ]] || die 'lease generation mismatch'
+    atomic_write "$directory/lease-state" active
+    trace "$project" lease-commit
+    ;;
+
+  quiescent)
+    [[ $# -eq 2 ]] || usage
+    valid_session "$1" || usage
+    require_authority "$2"
+    [[ $(read_value "$directory/lease-state" '') == active ]] || die 'active lease required'
+    [[ $(read_value "$directory/lease-session" '') == "$1" ]] || die 'lease session mismatch'
+    if [[ -f $directory/quiescent ]]; then
+      [[ $(read_value "$directory/quiescent" '') == "$1" ]] || die 'quiescent session mismatch'
+    fi
+    atomic_write "$directory/quiescent" "$1"
+    trace "$project" quiescent
+    ;;
+
+  post-sync-verify)
+    [[ $# -eq 2 ]] || usage
+    atomic_write "$directory/common" "$2"
+    atomic_write "$directory/remote" "$2"
+    atomic_write "$directory/post-sync-verified" "$2"
+    trace "$project" post-sync-verify
+    ;;
+
+  release-only-verify)
+    [[ $# -eq 3 ]] || usage
+    require_authority "$3"
+    session=$2
+    valid_session "$session" || usage
+    [[ $session == remote-agent--$project--* ]] || usage
+    [[ $(read_value "$directory/lease-state" '') == active ]] || die 'active lease required'
+    [[ $(read_value "$directory/lease-session" '') == "$session" ]] || die 'lease session mismatch'
+    [[ $(read_value "$directory/quiescent" '') == "$session" ]] || die 'quiescence required before verification'
+    [[ ! -f $directory/recovery-required ]] || die 'recovery evidence blocks release-only verification'
+    common=$(read_value "$directory/common" '')
+    remote=$(read_value "$directory/remote" '')
+    [[ -n $common && $remote == "$common" ]] || die 'remote state does not match common state'
+    atomic_write "$directory/post-sync-verified" "$common"
+    trace "$project" release-only-verify
+    ;;
+
+  lease-release)
+    [[ $# -eq 4 && $1 == temp-rename ]] || usage
+    require_authority "$4"
+    session=$3
+    [[ $(read_value "$directory/lease-state" '') == active ]] || die 'active lease required'
+    [[ $(read_value "$directory/lease-session" '') == "$session" ]] || die 'lease session mismatch'
+    lease_generation=$(read_value "$directory/lease-generation" '')
+    valid_uint "$lease_generation" || die 'invalid lease generation'
+    current_generation=$(generation "$project")
+    (( lease_generation <= current_generation )) || die 'lease generation is ahead of project generation'
+    [[ -f $directory/quiescent ]] || die 'quiescence required before release'
+    [[ -f $directory/post-sync-verified ]] || die 'post-sync verification required before release'
+    [[ $(read_value "$directory/post-sync-verified" '') == $(read_value "$directory/common" '') ]] || die 'post-sync verification mismatch'
+    rm -f "$directory/lease-state" "$directory/lease-session" "$directory/lease-owner" \
+      "$directory/lease-generation" "$directory/quiescent" "$directory/post-sync-verified"
+    trace "$project" lease-release
+    ;;
+esac

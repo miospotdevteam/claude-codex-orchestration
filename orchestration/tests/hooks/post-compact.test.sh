@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Fixtures intentionally use the literal plan status `done` and Markdown
+# backticks in single-quoted expected output.
+# shellcheck disable=SC1010,SC2016
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)

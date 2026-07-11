@@ -572,6 +572,7 @@ if [[ $command == start ]]; then
     ssh_quiet "$PROTOCOL" adopt "$project" "$universe_digest"
   elif [[ $relation == local-only ]]; then
     transfer_outbound
+    ssh_quiet "$PROTOCOL" post-sync-verify "$project" "$universe_digest"
   else
     die "cannot start from ambiguous relation: $relation"
   fi

@@ -152,6 +152,10 @@ TUI in tmux. Authentication must already exist on the Mini through that TUI's
 normal interactive subscription login. Never copy API keys, browser profiles,
 cookies, or local authentication material and never edit user Claude settings
 to install or emulate lifecycle hooks; the plugin manifest owns its hooks.
+On the provisioned Mini, Claude's machine-local subscription preferences are
+`model=fable` and `effortLevel=xhigh`. Treat them as a provisioning invariant,
+not as launch flags: the supervisor still starts the exact `claude --yolo`
+command, and this skill never copies or silently rewrites user settings.
 
 ## Synchronization safety
 

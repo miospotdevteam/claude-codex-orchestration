@@ -1,6 +1,6 @@
 {
   "name": "orchestration",
-  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
+  "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only plan notices, fail-open private-queue lifecycle observers, no gates.",
   "mcpServers": {
     "orbit": {
       "command": "orbit-mcp"

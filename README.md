@@ -182,25 +182,13 @@ needed, stop active sessions through the guarded helper, restore both files
 together, and start a new session; never mix backend versions or bypass lease,
 restore-journal, or recovery-required state.
 
-The V6 rollout has one known provisional MioSpot lease left by the pre-fix
-failed launch. After atomically installing the new matched backend pair, and
-before retrying `start`, recover only that exact record from a shell on the
-Mini:
-
-```bash
-remote-agent-v1 lease-abort temp-rename miospot \
-  remote-agent--miospot--claude 0 authority-root-v1
-```
-
-The `0` is the recorded lease generation, even though the project generation
-is already `1` after its successful common-state CAS. Capture rollout evidence
-before and after: the initial status is `relation=equal`,
-`writer/lease=provisional`, project generation `1`; the successful transition
-leaves `relation=equal`, `writer/lease=none`, project generation `1`, and the
-final trace line exactly `lease-abort`. Do not reset common state or project
-generation, and do not alter or retry the command if the session, lease
-generation, authority token, or provisional state does not match: the closed
-transition must refuse that state for explicit investigation.
+Claude model and effort are authenticated user preferences, not supervisor
+launch arguments. For this Mini deployment, select Fable and xhigh once in the
+subscription-backed Claude TUI (`/model fable`, then `/effort xhigh`) and verify
+that `~/.claude/settings.json` reports `model=fable` and
+`effortLevel=xhigh`. The supervisor deliberately continues to launch only
+`claude --yolo`; the helper neither copies authentication nor rewrites those
+machine-local preferences.
 
 ## Usage
 

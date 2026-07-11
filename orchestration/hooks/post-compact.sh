@@ -9,6 +9,8 @@ PLAN_UTILS="$SCRIPT_DIR/../scripts/plan-utils.sh"
 
 no_active_notice() {
   printf '## Orchestration\n\n'
+  # Backticks are Markdown, so this string must remain single-quoted.
+  # shellcheck disable=SC2016
   printf 'No active plan in `.temp/plan-mode/active/`; no active plan to resume.\n'
 }
 
@@ -101,14 +103,22 @@ emit_notice() {
   path=".temp/plan-mode/active/$(basename "$plan_dir")/"
 
   printf '## Orchestration: resuming after compaction\n\n'
+  # Backticks are Markdown, so these format strings must remain single-quoted.
+  # shellcheck disable=SC2016
   printf -- '- **Plan**: `%s` — %s\n' "$plan_id" "$title"
+  # shellcheck disable=SC2016
   printf -- '- **Path**: `%s`\n' "$path"
   printf -- '- **Status**: %s\n' "$status"
   printf -- '- **Runnable frontier**: %s\n\n' "$frontier"
+  # Backticks are Markdown, so these strings must remain single-quoted.
+  # shellcheck disable=SC2016
   printf 'Resumption protocol (from `docs/04-execution-loop.md`):\n\n'
+  # shellcheck disable=SC2016
   printf '1. Read `plan.json` (immutable) and `progress.json` (mutable).\n'
+  # shellcheck disable=SC2016
   printf '2. Recreate the TaskList from `progress.json`.\n'
   printf '3. Compute the frontier — already shown above.\n'
+  # shellcheck disable=SC2016
   printf '4. Dispatch the frontier in parallel via `codex-dispatch`.\n\n'
   printf 'Do not re-read source files or re-run discovery; the plan is your\n'
   printf 'source of truth.\n'

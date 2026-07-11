@@ -1,6 +1,7 @@
 ---
 name: systematic-debugging
-description: Four-phase debugging — investigate, identify pattern, form hypotheses, fix — to prevent guess-and-check thrashing. Use whenever a bug is reported, a test fails unexpectedly, a verifier returns FAIL, or the user says "this doesn't work" / "X is broken" / "fix the bug where …". The discipline is: never change code before you can name the root cause. Do NOT use for learning a new API (that's exploration), refactoring for clarity (use `refactoring`), performance optimization without a concrete regression, or new-feature work (use `test-driven-development` / `writing-plans`).
+description: >-
+  Four-phase debugging — investigate, identify pattern, form hypotheses, fix — to prevent guess-and-check thrashing. Use whenever a bug is reported, a test fails unexpectedly, a verifier returns FAIL, or the user says "this doesn't work" / "X is broken" / "fix the bug where …". The discipline is: never change code before you can name the root cause. Do NOT use for learning a new API (that's exploration), refactoring for clarity (use `refactoring`), performance optimization without a concrete regression, or new-feature work (use `test-driven-development` / `writing-plans`).
 allowed-tools: Read, Edit, Write, Bash, Grep, Glob, Agent
 ---
 

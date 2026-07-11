@@ -1,303 +1,166 @@
 # 07 — Hooks
 
-v2 ships **exactly two hooks**, and both are **read-only**. They
-inject short status notices into the conductor's context. They do
-not block tool calls, do not mutate files, do not invoke Codex, and
-do not enforce gates.
+v2 registers **six Claude Code hook events**. Two context hooks keep the
+conductor oriented; four narrowly scoped lifecycle observers feed sanitized
+labels to the Mini session supervisor. This six-event design explicitly
+supersedes the earlier exactly-two-read-only-hooks design.
 
-This is a direct reaction to v1, where the hook surface grew to a
-dozen gates and mutators that became the primary source of bugs and
-friction. v2's principle (`01-philosophy.md`): hooks are the most
-expensive surface to maintain because they fire on every event. Keep
-the surface minimal.
+None of the six entries is a tool gate. The lifecycle observers are
+synchronous, fail open, emit no hook decision, and never edit user Claude
+settings. They enqueue only closed labels in private supervisor state; prompt,
+message, transcript, environment, model, and terminal text never enter the
+queue.
 
-The two hooks:
+## Event inventory
 
-1. **`session-start`** — runs once when a Claude Code session
-   starts. Looks for an active plan; injects a short notice.
-2. **`post-compact`** — runs after the conductor's context is
-   compacted. Re-injects the active plan path and current frontier.
+| Claude Code event | Handler | Purpose |
+|---|---|---|
+| `SessionStart` (`startup|resume|clear`) | `hooks/session-start.sh` | Inject a bounded active-plan notice. |
+| `PostCompact` | `hooks/post-compact.sh` | Re-inject the active plan and runnable frontier. |
+| `Stop` | `hooks/agent-event.sh` | Enqueue `main completed`. |
+| `SubagentStop` | `hooks/agent-event.sh` | Enqueue `subagent completed`. |
+| `StopFailure` | `hooks/agent-event.sh` | Enqueue `main failed`. |
+| `Notification` | `hooks/agent-event.sh` | Enqueue `main input-needed` only for the exact allowlist below. |
 
-This document specifies each in full.
+The four lifecycle event registrations share one handler because their
+privacy, binding, and fail-open behavior is identical. “Four observers” means
+four event registrations, not four scripts.
 
----
+## Context hook: `session-start`
 
-## Hook 1: `session-start`
+`SessionStart` runs for `startup`, `resume`, and `clear`, before the first user
+turn. It reads only `.temp/plan-mode/active/`, selects the sole active plan or
+the one whose `progress.json` has the newest `lastUpdatedAt`, and emits a short
+notice containing the plan ID/title, status counts, runnable frontier, and
+relative plan path. With no active plan it emits a one-line standby notice.
 
-### Trigger event
+It does not mutate plan files, inspect source, invoke another model, spawn an
+agent, block a tool, or ask a question. Missing or malformed plan state is a
+bounded notice or a silent zero exit; hook failure must not break startup.
 
-The Claude Code harness fires `session-start` when:
+## Context hook: `post-compact`
 
-- A new session is opened in the working directory.
-- A session is resumed and the working directory has not changed.
+`PostCompact` runs after Claude Code compacts the conductor context. It reads
+the active plan's `plan.json` and `progress.json`, recomputes the runnable
+frontier through `scripts/plan-utils.sh`, and injects a bounded resumption
+notice. It never reconstructs discovery, reads source files, or changes plan
+state. Missing state is a short diagnostic and a zero exit.
 
-It fires before the user's first prompt is processed.
+The separate event prevents `SessionStart` from firing twice around a
+compaction.
 
-### Inputs (event payload)
+## Lifecycle observer: `agent-event`
 
-The harness invokes the hook with an environment payload
-(canonical form, JSON on stdin or env vars; the implementer chooses
-the form that matches the harness API). Fields used:
+`hooks/agent-event.sh` reads at most one bounded JSON payload from stdin and
+accepts only these mappings:
 
-```json
-{
-  "cwd": "/abs/path/to/project",
-  "sessionId": "<uuid>",
-  "ts": "2026-05-11T15:00:00Z"
-}
+- Main `Stop` → scope `main`, kind `completed`.
+- `SubagentStop` → scope `subagent`, kind `completed`.
+- Main `StopFailure` → scope `main`, kind `failed`.
+- `Notification` with `permission_prompt`, `idle_prompt`, or
+  `elicitation_dialog` → scope `main`, kind `input-needed`.
+
+Every other event and notification subtype is ignored. In particular, the
+input-needed allowlist is exactly those three values; it is not a substring or
+open-ended notification matcher.
+
+The handler requires an exact canonical project-root and tmux-pane binding to
+one live `remote-agent--PROJECT--HARNESS` supervisor session. It then invokes
+only:
+
+```text
+${CLAUDE_PLUGIN_ROOT}/scripts/agent-supervisor enqueue ROOT %PANE SCOPE KIND
 ```
 
-### Behavior (read-only)
+The private queue lives under
+`${XDG_STATE_HOME:-$HOME/.local/state}/orchestration/agent-supervisor/` with
+directories mode `0700` and files mode `0600`. Records contain only scope and
+kind; the supervisor adds the session atom, epoch, and monotonic cursor when a
+wait wakes. The hook passes no stdin to the queue and discards all output.
 
-1. **Locate the active plan.** Scan
-   `<cwd>/.temp/plan-mode/active/` for plan directories.
-   - Zero directories: no plan active. Emit a one-line notice
-     telling the conductor that orchestration is installed but no
-     plan is active.
-   - One directory: that is the active plan.
-   - Two or more: pick the directory whose `progress.json` has the
-     latest `lastUpdatedAt`. Emit a notice naming the chosen plan
-     and warning that others exist.
-2. **Read `plan.json` and `progress.json`** for the chosen plan.
-   These are bounded files; the hook reads them fully.
-3. **Compute a short summary**:
-   - Plan title and ID.
-   - Step counts by status (e.g., `2 done · 1 in_progress · 5
-     pending`).
-   - The current runnable frontier (step IDs and titles).
-4. **Emit a notice** in the format below. The hook writes it to its
-   stdout (or whatever channel the harness uses for context
-   injection).
+Malformed input, missing dependencies, ambiguous bindings, queue failures, and
+timeouts all exit zero without stdout/stderr. The observer does not return
+JSON, `decision`, `continue`, or `stopReason` fields, so it cannot approve,
+deny, or steer a Claude turn. Installation is plugin-scoped through
+`hooks/hooks.json`; no document, installer, or hook may edit
+`~/.claude/settings.json` or another user settings file.
 
-### Output (injected notice format)
+## Event semantics and limits
 
-A short markdown block, at most ~12 lines:
+Lifecycle labels are wake hints, not proofs about the writer lease:
 
-```markdown
-## Orchestration: active plan
+- `Stop` says the Claude main turn completed. It does not say all child
+  processes ended, the tmux session exited, or the lease is quiescent.
+- `SubagentStop` says one subagent completed. It is intentionally distinct from
+  main-turn completion and says nothing about other agents.
+- `StopFailure` says the main turn failed. It does not imply session exit or
+  safe reclaim.
+- `input-needed` says Claude emitted one allowlisted notification. The caller
+  must inspect the bounded terminal tail to learn what input is appropriate.
+- A supervisor `exit` wake says the exact tmux session is absent.
+- A supervisor `timeout` wake says no supported event or tmux exit was observed
+  before the 1–300 second deadline.
 
-- **Plan**: `auth-refactor-2026-05-11` — Refactor auth to use signed cookies
-- **Status**: 2 done · 1 in_progress · 5 pending
-- **Frontier**: step-3 (Introduce SignedCookie type), step-4 (Update middleware)
-- **Path**: `.temp/plan-mode/active/auth-refactor-2026-05-11/`
+No event, exit wake, or timeout proves lease quiescence. Only the guarded
+`remote-agent.sh kill PROJECT HARNESS` path invokes the synchronization
+protocol's quiescence check. Wait, inspect, and reveal never synchronize files,
+change ownership, or release a lease.
 
-The `conductor` skill will pick this up. Read `plan.json` and
-`progress.json` before dispatching the frontier.
+Claude sessions can produce all three event kinds. Codex and Grok do not run
+Claude plugin hooks, so their waits normally wake only on tmux exit or timeout.
+An epoch change identifies a supervisor restart; callers retain and resend the
+returned `epoch:cursor` so a restart or queued event is not mistaken for fresh
+terminal state.
+
+## Event-driven interaction, not visual polling
+
+The natural-language route uses one blocking helper call:
+
+```text
+${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh wait PROJECT HARNESS --cursor EPOCH:NUMBER --timeout SECONDS
 ```
 
-If no plan is active, the notice degrades to:
+After any `event`, `exit`, or `timeout` wake, it performs one bounded
+`inspect` (at most 40 lines or 4 KiB) and reports only the relevant tail. It
+does not repeatedly inspect, screenshot-poll, or use Computer Use as a watch
+loop. Computer Use is exception handling for an explicit interactive problem
+after a wake; `reveal` is the supported way to open Terminal on the exact
+existing session.
 
-```markdown
-## Orchestration
+The public helper exposes the restart-aware first-wait cursor without a
+separate caller-side supervisor command. A successful `start` returns one
+bounded labels-only envelope after lease commit, and `status` composes one
+bounded public envelope from its authority probe and exact supervisor state.
+Callers retain a running session's `bootstrapCursor` and pass it directly to
+`wait`; subsequent wake envelopes replace the retained epoch and cursor.
+`inspect` is used after a wake for bounded context, not as a normal first-wait
+fallback, and callers never invoke `agent-supervisor` around the guarded
+boundary.
 
-No active plan in `.temp/plan-mode/active/`. The `conductor` skill
-will create one when you start a non-trivial task.
+The Mini supervisor launches the installed Claude, Codex, or Grok subscription
+TUI. Each must already be authenticated interactively on the Mini. Hooks and
+handoff never copy API keys, cookies, browser profiles, shell profiles, or
+subscription credentials.
+
+## Hook manifest
+
+`hooks/hooks.json` is the executable source of truth. The two context hooks use
+10-second bounds. Each of `Stop`, `SubagentStop`, `StopFailure`, and
+`Notification` is declared synchronously with `async: false` and a 2-second
+timeout so the small label is handed off before Claude exits the hook callback.
+All command paths begin with `${CLAUDE_PLUGIN_ROOT}`.
+
+## Validation
+
+The shipped hook suites are:
+
+```text
+tests/hooks/session-start.test.sh
+tests/hooks/post-compact.test.sh
+tests/hooks/agent-event.test.sh
 ```
 
-### What `session-start` does NOT do
-
-- Does **not** block any tool.
-- Does **not** mutate `plan.json` or `progress.json`.
-- Does **not** invoke Codex.
-- Does **not** read source files outside `.temp/plan-mode/active/`.
-- Does **not** spawn sub-agents.
-- Does **not** ask the user questions.
-
-If `.temp/plan-mode/active/` is unreadable (permissions, missing),
-the hook fails silently — it emits no notice and exits zero. A
-broken hook must not break the session.
-
----
-
-## Hook 2: `post-compact`
-
-### Trigger event
-
-The Claude Code harness fires `post-compact` after it summarizes the
-conductor's prior context. By the time this hook runs, the
-conductor has lost most in-memory state and is about to receive its
-next user turn (or auto-resume turn).
-
-### Inputs (event payload)
-
-```json
-{
-  "cwd": "/abs/path/to/project",
-  "sessionId": "<uuid>",
-  "ts": "2026-05-11T16:00:00Z",
-  "compactionId": "<uuid>"
-}
-```
-
-### Behavior (read-only)
-
-The `post-compact` hook's job is the same as `session-start`'s, but
-the notice it emits is **action-oriented**, not informational. The
-conductor needs to resume execution; the notice should make that
-trivial.
-
-1. **Locate the active plan** (same logic as `session-start`).
-2. **Read `plan.json` and `progress.json`**.
-3. **Compute the runnable frontier** using the algorithm in
-   `04-execution-loop.md`.
-4. **Emit the resumption notice** below.
-
-If no active plan exists, the hook emits a short note saying so and
-does nothing else. (After a compaction with no plan, the conductor
-has no orchestration work to resume.)
-
-### Output (injected notice format)
-
-```markdown
-## Orchestration: resuming after compaction
-
-- **Plan**: `auth-refactor-2026-05-11` — Refactor auth to use signed cookies
-- **Path**: `.temp/plan-mode/active/auth-refactor-2026-05-11/`
-- **Status**: 2 done · 1 in_progress · 5 pending
-- **Runnable frontier**: step-3, step-4
-
-Resumption protocol (from `docs/04-execution-loop.md`):
-
-1. Read `plan.json` (immutable) and `progress.json` (mutable).
-2. Recreate the TaskList from `progress.json`.
-3. Compute the frontier — already shown above.
-4. Dispatch the frontier in parallel via `codex-dispatch`.
-
-Do not re-read source files or re-run discovery; the plan is your
-source of truth.
-```
-
-This shape is opinionated on purpose: the conductor wakes into a
-clean window and needs explicit, actionable steps. The notice is the
-last context-injected message before the conductor's next turn.
-
-### What `post-compact` does NOT do
-
-Same prohibitions as `session-start`:
-
-- Does **not** block any tool.
-- Does **not** mutate `plan.json` or `progress.json`.
-- Does **not** invoke Codex.
-- Does **not** read source files.
-- Does **not** spawn sub-agents.
-
-Additionally:
-
-- Does **not** modify the harness's compaction summary itself. The
-  hook produces a sibling notice that the harness presents after
-  compaction; it does not edit the compaction text.
-
-### Failure mode
-
-If the hook errors (corrupted `progress.json`, missing files), it
-emits a single line:
-
-```
-## Orchestration: post-compact hook failed; check .temp/plan-mode/active/ manually
-```
-
-and exits zero. A broken hook must not break resumption.
-
----
-
-## What we explicitly did **not** add
-
-For the record, the following hooks were considered and rejected:
-
-- **`pre-edit` / `pre-write`** — would intercept every file edit to
-  enforce plan presence. This was the v1 gate; it created the
-  /bypass-as-reflex anti-pattern. Replaced by the conductor skill's
-  prompt and gentle reminders.
-- **`pre-codex`** — would intercept Codex calls to mint receipts.
-  No receipts in v2; no need.
-- **`pre-bash`** — would gate destructive commands. Out of scope:
-  destructive-command policy is the user's, not the plugin's.
-- **`post-step`** — would re-verify progress.json after every step.
-  The conductor already writes progress.json; double-checking it
-  via hook adds nothing.
-
-The bar for adding a third hook in v2 is: it must do something that
-cannot be done by a skill or wrapper, it must be read-only, and it
-must be cheap to maintain. We expect to clear that bar rarely.
-
----
-
-## Implementer notes
-
-- Both hooks should be single-file scripts (the implementation
-  language is the implementer's choice — Bash, Python, Node — but
-  Bash + `jq` keeps deps minimal).
-- Both hooks must exit zero. Non-zero exits would risk breaking the
-  session.
-- Both hooks should run in well under 200ms in the common case.
-  Reading two small JSON files and emitting a markdown block is the
-  total work.
-- Tests for the hooks live in the implementation repo and cover:
-  no plan, one plan, two plans (newest wins), corrupted
-  `progress.json`, missing `plan.json`.
-
-See `08-plugin-layout.md` for where the hook scripts live in the
-plugin tree.
-
----
-
-## Hook declaration (`hooks/hooks.json`)
-
-Claude Code learns which scripts to fire on which events from
-`hooks/hooks.json`. The schema is event-keyed: each top-level key is
-a Claude Code event name (e.g. `SessionStart`, `PostCompact`,
-`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) and the
-value is an array of handler-group objects. Each handler-group may
-include a `matcher` (regex-style filter on event sub-types or tool
-names) and a `hooks` array of command entries.
-
-v2's `hooks/hooks.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
-            "async": false,
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PostCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/post-compact.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Three things to note:
-
-1. **`${CLAUDE_PLUGIN_ROOT}`** is the path Claude Code resolves at
-   runtime to the plugin's installation directory. Use it for every
-   in-plugin command path; never hard-code absolute paths.
-2. **The `SessionStart` matcher is `startup|resume|clear`** — and
-   intentionally **not** `compact`. Compaction is handled by the
-   `PostCompact` event below, so the session-start notice doesn't
-   fire twice on a compaction event.
-3. **`async: false` on `SessionStart`** ensures the notice is
-   injected before the user's first turn. The `PostCompact` handler
-   can run async (default); the resumption notice arrives ahead of
-   the conductor's next message either way.
-
-If a third event is ever proposed, the bar from earlier in this doc
-applies: it must do something a skill or wrapper cannot, it must be
-read-only, and it must be cheap to maintain.
+They cover plan notices, resumption, exact event mappings, the three-value
+input allowlist, payload redaction, private queue permissions, exact session
+binding, fail-open behavior, and non-mutation of user settings. See
+`docs/08-plugin-layout.md` for the complete source and test inventory.

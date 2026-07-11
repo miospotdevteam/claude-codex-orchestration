@@ -133,8 +133,10 @@ contract is enforced by the wrapper. See `06-codex-integration.md` and
 
 ### From hooks
 
-Each hook injects at most a short notice (a few lines). See
-`07-hooks.md`. Hooks never inject full file contents or raw artifacts.
+Only `SessionStart` and `PostCompact` inject bounded read-only notices. The
+four lifecycle observers emit no notice or decision and enqueue only
+allowlisted labels in private state. See `07-hooks.md`; no hook injects full
+file contents or raw artifacts.
 
 ## When the conductor is allowed to "just do it"
 

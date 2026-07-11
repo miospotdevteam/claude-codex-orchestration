@@ -63,11 +63,13 @@ These three categories are gone:
    only thing pushing the model toward plans is gentle reminders from the
    discipline skills and the `session-start` notice. If the user wants to
    make a one-line change without a plan, nothing stops them.
-3. **Heavy hook surface.** v1 had hooks that mutated state, invoked
-   Codex, refreshed caches, and gated tools. v2 ships **exactly two**
-   hooks and **both are read-only**: `session-start` and `post-compact`.
-   They inject context. They do not block, mutate, or call out. See
-   `07-hooks.md`.
+3. **Heavy hook surface.** v1 had hooks that invoked models, refreshed
+   caches, and gated tools. v2 registers six events: two bounded context hooks
+   (`SessionStart`, `PostCompact`) and four narrowly scoped lifecycle observers
+   (`Stop`, `SubagentStop`, `StopFailure`, `Notification`). The observers are
+   fail-open, non-decision bridges into a private labels-only queue. This
+   explicitly supersedes the earlier exactly-two-read-only-hooks design
+   without restoring enforcement. See `07-hooks.md`.
 
 ## v2 design principles
 
@@ -78,9 +80,12 @@ option that aligns with more of them.
    reminded to do the right thing via a skill description, do that instead
    of building a hook to enforce it. Enforcement is for safety-critical
    invariants (no destructive git, no secret commits) — not for habits.
-2. **Minimal hooks.** Hooks are the most expensive surface to maintain
-   because they fire on every event. v2 ships two, both read-only. Any
-   proposal to add a third hook must clear a high bar.
+2. **Minimal, non-decision hooks.** Hooks are expensive because they fire on
+   lifecycle events. v2 keeps six registrations narrow: two orient the
+   conductor and four sanitize lifecycle signals for blocking Mini waits. No
+   hook gates a tool, sends user input, makes a lease decision, edits user
+   settings, or persists prompt/transcript/terminal text. A new event must
+   clear the same high bar.
 3. **Bounded I/O via prompt contract, not signed artifacts.** A sub-agent
    or Codex call returns at most one structured message in a known shape.
    The conductor parses the shape and trusts it. The bound is enforced by
@@ -100,6 +105,10 @@ option that aligns with more of them.
 7. **Resumable by construction.** Anything that can't be reconstructed
    from `plan.json` + `progress.json` after a compaction is a bug. The
    only state that matters lives on disk.
+8. **Events wake; protocols prove.** Main `Stop`, `SubagentStop`,
+   `StopFailure`, an allowlisted input-needed notification, tmux exit, and
+   timeout are distinct wake reasons. None proves the Mini writer lease is
+   quiescent; guarded kill/reclaim protocol checks remain authoritative.
 
 ## How to read the rest of this spec
 

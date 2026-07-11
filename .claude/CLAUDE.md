@@ -37,8 +37,19 @@ plugin for Claude Code**. This repo holds both the design spec (under
   without amending that doc first.
 - **No regressions to v1 shape.** No `receipts/`, no HMAC sidecars, no
   `claude-review-*.md`, no `lbyl-digest` sub-agent, no shared `lib/`,
-  no third hook, no `pre-*` hooks, no Edit/Write gating, no
-  `--direction` flag (direction is the wrapper script's identity).
+  no `pre-*` hooks, no Edit/Write gating, no `--direction` flag (direction is
+  the wrapper script's identity). The shipped hook surface is exactly six
+  event registrations: two bounded context hooks plus four narrowly scoped,
+  fail-open, non-decision lifecycle observers backed by one private labels-only
+  queue bridge. This explicitly supersedes the former exactly-two-read-only-
+  hooks rule. Do not add events, persist hook payload text, screenshot-poll,
+  or edit user Claude settings.
+- **Mini lifecycle stays event-driven.** Natural start, continue, wait,
+  inspect, reveal, interrupt, kill, and reclaim intents route through
+  `skills/remote-agent-host/SKILL.md` and `scripts/remote-agent.sh`. Events,
+  tmux exit, and timeout are wake hints, never lease-quiescence proof; only the
+  guarded protocol decides kill/reclaim safety. Computer Use is exceptional
+  interactive handling, not a polling loop.
 - **Cross-reference by relative path.** Docs refer to each other as
   e.g. `docs/02-conductor.md`. Code may cite the doc that informs it
   in a single header comment, but skill prose should reference *skills

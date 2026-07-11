@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One closed, local session boundary for Claude, Codex, and Grok on the Mini.
+# Event records contain labels only; terminal and prompt content is never stored.
+umask 077
+
+usage() {
+  printf '%s\n' 'usage: agent-supervisor version|start|status|capture|send|interrupt|kill|enqueue|wait|reveal ...' >&2
+  exit 64
+}
+
+die() {
+  printf 'agent-supervisor: %s\n' "$*" >&2
+  exit 1
+}
+
+valid_session() {
+  case ${1:-} in
+    remote-agent--miospot--claude|remote-agent--miospot--codex|remote-agent--miospot--grok|\
+    remote-agent--orchestration--claude|remote-agent--orchestration--codex|remote-agent--orchestration--grok) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+session_harness() { printf '%s\n' "${1##*--}"; }
+
+session_project() {
+  local value=${1#remote-agent--}
+  printf '%s\n' "${value%%--*}"
+}
+
+valid_pane() {
+  case ${1:-} in
+    %*[!0-9]*|%|'') return 1 ;;
+    %*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_uint() {
+  case ${1:-} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+json_string() {
+  # All callers pass closed atoms or canonical filesystem paths. This helper is
+  # retained for the latter so status remains valid JSON on unusual roots.
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//'
+}
+
+readonly state_base="${XDG_STATE_HOME:-$HOME/.local/state}/orchestration/agent-supervisor"
+
+init_state() {
+  case $state_base in /*) ;; *) die 'supervisor state root must be absolute' ;; esac
+  [[ ! -L $state_base ]] || die 'supervisor state root must not be a symlink'
+  mkdir -p "$state_base"
+  [[ -d $state_base && ! -L $state_base && -O $state_base ]] \
+    || die 'supervisor state root must be an owned real directory'
+  [[ ! -L $state_base/sessions ]] || die 'supervisor sessions path must not be a symlink'
+  mkdir -p "$state_base/sessions"
+  [[ -d $state_base/sessions && ! -L $state_base/sessions && -O $state_base/sessions ]] \
+    || die 'supervisor sessions path must be an owned real directory'
+  chmod 700 "$state_base" "$state_base/sessions"
+}
+
+state_dir() { printf '%s/sessions/%s\n' "$state_base" "$1"; }
+
+atomic_write() {
+  local destination=$1 value=$2 temporary
+  temporary="${destination}.tmp.$$.$RANDOM"
+  printf '%s\n' "$value" >"$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$destination"
+}
+
+atomic_write_launcher() {
+  local destination=$1 session=$2 temporary
+  [[ ! -L $destination ]] || die 'reveal launcher must not be a symlink'
+  if [[ -e $destination && ( ! -f $destination || ! -O $destination ) ]]; then
+    die 'reveal launcher must be an owned regular file'
+  fi
+  temporary=$(mktemp "${destination}.tmp.XXXXXX") || die 'cannot create reveal launcher temporary'
+  if ! {
+    printf '%s\n' '#!/bin/sh' "exec tmux attach-session -t '$session'" >"$temporary" &&
+      chmod 700 "$temporary" &&
+      mv -f "$temporary" "$destination"
+  }; then
+    rm -f "$temporary"
+    die 'cannot install reveal launcher'
+  fi
+  [[ -f $destination && ! -L $destination && -O $destination && -x $destination ]] \
+    || die 'installed reveal launcher is not private'
+}
+
+open_terminal_launcher() {
+  local launcher=$1
+  if [[ -n ${AGENT_SUPERVISOR_TEST_OPEN:-} ]]; then
+    case $AGENT_SUPERVISOR_TEST_OPEN in /*) ;; *) die 'test open command must be absolute' ;; esac
+    [[ -x $AGENT_SUPERVISOR_TEST_OPEN ]] || die 'test open command is unavailable'
+    "$AGENT_SUPERVISOR_TEST_OPEN" -a Terminal -- "$launcher" >/dev/null
+    return
+  fi
+  /usr/bin/open -a Terminal -- "$launcher" >/dev/null
+}
+
+acquire_lock() {
+  local lock=$1 attempts=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [[ $attempts -lt 500 ]] || die 'event state is busy'
+    sleep 0.01
+  done
+  chmod 700 "$lock"
+}
+
+bounded_tail() {
+  tail -n 40 | tail -c 4096
+}
+
+require_existing() {
+  valid_session "$1" || usage
+  tmux has-session -t "$1" 2>/dev/null || die "session is absent: $1"
+}
+
+current_epoch() {
+  local directory
+  directory=$(state_dir "$1")
+  [[ -f $directory/epoch ]] || die "missing supervisor state: $1"
+  IFS= read -r REPLY <"$directory/epoch"
+  printf '%s\n' "$REPLY"
+}
+
+current_cursor() {
+  local directory value=0
+  directory=$(state_dir "$1")
+  if [[ -f $directory/cursor ]]; then IFS= read -r value <"$directory/cursor"; fi
+  valid_uint "$value" || die 'corrupt event cursor'
+  printf '%s\n' "$value"
+}
+
+emit_bootstrap() {
+  local session=$1 epoch cursor
+  epoch=$(current_epoch "$session")
+  cursor=$(current_cursor "$session")
+  emit_bootstrap_boundary "$session" "$epoch" "$cursor"
+}
+
+emit_bootstrap_boundary() {
+  local session=$1 epoch=$2 cursor=$3
+  printf '{"session":"running","name":"%s","epoch":"%s","cursor":%s,"bootstrapCursor":"%s:%s"}\n' \
+    "$session" "$epoch" "$cursor" "$epoch" "$cursor"
+}
+
+command=${1:-}
+case $command in
+  version)
+    [[ $# -eq 1 ]] || usage
+    printf '%s\n' agent-supervisor-v1
+    exit 0
+    ;;
+  start|status|capture|send|interrupt|kill|enqueue|wait|reveal) ;;
+  *) usage ;;
+esac
+shift
+init_state
+
+case $command in
+  start)
+    [[ $# -eq 4 && $4 == --yolo ]] || usage
+    session=$1 harness=$2 requested_root_token=$3
+    valid_session "$session" || usage
+    case $harness in claude|codex|grok) ;; *) usage ;; esac
+    [[ $(session_harness "$session") == "$harness" ]] || usage
+    case $requested_root_token in
+      project-root-v1:miospot) requested_project=miospot; requested_root=$HOME/Projects/miospot ;;
+      project-root-v1:orchestration) requested_project=orchestration; requested_root=$HOME/Projects/orchestration ;;
+      *) die 'start requires a closed project root token' ;;
+    esac
+    [[ $(session_project "$session") == "$requested_project" ]] || die 'project root token does not match session project'
+    [[ -d $requested_root && ! -L $requested_root ]] || die 'worktree root must be a real directory'
+    root=$(cd "$requested_root" && pwd -P) || die 'cannot canonicalize worktree root'
+    tmux has-session -t "$session" 2>/dev/null && die "session already exists: $session"
+
+    directory=$(state_dir "$session")
+    mkdir -p "$directory/events"
+    chmod 700 "$directory" "$directory/events"
+    cursor=0
+    if [[ -f $directory/cursor ]]; then IFS= read -r cursor <"$directory/cursor"; fi
+    valid_uint "$cursor" || die 'corrupt event cursor'
+    rm -f "$directory/events/"*
+    epoch="epoch-$(date +%s)-$$-$RANDOM"
+
+    start_complete=0
+    # The pre-launch cursor is the first-wait boundary. Preserve it if any
+    # placeholder, binding, or harness launch operation fails.
+    rollback_start() {
+      local status=$?
+      if [[ $start_complete -eq 0 ]]; then
+        tmux has-session -t "$session" 2>/dev/null && tmux kill-session -t "$session" 2>/dev/null || true
+        rm -rf "$directory"
+        mkdir -p "$directory/events" 2>/dev/null || true
+        chmod 700 "$directory" "$directory/events" 2>/dev/null || true
+        atomic_write "$directory/cursor" "$cursor" 2>/dev/null || true
+      fi
+      exit "$status"
+    }
+    trap rollback_start EXIT
+
+    # Create an attachable dormant pane first. The TUI is spawned only after
+    # the exact pane binding and restart epoch are durable, so its hooks can
+    # enqueue their first lifecycle event without racing supervisor state.
+    tmux new-session -d -s "$session" -c "$root"
+    pane=$(tmux display-message -p -t "$session:0.0" '#{pane_id}' 2>/dev/null || true)
+    if ! valid_pane "$pane"; then
+      pane=$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null | head -n 1 || true)
+    fi
+    valid_pane "$pane" || die 'cannot bind exact tmux pane'
+    atomic_write "$directory/root" "$root"
+    atomic_write "$directory/harness" "$harness"
+    atomic_write "$directory/pane" "$pane"
+    atomic_write "$directory/epoch" "$epoch"
+    atomic_write "$directory/cursor" "$cursor"
+    tmux respawn-pane -k -t "$pane" -c "$root" -- "$harness" --yolo
+    start_complete=1
+    trap - EXIT
+    emit_bootstrap_boundary "$session" "$epoch" "$cursor"
+    ;;
+
+  status)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    valid_session "$session" || usage
+    directory=$(state_dir "$session")
+    if tmux has-session -t "$session" 2>/dev/null; then
+      emit_bootstrap "$session"
+    else
+      printf '{"session":"absent","name":"%s"}\n' "$session"
+    fi
+    ;;
+
+  capture)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    require_existing "$session"
+    if [[ -n ${SUPERVISOR_CAPTURE_FILE:-} ]]; then
+      bounded_tail <"$SUPERVISOR_CAPTURE_FILE"
+    else
+      tmux capture-pane -p -t "$session" -S -200 | bounded_tail
+    fi
+    ;;
+
+  send)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    require_existing "$session"
+    directory=$(state_dir "$session")
+    [[ -f $directory/harness ]] || die 'missing session harness state'
+    IFS= read -r harness <"$directory/harness"
+    [[ $harness == "$(session_harness "$session")" ]] || die 'session harness state mismatch'
+    first=''
+    if ! IFS= read -r -n 1 first; then die 'send requires non-empty stdin'; fi
+    temporary=$(mktemp "$directory/.send.XXXXXX") || die 'cannot create private send buffer'
+    cleanup_send() { rm -f "$temporary"; }
+    trap cleanup_send EXIT HUP INT TERM
+    { printf '%s' "$first"; cat; } >"$temporary"
+    chmod 600 "$temporary"
+    buffer="remote-agent-$$-$RANDOM"
+    case $harness in
+      codex|grok)
+        bytes=$(wc -c <"$temporary" | tr -d ' ')
+        last_byte=$(tail -c 1 "$temporary" | od -An -tuC | tr -d ' ')
+        if [[ $last_byte == 10 ]]; then
+          head -c "$((bytes - 1))" "$temporary" | tmux load-buffer -b "$buffer" -
+        else
+          tmux load-buffer -b "$buffer" - <"$temporary"
+        fi
+        ;;
+      claude) tmux load-buffer -b "$buffer" - <"$temporary" ;;
+    esac
+    tmux paste-buffer -d -b "$buffer" -t "$session"
+    # TUIs process bracketed paste asynchronously; submitting in the same
+    # scheduler tick can leave the text sitting in the composer.
+    sleep 0.1
+    tmux send-keys -t "$session" Enter
+    rm -f "$temporary"
+    trap - EXIT HUP INT TERM
+    ;;
+
+  interrupt)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    require_existing "$session"
+    tmux send-keys -t "$session" C-c
+    ;;
+
+  kill)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    valid_session "$session" || usage
+    tmux has-session -t "$session" 2>/dev/null || die "session is absent: $session"
+    tmux kill-session -t "$session"
+    ;;
+
+  enqueue)
+    [[ $# -eq 4 ]] || usage
+    requested_root=$1 pane=$2 scope=$3 kind=$4
+    valid_pane "$pane" || usage
+    case $scope in main|subagent) ;; *) usage ;; esac
+    case $kind in completed|failed|input-needed) ;; *) usage ;; esac
+    [[ -d $requested_root ]] || die 'event root is not a directory'
+    root=$(cd "$requested_root" && pwd -P) || die 'cannot canonicalize event root'
+
+    matched=''
+    for directory in "$state_base/sessions/"remote-agent--*; do
+      [[ -d $directory && -f $directory/root && -f $directory/pane ]] || continue
+      IFS= read -r stored_root <"$directory/root"
+      IFS= read -r stored_pane <"$directory/pane"
+      session=${directory##*/}
+      if [[ $stored_root == "$root" && $stored_pane == "$pane" ]] && tmux has-session -t "$session" 2>/dev/null; then
+        [[ -z $matched ]] || die 'ambiguous root and pane binding'
+        matched=$session
+      fi
+    done
+    [[ -n $matched ]] || die 'no exact supervisor root and pane binding'
+    directory=$(state_dir "$matched")
+    lock=$directory/enqueue.lock
+    acquire_lock "$lock"
+    trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
+    cursor=$(current_cursor "$matched")
+    cursor=$((cursor + 1))
+    event=$(printf '%020d' "$cursor")
+    temporary="$directory/events/.${event}.$$.$RANDOM"
+    printf '%s %s\n' "$scope" "$kind" >"$temporary"
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$directory/events/$event"
+    atomic_write "$directory/cursor" "$cursor"
+    rmdir "$lock"
+    trap - EXIT HUP INT TERM
+    ;;
+
+  wait)
+    [[ $# -eq 3 ]] || usage
+    session=$1 supplied_cursor=$2 timeout=$3
+    valid_session "$session" || usage
+    valid_uint "$timeout" || usage
+    (( timeout <= 300 )) || usage
+    case $supplied_cursor in
+      0) after=0 ;;
+      epoch-*:*)
+        supplied_epoch=${supplied_cursor%:*}
+        after=${supplied_cursor##*:}
+        case $supplied_epoch in epoch-|*[!A-Za-z0-9._-]*) usage ;; esac
+        valid_uint "$after" || usage
+        ;;
+      *) usage ;;
+    esac
+    directory=$(state_dir "$session")
+    [[ -d $directory && -f $directory/epoch ]] || die "missing supervisor state: $session"
+    deadline=$((SECONDS + timeout))
+    while :; do
+      epoch=$(current_epoch "$session")
+      cursor=$(current_cursor "$session")
+      event_file=''
+      for candidate in "$directory/events/"[0-9]*; do
+        [[ -f $candidate ]] || continue
+        candidate_cursor=$((10#${candidate##*/}))
+        if (( candidate_cursor > after )); then event_file=$candidate; break; fi
+      done
+      if [[ -n $event_file ]]; then
+        IFS=' ' read -r scope kind <"$event_file"
+        event_cursor=$((10#${event_file##*/}))
+        printf '{"epoch":"%s","cursor":%s,"session":"%s","wake":"event","scope":"%s","kind":"%s"}\n' \
+          "$epoch" "$event_cursor" "$session" "$scope" "$kind"
+        exit 0
+      fi
+      if ! tmux has-session -t "$session" 2>/dev/null; then
+        printf '{"epoch":"%s","cursor":%s,"session":"%s","wake":"exit"}\n' "$epoch" "$cursor" "$session"
+        exit 0
+      fi
+      if (( SECONDS >= deadline )); then
+        printf '{"epoch":"%s","cursor":%s,"session":"%s","wake":"timeout"}\n' "$epoch" "$cursor" "$session"
+        exit 0
+      fi
+      sleep 0.05
+    done
+    ;;
+
+  reveal)
+    [[ $# -eq 1 ]] || usage
+    session=$1
+    require_existing "$session"
+    reveal_dir="$state_base/reveal"
+    [[ ! -L $reveal_dir ]] || die 'reveal state path must not be a symlink'
+    mkdir -p "$reveal_dir"
+    [[ -d $reveal_dir && ! -L $reveal_dir && -O $reveal_dir ]] \
+      || die 'reveal state path must be an owned real directory'
+    chmod 700 "$reveal_dir"
+    launcher="$reveal_dir/$session.command"
+    # The validated session is a closed atom, single-quoted in a fixed command;
+    # prompt stdin is ignored and never reaches the launcher or open argv.
+    atomic_write_launcher "$launcher" "$session"
+    open_terminal_launcher "$launcher"
+    ;;
+esac

@@ -199,6 +199,8 @@ test_remote_agent_host_contract() {
     'exact reveal session|remote-agent--PROJECT--HARNESS'
     'reveal keeps prompt out of argv|(reveal|Terminal).*(prompt).*(not|never|without).*(argv)|(prompt).*(not|never|without).*(argv).*(reveal|Terminal)'
     'reveal does not replace the pane|(reveal|Terminal).*(not|never|without).*(replace|replacing).*(pane)|(not|never|without).*(replace|replacing).*(pane).*(reveal|Terminal)'
+    'Mini Claude defaults to Fable xhigh|model=fable.*effortLevel=xhigh|Fable.*xhigh'
+    'Claude model preference is not a launch flag|not as launch flags|not.*launch arguments'
   )
 
   if [[ ! -f "$REMOTE_AGENT_HOST_SKILL" ]]; then

@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-codex-orchestration",
-  "description": "Conductor-mode orchestrator for Claude Code: persistent plans, direction-locked Codex impl/verify, bounded prompt-contract I/O, read-only hooks.",
+  "description": "Conductor-mode orchestrator for Claude Code: persistent plans, direction-locked Codex impl/verify, bounded prompt-contract I/O, read-only plan notices and fail-open lifecycle observers.",
   "owner": {
     "name": "Miospot Dev Team"
   },
   "plugins": [
     {
       "name": "orchestration",
-      "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only hooks, no gates.",
+      "description": "Conductor-mode orchestrator: persistent plans, bounded sub-agent dispatch, direction-locked Codex impl/verify. Read-only plan notices, fail-open private-queue lifecycle observers, no gates.",
       "source": "./orchestration",
       "category": "development"
     }
