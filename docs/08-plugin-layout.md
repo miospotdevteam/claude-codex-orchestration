@@ -47,7 +47,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
 ├── LICENSE                              ← MIT
 ├── install.sh                           ← conditional uninstall + install via claude CLI
 ├── docs/                                ← design spec (markdown only)
-│   ├── 01-philosophy.md … 11-routing-eval.md
+│   ├── 01-philosophy.md … 12-phone-control-surface.md
 │
 └── orchestration/                       ← plugin root (source: "./orchestration")
     ├── .claude-plugin/
@@ -93,14 +93,27 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   ├── parse-contract.sh            ← extract the contract block
     │   ├── remote-agent.sh              ← guarded host-side Mini boundary
     │   ├── agent-supervisor             ← Mini session/event adapter
-    │   └── remote-agent-v1              ← Mini synchronization authority
+    │   ├── remote-agent-v1              ← Mini synchronization authority
+    │   ├── agent-control                ← Mini-local guarded-verb authority (phone surface)
+    │   ├── phone-control-gateway        ← loopback HTTP+SSE daemon (Python 3 stdlib)
+    │   ├── phone-control-bridge         ← MacBook SSH long-poll ownership worker
+    │   └── phone-control-install-check  ← read-only install/hardening validator
     │
     ├── schemas/                         ← JSON schemas for plan files
     │   ├── plan.schema.json
     │   └── progress.schema.json
     │
     ├── templates/                       ← starter templates
-    │   └── masterPlan.template.md
+    │   ├── masterPlan.template.md
+    │   └── phone-control/               ← installable PWA shell + LaunchAgent plists
+    │       ├── index.html
+    │       ├── app.js
+    │       ├── style.css
+    │       ├── manifest.webmanifest
+    │       ├── sw.js
+    │       ├── icon.svg
+    │       ├── com.orchestration.phone-control-gateway.plist
+    │       └── com.orchestration.phone-control-bridge.plist
     │
     └── tests/                           ← hook + script tests
         ├── hooks/
@@ -119,17 +132,29 @@ claude-codex-orchestration/              ← repo root = marketplace root
             ├── run-grok-impl.test.sh
             ├── run-grok-verify.test.sh
             ├── skill-contracts.test.sh
-            └── validate-structure.test.sh
+            ├── validate-structure.test.sh
+            ├── agent-control.test.sh
+            ├── phone-control-gateway.test.sh
+            ├── phone-control-bridge.test.sh
+            ├── phone-control-install.test.sh
+            └── phone-control-e2e.test.sh
 ```
 
 Notes on shape:
 
-The shipped plugin subtree contains 18 Claude-side skills (9 core and 9
+The core plugin subtree contains 18 Claude-side skills (9 core and 9
 auxiliary), 1 Codex-side skill body, 2 read-only notice handlers and 1 fail-open
 private-queue observer with a six-event manifest, 9 scripts (4 model wrappers
 and 5 helpers), 2 schemas, 1 template, and 15 test suites (12 script suites and
-3 hook suites). The non-shipped routing eval adds 7 scripts and 5 test suites
-at the repo root.
+3 hook suites). The phone-from-anywhere control surface described in
+`12-phone-control-surface.md` extends this with 4 more scripts (`agent-control`,
+`phone-control-gateway`, `phone-control-bridge`, `phone-control-install-check`),
+the `templates/phone-control/` asset set (six PWA shell files plus two
+LaunchAgent plists), and 5 more test suites, and adds new verbs to the existing
+Mini authorities (`remote-agent-v1` gains `peek`, `git-align`, and the cession
+transitions; `remote-agent.sh` gains `cede` and `uncede`) — bringing the totals
+to 13 scripts and 20 test suites. The non-shipped routing eval adds 7 scripts
+and 5 test suites at the repo root.
 
 - **`.claude-plugin/` holds each manifest.** Claude Code's plugin
   schema places metadata under `.claude-plugin/` rather than at the
@@ -303,6 +328,7 @@ Cross-reference: which doc(s) inform which file.
 |------------------------------------------------|-----------------------------------------------------------|
 | `README.md`                                    | This repo's `README.md`, `01-philosophy.md`               |
 | `AGENTS.md`                                    | This repo's `AGENTS.md`, `02-conductor.md`                |
+| `docs/12-phone-control-surface.md`             | `12-phone-control-surface.md` (this artifact), `05-skills-catalog.md`, `08-plugin-layout.md` |
 | `.claude-plugin/plugin.json`                   | `08-plugin-layout.md` (this doc)                          |
 | `.claude-plugin/marketplace.json`              | `08-plugin-layout.md` (this doc)                          |
 | `install.sh`                                   | `08-plugin-layout.md` (this doc), the `claude plugin` CLI |
@@ -323,9 +349,21 @@ Cross-reference: which doc(s) inform which file.
 | `scripts/run-grok-verify.sh`                   | `10-grok-integration.md`                                  |
 | `scripts/plan-utils.sh`                        | `03-plan-format.md`                                       |
 | `scripts/parse-contract.sh`                    | `06-codex-integration.md`                                 |
-| `scripts/remote-agent.sh`                      | `05-skills-catalog.md`, `08-plugin-layout.md`             |
+| `scripts/remote-agent.sh`                      | `05-skills-catalog.md`, `08-plugin-layout.md`, `12-phone-control-surface.md` |
 | `scripts/agent-supervisor`                     | `05-skills-catalog.md`, `07-hooks.md`, `08-plugin-layout.md` |
-| `scripts/remote-agent-v1`                      | `05-skills-catalog.md`, `08-plugin-layout.md`             |
+| `scripts/remote-agent-v1`                      | `05-skills-catalog.md`, `08-plugin-layout.md`, `12-phone-control-surface.md` |
+| `scripts/agent-control`                        | `12-phone-control-surface.md`                             |
+| `scripts/phone-control-gateway`                | `12-phone-control-surface.md`                             |
+| `scripts/phone-control-bridge`                 | `12-phone-control-surface.md`                             |
+| `scripts/phone-control-install-check`          | `12-phone-control-surface.md`, `08-plugin-layout.md`      |
+| `templates/phone-control/index.html`           | `12-phone-control-surface.md`                             |
+| `templates/phone-control/app.js`               | `12-phone-control-surface.md`                             |
+| `templates/phone-control/style.css`            | `12-phone-control-surface.md`                             |
+| `templates/phone-control/manifest.webmanifest` | `12-phone-control-surface.md`                             |
+| `templates/phone-control/sw.js`                | `12-phone-control-surface.md`                             |
+| `templates/phone-control/icon.svg`             | `12-phone-control-surface.md`                             |
+| `templates/phone-control/com.orchestration.phone-control-gateway.plist` | `12-phone-control-surface.md`, `08-plugin-layout.md` |
+| `templates/phone-control/com.orchestration.phone-control-bridge.plist`  | `12-phone-control-surface.md`, `08-plugin-layout.md` |
 | `schemas/plan.schema.json`                     | `03-plan-format.md`                                       |
 | `schemas/progress.schema.json`                 | `03-plan-format.md`                                       |
 | `templates/masterPlan.template.md`             | `03-plan-format.md`                                       |
@@ -341,8 +379,13 @@ Cross-reference: which doc(s) inform which file.
 | `tests/scripts/run-grok-impl.test.sh`          | `10-grok-integration.md`                                  |
 | `tests/scripts/run-grok-verify.test.sh`        | `10-grok-integration.md`                                  |
 | `tests/scripts/skill-contracts.test.sh`        | `05-skills-catalog.md`                                    |
-| `tests/scripts/validate-structure.test.sh`     | `05-skills-catalog.md`                                    |
+| `tests/scripts/validate-structure.test.sh`     | `05-skills-catalog.md`, `12-phone-control-surface.md`     |
 | `tests/scripts/install.test.sh` (repo root `install.sh`) | `08-plugin-layout.md`                           |
+| `tests/scripts/agent-control.test.sh`          | `12-phone-control-surface.md`                             |
+| `tests/scripts/phone-control-gateway.test.sh`  | `12-phone-control-surface.md`                             |
+| `tests/scripts/phone-control-bridge.test.sh`   | `12-phone-control-surface.md`                             |
+| `tests/scripts/phone-control-install.test.sh`  | `12-phone-control-surface.md`, `08-plugin-layout.md`      |
+| `tests/scripts/phone-control-e2e.test.sh`      | `12-phone-control-surface.md`                             |
 | `eval/corpus/`                                 | `11-routing-eval.md`                                      |
 | `eval/scripts/`                                | `11-routing-eval.md`                                      |
 | `eval/results/`                                | `11-routing-eval.md`                                      |

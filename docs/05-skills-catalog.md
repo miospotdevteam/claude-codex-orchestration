@@ -384,6 +384,19 @@ ownership nor substitutes for reclaim. The skill never improvises raw tmux or
 transport commands, never edits user Claude settings, and uses Computer Use
 only for exceptional explicit interaction after a wake—not as a polling loop.
 
+The skill also routes the two cession intents, `cede` and `uncede`, that arm and
+cancel a phone-originated Mini-content start. `cede` runs the same canonical
+worktree gate under the Mini mutex and issues a single-use, MacBook-issued
+cession only from a clean, equal, writer-none relation; `uncede` cancels an
+unconsumed one. A phone-started session carries an explicit `origin=phone` writer
+record and is live/active exactly like any other lease, and every guarded MacBook
+operation fails closed if local content has drifted from an active cession's
+baseline. The phone control surface — an installable app served tailnet-only from
+the Mini that re-calls the host-independent verbs and queues the two
+ownership-changing ones — is specified in full in
+`12-phone-control-surface.md`; this catalog is updated to the shipped contract
+once that surface lands.
+
 ### Codex-side skill bodies (`codex-skills/`)
 
 For the dual-install pattern (currently `react-native-mobile`), Codex

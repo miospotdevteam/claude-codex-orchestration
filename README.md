@@ -61,7 +61,7 @@ claude-codex-orchestration/      ← repo root = marketplace root
 ├── .claude/
 │   └── CLAUDE.md                ← context for any Claude session editing this repo
 ├── docs/                        ← the design spec (markdown only)
-│   ├── 01-philosophy.md … 11-routing-eval.md
+│   ├── 01-philosophy.md … 12-phone-control-surface.md
 │
 ├── orchestration/               ← plugin root (marketplace source: "./orchestration")
 │   ├── .claude-plugin/
