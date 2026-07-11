@@ -214,14 +214,14 @@ notice=$(
       def step_status($p; $id):
         $p.steps[$id].status // "pending";
       def frontier_ids($plan; $progress):
-        if (($progress.currentFrontier // []) | length) > 0 then
-          $progress.currentFrontier[]
-        else
-          $plan.steps[]
-          | select((step_status($progress; .id) == "pending")
-              and all((.dependsOn // [])[]; step_status($progress; .) == "done"))
-          | .id
-        end;
+        # Recompute from statuses (same rule as compute-frontier):
+        # stored currentFrontier can be stale after start-step flips a
+        # step to in_progress, and the resume notice must not announce
+        # already-dispatched steps as runnable.
+        $plan.steps[]
+        | select((step_status($progress; .id) == "pending")
+            and all((.dependsOn // [])[]; step_status($progress; .) == "done"))
+        | .id;
 
       $plan[0] as $pl
       | $progress[0] as $pr
