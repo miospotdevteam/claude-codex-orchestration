@@ -104,6 +104,40 @@ protocol_stage_path() {
   return 1
 }
 
+init_git_checkout() {
+  git -C "$REMOTE_ROOT" init -q
+  git -C "$REMOTE_ROOT" config user.name 'Remote Agent Test'
+  git -C "$REMOTE_ROOT" config user.email remote-agent@example.invalid
+  git -C "$REMOTE_ROOT" add tracked.txt
+  git -C "$REMOTE_ROOT" commit -qm base
+  git -C "$REMOTE_ROOT" branch -M mini-base
+}
+
+make_transfer_source() {
+  TRANSFER_SOURCE="$CASE/source"
+  git clone -q "$REMOTE_ROOT" "$TRANSFER_SOURCE"
+  git -C "$TRANSFER_SOURCE" config user.name 'Remote Agent Test'
+  git -C "$TRANSFER_SOURCE" config user.email remote-agent@example.invalid
+  git -C "$TRANSFER_SOURCE" switch -qc transferred
+  printf 'committed-on-source\n' >"$TRANSFER_SOURCE/tracked.txt"
+  git -C "$TRANSFER_SOURCE" add tracked.txt
+  git -C "$TRANSFER_SOURCE" commit -qm transferred
+  TRANSFER_HEAD=$(git -C "$TRANSFER_SOURCE" rev-parse HEAD)
+  printf 'dirty-on-source\n' >"$TRANSFER_SOURCE/tracked.txt"
+  printf 'untracked-on-source\n' >"$TRANSFER_SOURCE/untracked.txt"
+}
+
+stage_transfer_source() {
+  local stage
+  expect_success stage $'umask 077\nmode=0700' miospot outbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+  cp "$TRANSFER_SOURCE/tracked.txt" "$stage/tracked.txt"
+  cp "$TRANSFER_SOURCE/untracked.txt" "$stage/untracked.txt"
+  git -C "$TRANSFER_SOURCE" bundle create "$stage/.remote-agent-git.bundle" transferred
+  expect_success restore-journal mode=0600 miospot || return 1
+  expect_success stage-verify miospot transfer-digest || return 1
+}
+
 test_closed_vocabulary_and_private_authority() {
   expect_failure unknown-operation || return 1
   assert_contains "$STDERR" 'usage' || return 1
@@ -185,6 +219,63 @@ test_stage_is_outside_worktree_and_removes_legacy_stage() {
   stage=$(protocol_stage_path) || return 1
   [[ $stage != "$REMOTE_ROOT"/* ]] || return 1
   [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]]
+}
+
+test_inbound_stage_contains_worktree_manifest_and_bundle() {
+  local stage actual expected
+  init_git_checkout || return 1
+  printf 'dirty-on-mini\n' >"$REMOTE_ROOT/tracked.txt"
+  printf 'untracked-on-mini\n' >"$REMOTE_ROOT/untracked.txt"
+  expect_success stage $'umask 077\nmode=0700' miospot inbound "$AUTHORITY_TOKEN" || return 1
+  stage=$(protocol_stage_path) || return 1
+
+  run_protocol populate-inbound miospot mini-base "$(git -C "$REMOTE_ROOT" rev-parse HEAD)"
+  actual=$(find "$stage" -type f -print | sed "s#^$stage/##" | LC_ALL=C sort)
+  expected=$(printf '%s\n' .remote-agent-git.bundle tracked.txt untracked.txt | LC_ALL=C sort)
+  if [[ $actual != "$expected" ]]; then
+    printf 'inbound stage mismatch: expected manifest plus bundle; actual=%q\n' "$actual" >&2
+    return 1
+  fi
+  cmp "$REMOTE_ROOT/tracked.txt" "$stage/tracked.txt" || return 1
+  cmp "$REMOTE_ROOT/untracked.txt" "$stage/untracked.txt" || return 1
+  [[ $STATUS -eq 0 ]] || return 1
+  git -C "$REMOTE_ROOT" bundle verify "$stage/.remote-agent-git.bundle" >/dev/null
+}
+
+test_outbound_alignment_sets_branch_head_and_unstages_dirt() {
+  local source_paths remote_paths
+  init_git_checkout || return 1
+  make_transfer_source || return 1
+  stage_transfer_source || return 1
+  expect_success apply-exact miospot transfer-digest || return 1
+  expect_success git-align miospot transferred "$TRANSFER_HEAD" || return 1
+
+  [[ $(git -C "$REMOTE_ROOT" symbolic-ref --quiet --short HEAD) == transferred ]] || return 1
+  [[ $(git -C "$REMOTE_ROOT" rev-parse HEAD) == "$TRANSFER_HEAD" ]] || return 1
+  source_paths=$(git -C "$TRANSFER_SOURCE" status --porcelain=v1 | cut -c4- | LC_ALL=C sort)
+  remote_paths=$(git -C "$REMOTE_ROOT" status --porcelain=v1 | cut -c4- | LC_ALL=C sort)
+  [[ $remote_paths == "$source_paths" ]] || return 1
+  git -C "$REMOTE_ROOT" diff --cached --quiet
+}
+
+test_alignment_failure_restores_prior_refs_index_and_content() {
+  local before_branch before_head before_status
+  init_git_checkout || return 1
+  printf 'staged-before-transfer\n' >"$REMOTE_ROOT/tracked.txt"
+  git -C "$REMOTE_ROOT" add tracked.txt
+  before_branch=$(git -C "$REMOTE_ROOT" symbolic-ref --quiet --short HEAD)
+  before_head=$(git -C "$REMOTE_ROOT" rev-parse HEAD)
+  before_status=$(git -C "$REMOTE_ROOT" status --porcelain=v1)
+  make_transfer_source || return 1
+  stage_transfer_source || return 1
+  expect_success apply-exact miospot transfer-digest || return 1
+
+  REMOTE_AGENT_TEST_FAULT=git-align-after-ref-update run_protocol git-align miospot transferred "$TRANSFER_HEAD"
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ $(git -C "$REMOTE_ROOT" symbolic-ref --quiet --short HEAD) == "$before_branch" ]] || return 1
+  [[ $(git -C "$REMOTE_ROOT" rev-parse HEAD) == "$before_head" ]] || return 1
+  [[ $(git -C "$REMOTE_ROOT" status --porcelain=v1) == "$before_status" ]] || return 1
+  [[ $(<"$REMOTE_ROOT/tracked.txt") == staged-before-transfer ]]
 }
 
 test_successful_apply_removes_stage() {
@@ -387,6 +478,9 @@ run_test 'the project mutex has exactly one concurrent winner' test_mutex_is_ato
 run_test 'generation CAS fails closed without clobbering state' test_generation_cas_never_clobbers
 run_test 'private staging applies exactly and restores on failure' test_staging_apply_and_verified_restore
 run_test 'stage is outside the worktree and replaces a legacy in-root stage' test_stage_is_outside_worktree_and_removes_legacy_stage
+run_test 'inbound stage is the Mini manifest plus one reciprocal bundle sidecar' test_inbound_stage_contains_worktree_manifest_and_bundle
+run_test 'outbound alignment sets transferred branch and HEAD with all dirt unstaged' test_outbound_alignment_sets_branch_head_and_unstages_dirt
+run_test 'alignment failure restores prior refs index and worktree from the journal' test_alignment_failure_restores_prior_refs_index_and_content
 run_test 'successful exact apply removes its private stage' test_successful_apply_removes_stage
 run_test 'failed exact apply removes its private stage after verified restore' test_failed_apply_restore_removes_stage
 run_test 'lease abort removes its private stage' test_lease_abort_removes_stage

@@ -6,7 +6,7 @@ set -euo pipefail
 umask 077
 
 usage() {
-  printf '%s\n' 'usage: remote-agent-v1 probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture ...' >&2
+  printf '%s\n' 'usage: remote-agent-v1 probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|populate-inbound|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|git-align|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture ...' >&2
   exit 64
 }
 
@@ -101,7 +101,7 @@ restore_snapshot() {
 
 command=${1:-}
 case $command in
-  probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture) ;;
+  probe|adopt|mutex-acquire|mutex-release|generation-check|common-state-cas|stage|populate-inbound|deletion-inventory|inventory-path|restore-journal|stage-verify|apply-exact|git-align|restore-verify|recovery-required|lease-provisional|lease-abort|lease-commit|quiescent|post-sync-verify|release-only-verify|lease-release|capture) ;;
   *) usage ;;
 esac
 shift
@@ -160,9 +160,19 @@ case $command in
       else writer=provisional
       fi
     fi
+    remote_branch='' remote_head=''
+    if [[ $relation == remote-only ]]; then
+      remote_branch=$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+      remote_head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
+      case $remote_branch in ''|*[!A-Za-z0-9._/-]*) remote_branch='' ;; esac
+      case $remote_head in ''|*[!0-9a-f]*) remote_head='' ;; esac
+    fi
     if [[ -d $directory/mutex ]]; then
       owner=$(read_value "$directory/mutex/owner" unknown)
       printf '{"mutex":"held","owner":"%s","generation":%s}\n' "$owner" "$gen"
+    elif [[ -n $remote_branch && ( ${#remote_head} -eq 40 || ${#remote_head} -eq 64 ) ]]; then
+      printf '{"relation":"%s","writer":"%s","lease":"%s","generation":%s,"remoteBranch":"%s","remoteHead":"%s"}\n' \
+        "$relation" "$writer" "$lease" "$gen" "$remote_branch" "$remote_head"
     else
       printf '{"relation":"%s","writer":"%s","lease":"%s","generation":%s}\n' "$relation" "$writer" "$lease" "$gen"
     fi
@@ -228,6 +238,7 @@ case $command in
     case $3 in outbound|inbound) ;; *) usage ;; esac
     require_authority "$4"
     remove_stage "$project"
+    rm -f "$directory/inventory" "$directory/inventory-digest"
     trap 'remove_stage "$project"' EXIT
     stage=$(stage_dir "$project")
     mkdir -p "$stage"
@@ -239,6 +250,81 @@ case $command in
     [[ $stage_response_bytes -le 4096 ]] || die 'stage response exceeds 4096-byte bound'
     printf '%s\n' "$stage_response"
     trap - EXIT
+    ;;
+
+  populate-inbound)
+    [[ $# -eq 3 ]] || usage
+    branch=$2 head=$3 stage=$(stage_dir "$project")
+    [[ -d $stage ]] || die 'missing stage'
+    [[ $(read_value "$directory/stage-direction" '') == inbound ]] || die 'inbound stage required'
+    git -C "$root" check-ref-format --branch "$branch" >/dev/null 2>&1 || die 'invalid branch'
+    actual_root=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || die 'project root is not a Git worktree'
+    canonical_root=$(cd -- "$root" 2>/dev/null && pwd -P) || die 'project root is not a real directory'
+    [[ $actual_root == "$canonical_root" ]] || die 'project root is not the exact Git toplevel'
+    actual_branch=$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null) || die 'detached or ambiguous HEAD'
+    [[ $actual_branch == "$branch" ]] || die 'branch mismatch'
+    actual_head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || die 'invalid HEAD'
+    supplied_head=$(git -C "$root" rev-parse --verify "${head}^{commit}" 2>/dev/null) || die 'invalid supplied HEAD'
+    [[ $supplied_head == "$head" && $actual_head == "$head" ]] || die 'HEAD mismatch'
+
+    population="$directory/populate.$$.$RANDOM"
+    rm -rf "$population"
+    mkdir -p "$population"
+    chmod 700 "$population"
+    trap 'rm -rf "$population"' EXIT
+    paths=$population/.manifest.nul
+    : >"$paths"
+    chmod 600 "$paths"
+    git -C "$root" ls-files -z >"$paths" || die 'cannot enumerate tracked files'
+    git -C "$root" ls-files --others --exclude-standard -z >>"$paths" || die 'cannot enumerate untracked files'
+    if [[ -f $directory/inventory ]]; then
+      while IFS= read -r path; do
+        printf '%s\0' "$path" >>"$paths"
+      done <"$directory/inventory"
+    fi
+    while IFS= read -r -d '' path; do
+      valid_relative_path "$path" || die 'unsafe Git path'
+      [[ $path != .git && $path != .git/* ]] || die '.git is never transferable'
+      [[ $path != .remote-agent-git.bundle ]] || die 'reserved bundle path is not transferable'
+      [[ ! -L $root/$path ]] || die "refusing symlink in transfer universe: $path"
+      [[ -f $root/$path ]] || continue
+      destination=$population/$path
+      mkdir -p "${destination%/*}"
+      cp -p -- "$root/$path" "$destination"
+    done <"$paths"
+    bundle=$population/.remote-agent-git.bundle
+    git -C "$root" bundle create "$bundle" "refs/heads/$branch" >/dev/null || die 'cannot create reciprocal Git bundle'
+    git -C "$root" bundle verify "$bundle" >/dev/null 2>&1 || die 'cannot verify reciprocal Git bundle'
+    final_paths=$population/.manifest-final.nul
+    git -C "$root" ls-files -z >"$final_paths" || die 'cannot re-enumerate tracked files'
+    git -C "$root" ls-files --others --exclude-standard -z >>"$final_paths" || die 'cannot re-enumerate untracked files'
+    if [[ -f $directory/inventory ]]; then
+      while IFS= read -r path; do
+        printf '%s\0' "$path" >>"$final_paths"
+      done <"$directory/inventory"
+    fi
+    cmp -s "$paths" "$final_paths" || die 'worktree manifest changed during inbound population'
+    while IFS= read -r -d '' path; do
+      valid_relative_path "$path" || die 'unsafe Git path'
+      [[ $path != .git && $path != .git/* ]] || die '.git is never transferable'
+      [[ $path != .remote-agent-git.bundle ]] || die 'reserved bundle path is not transferable'
+      [[ ! -L $root/$path ]] || die "refusing symlink in transfer universe: $path"
+      if [[ -f $root/$path ]]; then
+        [[ -f $population/$path && ! -L $population/$path ]] || die 'worktree shape changed during inbound population'
+        cmp -s "$root/$path" "$population/$path" || die 'worktree content changed during inbound population'
+      else
+        [[ ! -e $population/$path && ! -L $population/$path ]] || die 'worktree shape changed during inbound population'
+      fi
+    done <"$final_paths"
+    rm -f "$paths" "$final_paths"
+    final_branch=$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null) || die 'HEAD changed during inbound population'
+    final_head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || die 'HEAD changed during inbound population'
+    [[ $final_branch == "$branch" && $final_head == "$head" ]] || die 'branch or HEAD changed during inbound population'
+    rm -rf "$stage"
+    mv "$population" "$stage"
+    trap - EXIT
+    trace "$project" populate-inbound
+    printf '{"populate":"verified"}\n'
     ;;
 
   deletion-inventory)
@@ -323,6 +409,47 @@ case $command in
     remove_stage "$project"
     trace "$project" apply-exact
     printf '{"apply":"verified"}\n'
+    ;;
+
+  git-align)
+    [[ $# -eq 3 ]] || usage
+    branch=$2 head=$3 bundle=$root/.remote-agent-git.bundle
+    journal=$directory/restore
+    [[ -d $journal ]] || die 'restore journal missing'
+    [[ -d $root/.git && ! -L $root/.git && -d $journal/.git && ! -L $journal/.git ]] || die 'journalable Git directories required'
+
+    restore_alignment() {
+      if restore_snapshot "$project"; then
+        trace "$project" git-align-restore || true
+        printf '{"align":"failed","restore":"verified"}\n'
+      else
+        trace "$project" git-align-restore-failed || true
+        printf '{"align":"failed","restore":"failed"}\n'
+      fi
+      exit 1
+    }
+
+    [[ -f $bundle && ! -L $bundle ]] || restore_alignment
+    git -C "$root" check-ref-format --branch "$branch" >/dev/null 2>&1 || restore_alignment
+    actual_root=$(git -C "$root" rev-parse --show-toplevel 2>/dev/null) || restore_alignment
+    canonical_root=$(cd -- "$root" 2>/dev/null && pwd -P) || restore_alignment
+    [[ $actual_root == "$canonical_root" ]] || restore_alignment
+    advertised=$(git -C "$root" bundle list-heads "$bundle" 2>/dev/null) || restore_alignment
+    [[ $advertised == "$head refs/heads/$branch" ]] || restore_alignment
+    git -C "$root" bundle verify "$bundle" >/dev/null 2>&1 || restore_alignment
+    git -C "$root" bundle unbundle "$bundle" >/dev/null 2>&1 || restore_alignment
+    imported_head=$(git -C "$root" rev-parse --verify "${head}^{commit}" 2>/dev/null) || restore_alignment
+    [[ $imported_head == "$head" ]] || restore_alignment
+    ref=refs/heads/$branch
+    git -C "$root" update-ref "$ref" "$head" || restore_alignment
+    if [[ ${REMOTE_AGENT_TEST_FAULT:-} == git-align-after-ref-update ]]; then
+      restore_alignment
+    fi
+    git -C "$root" symbolic-ref HEAD "$ref" || restore_alignment
+    git -C "$root" reset --mixed "$head" >/dev/null || restore_alignment
+    rm -f -- "$bundle" || restore_alignment
+    trace "$project" git-align || restore_alignment
+    printf '{"align":"verified"}\n'
     ;;
 
   restore-verify)

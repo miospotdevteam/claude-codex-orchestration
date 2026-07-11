@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+MAX_OUTPUT_BYTES=4096
+LOCK_DIR=
+LOCK_BOOT=
+
+json_error() {
+  local code=$1 message=$2
+  jq -cn --arg code "$code" --arg message "$message" \
+    '{ok:false,error:$code,message:($message[0:256])}'
+}
+
+fail() {
+  json_error "$1" "$2"
+  exit "${3:-1}"
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || {
+    printf '%s\n' '{"ok":false,"error":"missing-dependency","message":"jq is required"}'
+    exit 69
+  }
+}
+
+boot_token() {
+  local raw token sysctl_bin
+  if [[ -r /proc/stat ]]; then
+    awk '/^btime / { print $2; exit }' /proc/stat
+    return
+  fi
+  if command -v sysctl >/dev/null 2>&1 || [[ -x /usr/sbin/sysctl ]]; then
+    sysctl_bin=$(command -v sysctl 2>/dev/null || printf '%s\n' /usr/sbin/sysctl)
+    raw=$($sysctl_bin -n kern.boottime 2>/dev/null || true)
+    token=$(printf '%s\n' "$raw" | awk -F'[=,{} \t]+' '{
+      for (i = 1; i <= NF; i++)
+        if ($i == "sec" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit }
+    }')
+    if [[ -n $token ]]; then
+      printf '%s\n' "$token"
+      return
+    fi
+  fi
+  stat -c %W / 2>/dev/null || stat -f %B / 2>/dev/null || printf '0\n'
+}
+
+release_lock() {
+  local holder_pid holder_boot
+  if [[ -n ${LOCK_DIR:-} && -d $LOCK_DIR ]]; then
+    holder_pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$LOCK_DIR/holder" 2>/dev/null | head -n 1 || true)
+    holder_boot=$(sed -n 's/^boot=\(.*\)$/\1/p' "$LOCK_DIR/holder" 2>/dev/null | head -n 1 || true)
+    if [[ $holder_pid == "$$" && $holder_boot == "$LOCK_BOOT" ]]; then
+      rm -rf -- "$LOCK_DIR"
+    fi
+  fi
+  LOCK_DIR=
+  LOCK_BOOT=
+}
+
+acquire_lock() {
+  local wanted=$1 holder pid held_boot current_boot stale attempt
+  current_boot=$(boot_token)
+  attempt=0
+  while (( attempt < 3 )); do
+    if mkdir -m 700 -- "$wanted" 2>/dev/null; then
+      LOCK_DIR=$wanted
+      holder="$wanted/holder"
+      printf 'pid=%s\nboot=%s\n' "$$" "$current_boot" >"$holder"
+      chmod 600 "$holder"
+      LOCK_BOOT=$current_boot
+      return 0
+    fi
+
+    holder="$wanted/holder"
+    pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+    held_boot=$(sed -n 's/^boot=\(.*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+    if [[ -z $pid || ! $held_boot =~ ^[0-9]+$ ]]; then
+      return 1
+    fi
+    if [[ $held_boot == "$current_boot" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+
+    stale="${wanted}.stale.$$.$attempt"
+    if mv -- "$wanted" "$stale" 2>/dev/null; then
+      rm -rf -- "$stale"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+state_home=${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}
+registry_root="$state_home/orchestration/workflows"
+byproject_root="$registry_root/byproject"
+
+validate_atom() {
+  local value=$1 kind=$2
+  [[ -n $value && $value =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]] \
+    || fail invalid-argument "invalid $kind" 64
+}
+
+validate_workflow_id() {
+  [[ $1 =~ ^wf-[a-z0-9][a-z0-9-]{0,47}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$ ]] \
+    || fail invalid-workflow "invalid workflowId" 64
+}
+
+atomic_text() {
+  local target=$1 value=$2 tmp
+  tmp=$(mktemp "${target}.tmp.XXXXXX")
+  printf '%s\n' "$value" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+
+phase_transition_allowed() {
+  local from=$1 to=$2
+  case "$from:$to" in
+    bootstrapping:bootstrapping|bootstrapping:planning|bootstrapping:running|bootstrapping:recovering|bootstrapping:failed|bootstrapping:failed-recovery|bootstrapping:quiescing|\
+    planning:planning|planning:awaiting-approval|planning:failed|planning:failed-recovery|planning:quiescing|\
+    awaiting-approval:awaiting-approval|awaiting-approval:planning|awaiting-approval:running|awaiting-approval:failed|awaiting-approval:failed-recovery|awaiting-approval:quiescing|\
+    running:running|running:idle|running:needs-input|running:delivery-pending|running:exited|running:failed|running:failed-recovery|running:recovering|running:quiescing|\
+    idle:idle|idle:running|idle:needs-input|idle:exited|idle:failed|idle:failed-recovery|idle:recovering|idle:quiescing|\
+    needs-input:needs-input|needs-input:running|needs-input:delivery-pending|needs-input:exited|needs-input:failed|needs-input:failed-recovery|needs-input:recovering|needs-input:quiescing|\
+    delivery-pending:delivery-pending|delivery-pending:running|delivery-pending:needs-input|delivery-pending:failed|delivery-pending:failed-recovery|delivery-pending:recovering|delivery-pending:quiescing|\
+    exited:exited|exited:recovering|exited:failed-recovery|exited:quiescing|\
+    recovering:recovering|recovering:running|recovering:idle|recovering:needs-input|recovering:failed-recovery|recovering:quiescing|\
+    failed:failed|failed-recovery:failed-recovery|\
+    quiescing:quiescing|quiescing:quiesced|quiesced:quiesced|quiesced:released|released:released)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+workflow_record() {
+  local wf_dir=$1 meta phase latch pending jobs_file job count
+  meta="$wf_dir/meta.json"
+  [[ -f $meta ]] || return 1
+  phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || printf 'unknown')
+  if [[ ! $phase =~ ^(bootstrapping|planning|awaiting-approval|running|idle|needs-input|delivery-pending|exited|failed|failed-recovery|recovering|quiescing|quiesced|released)$ ]]; then
+    phase=unknown
+  fi
+
+  latch=null
+  if [[ -f $wf_dir/needs-input.json ]]; then
+    latch=$(jq -c '
+      try {
+        workflowId: ((.workflowId // "") | tostring | .[0:96]),
+        state: ((.state // "") | tostring | .[0:32]),
+        journalSeq: (.journalSeq // .seq // null),
+        kind: ((.kind // "") | tostring | .[0:48]),
+        raisedAt: ((.raisedAt // "") | tostring | .[0:40])
+      } catch null
+    ' "$wf_dir/needs-input.json" 2>/dev/null || printf 'null')
+  fi
+
+  pending=null
+  if [[ -f $wf_dir/pending-send.json ]]; then
+    pending=$(jq -c '
+      try {
+        requestId: ((.requestId // "") | tostring | .[0:96]),
+        sha256: ((.sha256 // "") | tostring | .[0:64]),
+        bytes: (.bytes // null),
+        queuedAt: ((.queuedAt // "") | tostring | .[0:40])
+      } catch null
+    ' "$wf_dir/pending-send.json" 2>/dev/null || printf 'null')
+  fi
+
+  jobs_file=$(mktemp "${TMPDIR:-/tmp}/workflow-registry-jobs.XXXXXX")
+  count=0
+  if [[ -d $wf_dir/mirror-queue ]]; then
+    while IFS= read -r job && (( count < 4 )); do
+      jq -c '
+        try {
+          jobId: ((.jobId // "") | tostring | .[0:96]),
+          state: ((.state // "") | tostring | .[0:32]),
+          createdAt: ((.createdAt // "") | tostring | .[0:40])
+        } catch empty
+      ' "$job" 2>/dev/null >>"$jobs_file" || true
+      count=$((count + 1))
+    done < <(find "$wf_dir/mirror-queue" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | LC_ALL=C sort)
+  fi
+
+  jq -cn \
+    --slurpfile meta "$meta" \
+    --arg phase "${phase:0:32}" \
+    --argjson latch "$latch" \
+    --argjson pending "$pending" \
+    --slurpfile jobs "$jobs_file" '
+      ($meta[0] // {}) as $m
+      | {
+          workflowId: (($m.workflowId // "") | tostring | .[0:96]),
+          project: (($m.project // "") | tostring | .[0:48]),
+          planId: (($m.planId // "") | tostring | .[0:96]),
+          residentHost: (($m.residentHost // "") | tostring | .[0:96]),
+          phase: $phase,
+          latch: $latch,
+          pendingSend: $pending,
+          mirrorJobs: $jobs
+        }
+    '
+  rm -f -- "$jobs_file"
+}
+
+mint_workflow() {
+  [[ $# -eq 4 ]] || fail usage 'mint requires PROJECT PLAN_ID CHECKOUT HOST' 64
+  local project=$1 plan_id=$2 checkout_arg=$3 resident_host=$4 checkout plan_dir
+  local root_var configured_root stamp suffix workflow_id wf_dir binding meta_tmp marker marker_tmp
+
+  validate_atom "$project" project
+  [[ $project =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || fail invalid-project 'invalid project' 64
+  validate_atom "$plan_id" planId
+  validate_atom "$resident_host" residentHost
+  [[ $checkout_arg == /* && $checkout_arg != *$'\n'* && -d $checkout_arg ]] \
+    || fail invalid-checkout 'checkout does not exist' 66
+  checkout=$(cd "$checkout_arg" && pwd -P)
+  plan_dir="$checkout/.temp/plan-mode/active/$plan_id"
+  [[ -f $plan_dir/plan.json && -f $plan_dir/progress.json && -f $plan_dir/masterPlan.md ]] \
+    || fail invalid-plan 'active plan trio is incomplete' 66
+
+  root_var="REMOTE_AGENT_ROOT_$(printf '%s' "$project" | tr '[:lower:]-' '[:upper:]_')"
+  configured_root=${!root_var:-}
+  if [[ -n $configured_root ]]; then
+    configured_root=$(cd "$configured_root" 2>/dev/null && pwd -P) \
+      || fail invalid-checkout 'configured Mini checkout does not exist' 66
+    [[ $configured_root == "$checkout" ]] || fail root-mismatch 'checkout does not match configured Mini root' 65
+  fi
+
+  mkdir -p -m 700 -- "$registry_root" "$byproject_root"
+  chmod 700 "$state_home/orchestration" "$registry_root" "$byproject_root" 2>/dev/null || true
+  acquire_lock "$registry_root/.registry-$project.lock" \
+    || fail busy 'registry lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+
+  binding="$byproject_root/$project"
+  if [[ -f $binding ]]; then
+    workflow_id=$(head -n 1 "$binding" 2>/dev/null || true)
+    fail active-workflow "project already has active workflow $workflow_id" 73
+  fi
+
+  stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  suffix=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
+  workflow_id="wf-$project-$stamp-$suffix"
+  wf_dir="$registry_root/$workflow_id"
+  [[ ! -e $wf_dir ]] || fail id-collision 'workflowId collision' 73
+
+  mkdir -m 700 -- "$wf_dir"
+  meta_tmp=$(mktemp "$wf_dir/.meta.XXXXXX")
+  jq -cn \
+    --arg workflowId "$workflow_id" \
+    --arg project "$project" \
+    --arg planId "$plan_id" \
+    --arg checkout "$checkout" \
+    --arg residentHost "$resident_host" \
+    --arg createdAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{schemaVersion:1,workflowId:$workflowId,project:$project,planId:$planId,checkout:$checkout,residentHost:$residentHost,createdAt:$createdAt}' \
+    >"$meta_tmp"
+  chmod 600 "$meta_tmp"
+  mv -f -- "$meta_tmp" "$wf_dir/meta.json"
+  atomic_text "$wf_dir/phase" bootstrapping
+
+  marker="$plan_dir/mini-workflow.json"
+  marker_tmp=$(mktemp "$plan_dir/.mini-workflow.XXXXXX")
+  jq -cn \
+    --arg workflowId "$workflow_id" \
+    --arg residentHost "$resident_host" \
+    --arg project "$project" \
+    '{workflowId:$workflowId,residentHost:$residentHost,project:$project}' \
+    >"$marker_tmp"
+  chmod 600 "$marker_tmp"
+  mv -f -- "$marker_tmp" "$marker"
+  atomic_text "$binding" "$workflow_id"
+
+  release_lock
+  trap - EXIT HUP INT TERM
+  jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"bootstrapping"}'
+}
+
+list_workflows() {
+  [[ $# -eq 0 ]] || fail usage 'list takes no arguments' 64
+  local records wf count output
+  records=$(mktemp "${TMPDIR:-/tmp}/workflow-registry-list.XXXXXX")
+  count=0
+  if [[ -d $registry_root ]]; then
+    while IFS= read -r wf && (( count < 4 )); do
+      workflow_record "$wf" >>"$records" || true
+      count=$((count + 1))
+    done < <(find "$registry_root" -mindepth 1 -maxdepth 1 -type d -name 'wf-*' -print 2>/dev/null | LC_ALL=C sort)
+  fi
+  output=$(jq -sc '{ok:true,workflows:.}' "$records")
+  rm -f -- "$records"
+  (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) || fail output-too-large 'list output exceeded bound' 70
+  printf '%s\n' "$output"
+}
+
+inspect_workflow() {
+  [[ $# -eq 1 ]] || fail usage 'inspect requires WORKFLOW_ID' 64
+  local workflow_id=$1 wf_dir record output
+  validate_workflow_id "$workflow_id"
+  wf_dir="$registry_root/$workflow_id"
+  [[ -d $wf_dir ]] || fail not-found 'workflow not found' 66
+  record=$(workflow_record "$wf_dir") || fail invalid-state 'workflow state is incomplete' 65
+  output=$(jq -cn --argjson workflow "$record" '{ok:true,workflow:$workflow}')
+  (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) || fail output-too-large 'inspect output exceeded bound' 70
+  printf '%s\n' "$output"
+}
+
+set_phase() {
+  [[ $# -eq 2 ]] || fail usage 'phase-set requires WORKFLOW_ID PHASE' 64
+  local workflow_id=$1 next=$2 wf_dir current
+  validate_workflow_id "$workflow_id"
+  [[ $next =~ ^(bootstrapping|planning|awaiting-approval|running|idle|needs-input|delivery-pending|exited|failed|failed-recovery|recovering|quiescing|quiesced|released)$ ]] \
+    || fail invalid-phase 'phase is outside the closed vocabulary' 64
+  wf_dir="$registry_root/$workflow_id"
+  [[ -d $wf_dir && -f $wf_dir/phase ]] || fail not-found 'workflow not found' 66
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  current=$(head -n 1 "$wf_dir/phase")
+  phase_transition_allowed "$current" "$next" \
+    || fail invalid-transition 'phase transition is refused' 65
+  atomic_text "$wf_dir/phase" "$next"
+  release_lock
+  trap - EXIT HUP INT TERM
+  jq -cn --arg workflowId "$workflow_id" --arg phase "$next" \
+    '{ok:true,workflowId:$workflowId,phase:$phase}'
+}
+
+require_jq
+operation=${1:-}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$operation" in
+  mint) mint_workflow "$@" ;;
+  list) list_workflows "$@" ;;
+  inspect) inspect_workflow "$@" ;;
+  phase-set) set_phase "$@" ;;
+  '') fail usage 'operation is required' 64 ;;
+  *) fail unknown-operation 'unknown or unsupported operation' 64 ;;
+esac

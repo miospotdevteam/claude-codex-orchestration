@@ -554,9 +554,42 @@ run_guarded_apply() {
   esac
 }
 
+run_guarded_alignment() {
+  local alignment_response alignment_result=$work_dir/alignment-result alignment_status
+  : >"$alignment_result"
+  chmod 600 "$alignment_result"
+  if ssh_call "$PROTOCOL" git-align "$project" "$local_branch" "$local_head" >"$alignment_result"; then
+    return 0
+  else
+    alignment_status=$?
+  fi
+  alignment_response=$(<"$alignment_result")
+  case $alignment_response in
+    *'"restore":"verified"'*)
+      ssh_quiet "$PROTOCOL" restore-verify "$project"
+      die 'destination Git alignment failed; pre-transfer snapshot restored and verified'
+      ;;
+    *'"restore":"failed"'*)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "$owner_record"
+      release_mutex=0
+      die 'destination Git alignment and restore failed; authoritative recovery-required evidence retained'
+      ;;
+    *)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "$owner_record"
+      release_mutex=0
+      die "destination Git alignment failed with status $alignment_status; authoritative recovery-required evidence retained"
+      ;;
+  esac
+}
+
 transfer_outbound() {
+  local bundle=$work_dir/.remote-agent-git.bundle
   local post_snapshot=$work_dir/post-snapshot.nul path
+  local post_status=$work_dir/post-status.nul pre_status=$work_dir/pre-status.nul
   local stage_path
+  git status --porcelain=v1 -z >"$pre_status"
+  git bundle create "$bundle" "refs/heads/$local_branch" >/dev/null
+  git bundle verify "$bundle" >/dev/null 2>&1
   request_stage outbound
   ssh_quiet "$PROTOCOL" deletion-inventory "$project" "$universe_digest"
   while IFS= read -r -d '' path; do
@@ -564,23 +597,50 @@ transfer_outbound() {
   done <"$manifest"
   ssh_quiet "$PROTOCOL" restore-journal mode=0600 "$project"
   rsync -a --from0 --files-from="$manifest" -- "$local_root/" "$host:$stage_path/"
+  rsync -a -- "$bundle" "$host:$stage_path/.remote-agent-git.bundle"
   ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
   snapshot_payload "$post_snapshot"
   cmp -s "$pre_snapshot" "$post_snapshot" || die 'source snapshot changed during outbound staging'
+  git status --porcelain=v1 -z >"$post_status"
+  cmp -s "$pre_status" "$post_status" || die 'source Git status changed during outbound staging'
   run_guarded_apply
+  run_guarded_alignment
 }
 
 transfer_inbound() {
-  local inbound_stage=$work_dir/inbound-stage stage_path
+  local advertised bundle inbound_stage=$work_dir/inbound-stage
+  local current_branch current_head remote_branch remote_head stage_path
+  case $response in
+    *'"relation":"mismatch"'*) die "post-sync mismatch: $response" ;;
+  esac
+  remote_branch=$(printf '%s\n' "$response" | sed -n 's/.*"remoteBranch":"\([^"]*\)".*/\1/p')
+  remote_head=$(printf '%s\n' "$response" | sed -n 's/.*"remoteHead":"\([^"]*\)".*/\1/p')
+  [[ -n $remote_branch && -n $remote_head ]] || die 'Mini response omitted Git alignment metadata'
+  git check-ref-format --branch "$remote_branch" >/dev/null 2>&1 || die 'Mini returned an invalid branch'
+  [[ $remote_head =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die 'Mini returned an invalid commit ID'
   mkdir "$inbound_stage"
   chmod 700 "$inbound_stage"
   request_stage inbound
-  ssh_quiet "$PROTOCOL" deletion-inventory "$project" "$universe_digest"
-  ssh_quiet "$PROTOCOL" restore-journal mode=0600 "$project"
+  ssh_quiet "$PROTOCOL" populate-inbound "$project" "$remote_branch" "$remote_head"
   rsync -a -- "$host:$stage_path/" "$inbound_stage/"
   ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
-  run_guarded_apply
-  rsync -a -- "$inbound_stage/" "$local_root/"
+  bundle=$inbound_stage/.remote-agent-git.bundle
+  advertised=$(git bundle list-heads "$bundle" 2>/dev/null) || die 'Mini reciprocal Git bundle could not be inspected'
+  [[ $advertised == "$remote_head refs/heads/$remote_branch" ]] || die 'Mini reciprocal Git bundle advertised unexpected refs'
+  git bundle verify "$bundle" >/dev/null 2>&1 || die 'Mini reciprocal Git bundle failed verification'
+  git bundle unbundle "$bundle" >/dev/null 2>&1 || die 'Mini reciprocal Git bundle could not be imported'
+  current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || die 'local HEAD became detached during reclaim'
+  current_head=$(git rev-parse HEAD) || die 'local HEAD became invalid during reclaim'
+  [[ $current_branch == "$local_branch" && $current_head == "$local_head" ]] || die 'local branch or HEAD changed during reclaim'
+  git merge-base --is-ancestor "$local_head" "$remote_head" || die 'reclaim requires a fast-forward from the local HEAD'
+  rsync -a --exclude=/.remote-agent-git.bundle -- "$inbound_stage/" "$local_root/"
+  if [[ $remote_branch == "$local_branch" ]]; then
+    git update-ref "refs/heads/$remote_branch" "$remote_head" "$local_head"
+  else
+    git update-ref "refs/heads/$remote_branch" "$remote_head" ''
+    git symbolic-ref HEAD "refs/heads/$remote_branch"
+  fi
+  git reset --mixed "$remote_head" >/dev/null
 }
 
 if [[ $command == start ]]; then

@@ -56,11 +56,15 @@ setup_case() {
   REMOTE_BIN="$CASE/remote-bin"
   FAKE_BIN="$CASE/bin"
   COMMAND_LOG="$CASE/commands.log"
+  GIT_REF_LOG="$CASE/git-ref-operations.log"
+  GIT_STATUS_FILE="$CASE/git-status.nul"
   SSH_STDIN="$CASE/ssh.stdin"
   STDOUT="$CASE/stdout"
   STDERR="$CASE/stderr"
   mkdir -p "$TEST_HOME" "$TEST_STATE" "$LOCAL_ROOT" "$DECOY_ROOT" "$REMOTE_ROOT" "$REMOTE_HOME" "$REMOTE_STATE" "$REMOTE_BIN" "$FAKE_BIN"
   : >"$COMMAND_LOG"
+  : >"$GIT_REF_LOG"
+  : >"$GIT_STATUS_FILE"
   : >"$SSH_STDIN"
   : >"$STDOUT"
   : >"$STDERR"
@@ -146,7 +150,10 @@ case "${REMOTE_SCENARIO:-equal}" in
   local-only-quiescent) printf '{"relation":"local-only","writer":"quiescent","generation":7}\n' ;;
   unknown-writer) printf '{"relation":"equal","writer":"unexpected","generation":7}\n' ;;
   local-only) printf '{"relation":"local-only","generation":7}\n' ;;
-  remote-only) printf '{"relation":"remote-only","generation":7}\n' ;;
+  remote-only)
+    printf '{"relation":"remote-only","generation":7,"remoteBranch":"%s","remoteHead":"%s"}\n' \
+      "${REMOTE_GIT_BRANCH:-mini-work}" "${REMOTE_GIT_HEAD:-fedcba9876543210fedcba9876543210fedcba98}"
+    ;;
   diverged) printf '{"relation":"diverged","paths":["left.txt","right.txt"]}\n' ;;
   post-mismatch) printf '{"relation":"mismatch","paths":["tampered.txt"],"generation":7}\n' ;;
   lock-held) printf '{"mutex":"held","owner":"other-client:4321"}\n' ;;
@@ -187,8 +194,15 @@ case "$name $*" in
     [[ $PWD != "${MOCK_GIT_FAIL_ROOT:-}" ]] || exit 128
     printf '%s\n' "${MOCK_GIT_TOPLEVEL_OVERRIDE:-$PWD}"
     ;;
-  'git rev-parse --abbrev-ref HEAD') printf 'main\n' ;;
-  'git rev-parse HEAD') printf '0123456789abcdef0123456789abcdef01234567\n' ;;
+  'git rev-parse --abbrev-ref HEAD') printf '%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
+  'git rev-parse HEAD') printf '%s\n' "${MOCK_GIT_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+  'git symbolic-ref --quiet --short HEAD') printf '%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
+  'git symbolic-ref --quiet HEAD') printf 'refs/heads/%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
+  'git status --porcelain=v1 -z') cat "$MOCK_GIT_STATUS_FILE" ;;
+  'git merge-base --is-ancestor '*) [[ ${MOCK_GIT_ANCESTOR:-1} == 1 ]] || exit 1 ;;
+  'git bundle create '*) : >"${3:?bundle destination}" ;;
+  'git bundle list-heads '*) printf '%s refs/heads/%s\n' "$REMOTE_GIT_HEAD" "$REMOTE_GIT_BRANCH" ;;
+  'git bundle verify '*) ;;
   'git ls-files -z')
     printf 'README.md\0src/app.ts\0'
     case $PWD in
@@ -208,6 +222,21 @@ case "$name $*" in
       *) digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
     esac
     printf '%s  -\n' "$digest"
+    ;;
+esac
+
+case "$name ${1:-}" in
+  'git update-ref'|'git reset'|'git fetch'|'git checkout'|'git switch')
+    printf 'git' >>"$GIT_REF_LOG"
+    for argument in "$@"; do printf ' <%q>' "$argument" >>"$GIT_REF_LOG"; done
+    printf '\n' >>"$GIT_REF_LOG"
+    ;;
+  'git symbolic-ref')
+    if [[ ${2:-} != --quiet ]]; then
+      printf 'git' >>"$GIT_REF_LOG"
+      for argument in "$@"; do printf ' <%q>' "$argument" >>"$GIT_REF_LOG"; done
+      printf '\n' >>"$GIT_REF_LOG"
+    fi
     ;;
 esac
 MOCK
@@ -231,6 +260,8 @@ run_helper() {
     XDG_STATE_HOME="$TEST_STATE" \
     PATH="$FAKE_BIN:/usr/bin:/bin" \
     COMMAND_LOG="$COMMAND_LOG" \
+    GIT_REF_LOG="$GIT_REF_LOG" \
+    MOCK_GIT_STATUS_FILE="$GIT_STATUS_FILE" \
     SSH_STDIN="$SSH_STDIN" \
     LOCAL_ROOT="${GENERIC_LOCAL_ROOT_OVERRIDE:-}" \
     LOCAL_MIOSPOT_ROOT="$mapped_miospot_root" \
@@ -240,8 +271,13 @@ run_helper() {
     MOCK_DECOY_ROOT="$DECOY_ROOT" \
     MOCK_GIT_FAIL_ROOT="${MOCK_GIT_FAIL_ROOT:-}" \
     MOCK_GIT_TOPLEVEL_OVERRIDE="${MOCK_GIT_TOPLEVEL_OVERRIDE:-}" \
+    MOCK_GIT_BRANCH="${MOCK_GIT_BRANCH:-main}" \
+    MOCK_GIT_HEAD="${MOCK_GIT_HEAD:-0123456789abcdef0123456789abcdef01234567}" \
+    MOCK_GIT_ANCESTOR="${MOCK_GIT_ANCESTOR:-1}" \
     REMOTE_ROOT="$REMOTE_ROOT" \
     REMOTE_SCENARIO="$scenario" \
+    REMOTE_GIT_BRANCH="${REMOTE_GIT_BRANCH:-mini-work}" \
+    REMOTE_GIT_HEAD="${REMOTE_GIT_HEAD:-fedcba9876543210fedcba9876543210fedcba98}" \
     REMOTE_AGENT_HOST="${REMOTE_AGENT_HOST_OVERRIDE:-fixture-mini}" \
     MOCK_IGNORED="${MOCK_IGNORED:-}" \
     MOCK_SAFE_PATH="${MOCK_SAFE_PATH:-}" \
@@ -839,6 +875,47 @@ test_reclaim_remote_only_release_last() {
   [[ -n "$verify_line" && -n "$release_line" && $verify_line -lt $release_line ]]
 }
 
+test_outbound_handoff_requests_bundle_and_exact_git_alignment() {
+  MOCK_GIT_BRANCH=feature/handoff
+  MOCK_GIT_HEAD=1111111111111111111111111111111111111111
+  printf ' M README.md\0?? notes.txt\0' >"$GIT_STATUS_FILE"
+  expect_success local-only start miospot claude || return 1
+  assert_contains "$COMMAND_LOG" '<bundle> <create>' || return 1
+  assert_contains "$COMMAND_LOG" '<git-align> <miospot> <feature/handoff> <1111111111111111111111111111111111111111>' || return 1
+  assert_contains "$COMMAND_LOG" '<status> <--porcelain=v1> <-z>'
+}
+
+test_reclaim_fast_forwards_branch_and_resets_index_mixed() {
+  local mini_head=fedcba9876543210fedcba9876543210fedcba98
+  MOCK_GIT_BRANCH=main
+  MOCK_GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+  REMOTE_GIT_BRANCH=main
+  REMOTE_GIT_HEAD=$mini_head
+  expect_success remote-only reclaim miospot claude || return 1
+  assert_contains "$COMMAND_LOG" "<populate-inbound> <miospot> <main> <$mini_head>" || return 1
+  assert_contains "$COMMAND_LOG" "<merge-base> <--is-ancestor> <0123456789abcdef0123456789abcdef01234567> <$mini_head>" || return 1
+  assert_contains "$GIT_REF_LOG" "<update-ref> <refs/heads/main> <$mini_head>" || return 1
+  assert_contains "$GIT_REF_LOG" "<reset> <--mixed> <$mini_head>"
+}
+
+test_reclaim_refuses_non_fast_forward_without_ref_mutation() {
+  MOCK_GIT_ANCESTOR=0 run_helper remote-only reclaim miospot claude
+  [[ $STATUS -ne 0 ]] || return 1
+  assert_contains "$STDERR" 'fast-forward' || return 1
+  [[ ! -s $GIT_REF_LOG ]]
+}
+
+test_refusal_paths_never_mutate_git_refs_or_index() {
+  expect_failure diverged start miospot claude || return 1
+  [[ ! -s $GIT_REF_LOG ]] || return 1
+  : >"$GIT_REF_LOG"
+  expect_failure cas-lost start miospot claude || return 1
+  [[ ! -s $GIT_REF_LOG ]] || return 1
+  : >"$GIT_REF_LOG"
+  expect_failure apply-fails-recovery start miospot claude || return 1
+  [[ ! -s $GIT_REF_LOG ]]
+}
+
 test_equal_quiescent_reclaim_releases_without_transfer() {
   expect_success equal-quiescent reclaim miospot claude || return 1
   assert_contains "$COMMAND_LOG" '<generation-check> <miospot> <7>' || return 1
@@ -935,6 +1012,11 @@ case ${1:-} in
     printf '%s' "$6" >"$XDG_STATE_HOME/adapter-received-owner"
     printf '%s' "$7" >"$XDG_STATE_HOME/adapter-received-authority"
     ;;
+  git-align)
+    printf '%s %s %s' "$2" "$3" "$4" >"$XDG_STATE_HOME/adapter-received-git-align"
+    printf '%s\n' '{"align":"verified"}'
+    exit 0
+    ;;
 esac
 exec "$REAL_PROTOCOL" "$@"
 MOCK
@@ -994,6 +1076,7 @@ MOCK
   [[ $(<"$REMOTE_STATE/adapter-received-privacy") == $'umask 077\nmode=0700' ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter-received-path") == "$safe_path" ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter-received-session") == "$session" ]] || return 1
+  [[ $(<"$REMOTE_STATE/adapter-received-git-align") == 'miospot main 0123456789abcdef0123456789abcdef01234567' ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter-received-supervisor-session") == "$session" ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter-received-root") == project-root-v1:miospot ]] || return 1
   [[ $(<"$REMOTE_STATE/adapter-received-authority") == authority-root-v1 ]] || return 1
@@ -1096,6 +1179,10 @@ run_test 'failed destination apply restores before ownership can advance' test_f
 run_test 'nonzero apply status restores before ownership can advance' test_nonzero_apply_status_restores_before_state_change
 run_test 'failed restore preserves authoritative recovery and mutex evidence' test_failed_restore_preserves_recovery_evidence
 run_test 'reclaim pulls remote-only work and releases ownership last' test_reclaim_remote_only_release_last
+run_test 'outbound handoff ships a bundle and requests exact branch HEAD alignment' test_outbound_handoff_requests_bundle_and_exact_git_alignment
+run_test 'reclaim fast-forwards the MacBook branch and rebuilds a mixed index' test_reclaim_fast_forwards_branch_and_resets_index_mixed
+run_test 'non-fast-forward reclaim refuses without mutating refs or index' test_reclaim_refuses_non_fast_forward_without_ref_mutation
+run_test 'divergence CAS loss and recovery-required paths never mutate Git' test_refusal_paths_never_mutate_git_refs_or_index
 run_test 'equal quiescent reclaim is release-only with zero transfer' test_equal_quiescent_reclaim_releases_without_transfer
 run_test 'local-only quiescent reclaim is release-only with zero transfer' test_local_only_quiescent_reclaim_releases_without_transfer
 run_test 'reclaim receives into verified private staging before local apply' test_reclaim_stages_before_local_apply
