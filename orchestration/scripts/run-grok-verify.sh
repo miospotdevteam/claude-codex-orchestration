@@ -189,6 +189,7 @@ grok \
   --prompt-file "$PROMPT_FILE" \
   --cwd "$ROOT_DIR" \
   -m grok-4.5 \
+  --reasoning-effort high \
   --max-turns 80 \
   --leader-socket "$LEADER_SOCKET" \
   --deny 'Write' \

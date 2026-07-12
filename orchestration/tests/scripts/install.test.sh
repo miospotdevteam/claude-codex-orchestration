@@ -9,14 +9,20 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 PASS_COUNT=0
 FAIL_COUNT=0
-EXTERNAL_SKILLS=(
+PORTABLE_SKILLS=(
   engineering-discipline
   test-driven-development
   refactoring
   systematic-debugging
-  webapp-testing
+  brainstorming
+  doc-coauthoring
+  frontend-design
+  svg-art
+  immersive-frontend
   mcp-builder
   react-native-mobile
+  webapp-testing
+  skill-review-standard
 )
 
 pass() {
@@ -53,6 +59,11 @@ setup_case() {
   LISTING_FILE="$CASE_DIR/plugin-list.json"
   INSTALL_MARKER="$CASE_DIR/plugin-installed"
   COMMAND_LOG="$CASE_DIR/claude.log"
+  CODEX_LOG="$CASE_DIR/codex.log"
+  CODEX_LISTING_FILE="$CASE_DIR/codex-list.json"
+  CODEX_INSTALL_MARKER="$CASE_DIR/codex-installed"
+  CODEX_ARTIFACT="$CASE_DIR/codex-artifact"
+  CODEX_PLUGIN_SOURCE="$CODEX_ARTIFACT/codex-plugin"
   GIT_LOG="$CASE_DIR/git.log"
   STDOUT_FILE="$CASE_DIR/stdout"
   STDERR_FILE="$CASE_DIR/stderr"
@@ -64,9 +75,25 @@ setup_case() {
   write_executable "$FAKE_BIN/gh" \
     '#!/usr/bin/env bash' \
     'exit 0'
+  mkdir -p "$CODEX_PLUGIN_SOURCE/.codex-plugin" \
+    "$CODEX_ARTIFACT/external-skills" "$CODEX_ARTIFACT/scripts"
+  printf '{"name":"orchestration"}\n' >"$CODEX_PLUGIN_SOURCE/.codex-plugin/plugin.json"
+  jq -n --arg path "$CODEX_PLUGIN_SOURCE" \
+    '{installed:[{pluginId:"orchestration@claude-codex-orchestration",source:{path:$path}}]}' \
+    >"$CODEX_LISTING_FILE"
+  # These variables intentionally expand when the generated mock runs.
+  # shellcheck disable=SC2016
   write_executable "$FAKE_BIN/codex" \
     '#!/usr/bin/env bash' \
-    'exit 0'
+    'set -euo pipefail' \
+    'printf "%s\n" "$*" >>"$CODEX_LOG"' \
+    'case "$*" in' \
+    '  "plugin marketplace list --json") printf "{\"marketplaces\":[]}\n" ;;' \
+    '  "plugin marketplace add miospotdevteam/claude-codex-orchestration --json") printf "{}\n" ;;' \
+    '  "plugin add orchestration@claude-codex-orchestration --json") : >"$CODEX_INSTALL_MARKER"; printf "{}\n" ;;' \
+    '  "plugin list --json") command cat "$CODEX_LISTING_FILE" ;;' \
+    '  *) printf "unexpected codex command: %s\n" "$*" >&2; exit 64 ;;' \
+    'esac'
   write_executable "$FAKE_BIN/grok" \
     '#!/usr/bin/env bash' \
     'exit 0'
@@ -103,18 +130,20 @@ setup_case() {
 
 populate_artifact() {
   local artifact="$1" marker="$2" skill
-  mkdir -p "$artifact/.claude-plugin" "$artifact/skills" "$artifact/codex-skills"
+  mkdir -p "$artifact/.claude-plugin" "$artifact/skills" \
+    "$artifact/codex-skills" "$artifact/external-skills"
   printf '{"name":"orchestration"}\n' >"$artifact/.claude-plugin/plugin.json"
-  for skill in "${EXTERNAL_SKILLS[@]}"; do
+  for skill in "${PORTABLE_SKILLS[@]}"; do
     write_skill "$artifact/skills" "$skill" "$marker:$skill:skills"
   done
   write_skill "$artifact/codex-skills" react-native-mobile "$marker:react-native-mobile:codex-skills"
+  write_skill "$artifact/external-skills" frontend-design "$marker:frontend-design:external-skills"
 }
 
 populate_stale_checkout() {
   local skill
   mkdir -p "$STALE_CHECKOUT/orchestration/skills" "$STALE_CHECKOUT/orchestration/codex-skills"
-  for skill in "${EXTERNAL_SKILLS[@]}"; do
+  for skill in "${PORTABLE_SKILLS[@]}"; do
     write_skill "$STALE_CHECKOUT/orchestration/skills" "$skill" "CHECKOUT:$skill:skills"
   done
   write_skill "$STALE_CHECKOUT/orchestration/codex-skills" react-native-mobile \
@@ -129,8 +158,11 @@ run_installer() {
     LISTING_FILE="$LISTING_FILE" \
     INSTALL_MARKER="$INSTALL_MARKER" \
     COMMAND_LOG="$COMMAND_LOG" \
+    CODEX_LOG="$CODEX_LOG" \
+    CODEX_LISTING_FILE="$CODEX_LISTING_FILE" \
+    CODEX_INSTALL_MARKER="$CODEX_INSTALL_MARKER" \
     GIT_LOG="$GIT_LOG" \
-    bash "$STALE_CHECKOUT/install.sh" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    bash "$STALE_CHECKOUT/install.sh" --host claude >"$STDOUT_FILE" 2>"$STDERR_FILE"
   INSTALL_STATUS=$?
   set -e
 }
@@ -138,10 +170,12 @@ run_installer() {
 assert_cache_sync() {
   local lane skill expected
   for lane in .codex .grok; do
-    for skill in "${EXTERNAL_SKILLS[@]}"; do
+    for skill in "${PORTABLE_SKILLS[@]}"; do
       expected="CACHE:$skill:skills"
       if [[ "$skill" == react-native-mobile ]]; then
         expected='CACHE:react-native-mobile:codex-skills'
+      elif [[ "$skill" == frontend-design ]]; then
+        expected='CACHE:frontend-design:external-skills'
       fi
       [[ "$(<"$TEST_HOME/$lane/skills/$skill/SKILL.md")" == "$expected" ]] || return 1
     done
@@ -321,6 +355,62 @@ test_legacy_claude_plugin_is_uninstalled() {
   fi
 }
 
+test_claude_host_installs_codex_dependency() {
+  local name='--host claude installs the required Codex dependency'
+  setup_case claude-codex-dependency
+  populate_artifact "$CACHE_ONE" CACHE
+  populate_stale_checkout
+  jq -n --arg path "$CACHE_ONE" \
+    '{plugins:{orchestration:{installPath:$path}}}' >"$LISTING_FILE"
+
+  run_installer
+  if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $INSTALL_STATUS; stderr=$(<"$STDERR_FILE")"
+  elif [[ "$(grep -Fxc 'plugin add orchestration@claude-codex-orchestration --json' "$CODEX_LOG")" -ne 1 ]]; then
+    fail "$name" 'Claude host did not install Codex exactly once'
+  else
+    pass "$name"
+  fi
+}
+
+test_both_installs_codex_and_syncs_each_lane_once() {
+  local name='--host both installs Codex once and syncs each external lane once'
+  setup_case both-hosts
+  populate_artifact "$CACHE_ONE" CACHE
+  populate_stale_checkout
+  write_skill "$CACHE_ONE/skills" cache-only-managed CACHE
+  seed_discovery_sentinels
+  jq -n --arg path "$CACHE_ONE" \
+    '{plugins:{orchestration:{installPath:$path}}}' >"$LISTING_FILE"
+
+  set +e
+  HOME="$TEST_HOME" \
+    PATH="$FAKE_BIN:$PATH" \
+    LISTING_FILE="$LISTING_FILE" \
+    INSTALL_MARKER="$INSTALL_MARKER" \
+    COMMAND_LOG="$COMMAND_LOG" \
+    CODEX_LOG="$CODEX_LOG" \
+    CODEX_LISTING_FILE="$CODEX_LISTING_FILE" \
+    CODEX_INSTALL_MARKER="$CODEX_INSTALL_MARKER" \
+    GIT_LOG="$GIT_LOG" \
+    bash "$STALE_CHECKOUT/install.sh" --host both >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  INSTALL_STATUS=$?
+  set -e
+
+  if [[ "$INSTALL_STATUS" -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $INSTALL_STATUS; stderr=$(<"$STDERR_FILE")"
+  elif [[ "$(grep -Fxc 'plugin add orchestration@claude-codex-orchestration --json' "$CODEX_LOG")" -ne 1 ]]; then
+    fail "$name" 'Codex plugin was not installed exactly once'
+  elif [[ "$(grep -Fc 'codex: 13 skill(s) synced' "$STDOUT_FILE")" -ne 1 \
+    || "$(grep -Fc 'grok: 13 skill(s) synced' "$STDOUT_FILE")" -ne 1 ]]; then
+    fail "$name" 'an external lane was synced more or less than once'
+  elif ! assert_cache_sync; then
+    fail "$name" 'both-host sync did not use the Claude installed artifact'
+  else
+    pass "$name"
+  fi
+}
+
 test_plugin_id_keyed_cache_is_the_only_source
 test_bare_name_keyed_cache_is_supported
 test_array_id_listing_is_supported
@@ -328,6 +418,8 @@ test_missing_install_path_fails_before_cleanup
 test_ambiguous_install_paths_fail_before_cleanup
 test_legacy_claude_marketplace_is_removed
 test_legacy_claude_plugin_is_uninstalled
+test_claude_host_installs_codex_dependency
+test_both_installs_codex_and_syncs_each_lane_once
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

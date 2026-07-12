@@ -9,10 +9,10 @@
 #   - Then installs (or reinstalls) the plugin.
 #
 # Usage:
-#   bash install.sh
+#   bash install.sh [--host codex|claude|both]
 #
 # Prerequisites:
-#   - claude CLI on PATH (Claude Code)
+#   - the selected host CLI on PATH (Codex is the default)
 #   - gh CLI on PATH, authenticated against an account with read access
 #     to the public miospotdevteam/claude-codex-orchestration repo
 #   - jq on PATH
@@ -32,17 +32,133 @@ ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bash install.sh [--host codex|claude|both]
+
+Hosts:
+  codex   Install the Codex plugin only (default; never invokes Claude).
+  claude  Install the Claude Code plugin plus required Codex/Grok dependencies.
+  both    Install both hosts so switching is explicit and immediate.
+USAGE
+}
+
+host=codex
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      host=$2
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+case "$host" in
+  codex|claude|both) ;;
+  *) die "unsupported host: $host (expected codex, claude, or both)" ;;
+esac
+
 # ---- preflight --------------------------------------------------------------
 
-command -v claude >/dev/null || die "claude CLI not on PATH. Install Claude Code first."
 command -v gh     >/dev/null || die "gh CLI not on PATH. Install GitHub CLI first."
 command -v jq     >/dev/null || die "jq not on PATH. Install jq first (brew install jq)."
+
+command -v codex >/dev/null || die "codex CLI not on PATH. Every host requires Codex as an implementation and verification lane."
+command -v grok  >/dev/null || die "grok CLI not on PATH. Every host requires Grok 4.5 as its independent counterweight."
+if [[ "$host" == claude || "$host" == both ]]; then
+  command -v claude >/dev/null || die "claude CLI not on PATH. Install Claude Code first."
+fi
 
 if ! gh auth status >/dev/null 2>&1; then
   die "gh is not authenticated. Run 'gh auth login' first."
 fi
 
 ok "prereqs OK"
+
+install_codex_host() {
+  local marketplaces
+
+  log "installing Codex host from $MARKETPLACE_SOURCE"
+  marketplaces=$(codex plugin marketplace list --json) \
+    || die "could not read Codex marketplace listing"
+  if jq -e --arg name "$MARKETPLACE_NAME" \
+    '.marketplaces | any(.name == $name)' <<<"$marketplaces" >/dev/null; then
+    codex plugin marketplace upgrade "$MARKETPLACE_NAME" --json >/dev/null
+    ok "Codex marketplace updated"
+  else
+    codex plugin marketplace add "$MARKETPLACE_SOURCE" --json >/dev/null
+    ok "Codex marketplace added"
+  fi
+
+  codex plugin add "$PLUGIN_ID" --json >/dev/null
+  ok "Codex plugin installed"
+}
+
+resolve_codex_plugin_install_path() {
+  local listing paths path count=0
+
+  listing=$(codex plugin list --json) \
+    || die "could not read Codex's machine-readable plugin listing"
+  paths=$(
+    jq -r --arg id "$PLUGIN_ID" --arg name "$PLUGIN_NAME" '
+      def installed_entries:
+        if type == "array" then .[]
+        elif (.installed? | type) == "array" then .installed[]
+        else empty
+        end;
+      [installed_entries
+        | select(.pluginId? == $id or .id? == $id or .name? == $name)
+        | .source.path?]
+      | map(select(type == "string" and length > 0))
+      | unique[]
+    ' <<<"$listing"
+  ) || die "Codex's machine-readable plugin listing is invalid"
+
+  CODEX_PLUGIN_INSTALL_PATH=''
+  while IFS= read -r path; do
+    if [[ -n "$path" ]]; then
+      CODEX_PLUGIN_INSTALL_PATH="$path"
+      count=$((count + 1))
+    fi
+  done <<<"$paths"
+
+  if [[ "$count" -ne 1 ]]; then
+    die "expected exactly one installed $PLUGIN_ID source.path; found $count"
+  fi
+
+  [[ "$CODEX_PLUGIN_INSTALL_PATH" == /* ]] \
+    || die "installed $PLUGIN_ID source.path is not absolute: $CODEX_PLUGIN_INSTALL_PATH"
+  [[ -d "$CODEX_PLUGIN_INSTALL_PATH" ]] \
+    || die "installed $PLUGIN_ID source.path is not a directory: $CODEX_PLUGIN_INSTALL_PATH"
+  [[ -f "$CODEX_PLUGIN_INSTALL_PATH/.codex-plugin/plugin.json" ]] \
+    || die "installed $PLUGIN_ID Codex artifact has no plugin manifest: $CODEX_PLUGIN_INSTALL_PATH"
+  jq -e --arg name "$PLUGIN_NAME" '.name == $name' \
+    "$CODEX_PLUGIN_INSTALL_PATH/.codex-plugin/plugin.json" >/dev/null \
+    || die "installed Codex artifact manifest is not for $PLUGIN_NAME: $CODEX_PLUGIN_INSTALL_PATH"
+
+  CODEX_PLUGIN_INSTALL_PATH="$(cd "$CODEX_PLUGIN_INSTALL_PATH" && pwd -P)"
+  CODEX_PACKAGE_ROOT="$(cd "$CODEX_PLUGIN_INSTALL_PATH/.." && pwd -P)"
+  [[ -d "$CODEX_PACKAGE_ROOT/external-skills" ]] \
+    || die "installed Codex package has no portable skill source: $CODEX_PACKAGE_ROOT"
+  [[ -d "$CODEX_PACKAGE_ROOT/scripts" ]] \
+    || die "installed Codex package has no wrapper scripts: $CODEX_PACKAGE_ROOT"
+  ok "resolved installed Codex plugin artifact: $CODEX_PLUGIN_INSTALL_PATH"
+  ok "resolved installed orchestration package: $CODEX_PACKAGE_ROOT"
+}
+
+install_codex_host
+resolve_codex_plugin_install_path
+
+if [[ "$host" != codex ]]; then
 
 # ---- step 1: uninstall current plugin if present ----------------------------
 
@@ -181,53 +297,70 @@ jq -e --arg name "$PLUGIN_NAME" '.name == $name' \
 PLUGIN_INSTALL_PATH="$(cd "$PLUGIN_INSTALL_PATH" && pwd -P)"
 ok "resolved installed plugin artifact: $PLUGIN_INSTALL_PATH"
 
+else
+  PLUGIN_INSTALL_PATH="$CODEX_PACKAGE_ROOT"
+fi
+
 # ---- step 5: de-duplicate skill dirs, then sync the external CLI lanes -----
-#
-# One canonical copy per lane, no doubles:
 #
 #   - Claude loads the plugin's skills from the plugin cache. Any same-named
 #     copy in ~/.claude/skills would double-install → cleared, never copied.
-#   - Codex and Grok load skills from their own skills dirs. The wrappers
+#   - Codex and Grok require the exact portable set in their own skill dirs. The wrappers
 #     inject "Honor the step-specific skill <name>", so the body must exist
 #     CLI-side → cleared of every plugin-managed name, then EXACTLY the
-#     injectable set from docs/09-routing-matrix.md ("Skill Injection Rules")
-#     is installed: the engineering floor, the five injectable workflow
-#     skills, and the dual-install react-native-mobile body (external-lane
-#     copy from codex-skills/ preferred).
+#     portable set is installed. An external-skills/ body wins when supplied,
+#     followed by a Codex-specific body and then the shared skill body.
 #
-# Claude-only skills (frontend-design, svg-art, immersive-frontend,
-# brainstorming, writing-plans, doc-coauthoring) are never installed
-# CLI-side — panel-planning briefs and arbitration instructions arrive via
-# the wrapper prompt, not as skills. v1 leftovers (lbyl-*,
-# look-before-you-leap) are cleared everywhere. Skills the plugin does not
-# own (user's own skills, a CLI's bundled skills) are never touched.
+# Host-only skills such as conductor, writing-plans, and codex-dispatch remain
+# plugin-provided and are never copied into a user skill directory. v1
+# leftovers (lbyl-*, look-before-you-leap) are cleared everywhere. Skills the
+# plugin does not own (user's own skills, a CLI's bundled skills) are never
+# touched.
 
-EXTERNAL_SKILLS=(
+PORTABLE_SKILLS=(
   engineering-discipline
   test-driven-development
   refactoring
   systematic-debugging
-  webapp-testing
+  brainstorming
+  doc-coauthoring
+  frontend-design
+  svg-art
+  immersive-frontend
   mcp-builder
   react-native-mobile
+  webapp-testing
+  skill-review-standard
 )
 
-# Validate every required source before cleanup so a malformed installed
-# artifact cannot leave an external lane partially cleared or partially synced.
-for s in "${EXTERNAL_SKILLS[@]}"; do
-  if [[ ! -d "$PLUGIN_INSTALL_PATH/codex-skills/$s" \
-    && ! -d "$PLUGIN_INSTALL_PATH/skills/$s" ]]; then
-    die "installed artifact is missing external skill '$s': $PLUGIN_INSTALL_PATH"
-  fi
+# Resolve and validate every required source before cleanup so a malformed
+# installed artifact cannot leave an external lane partially cleared or synced.
+PORTABLE_SKILL_SOURCES=()
+for s in "${PORTABLE_SKILLS[@]}"; do
+  src=''
+  for candidate in \
+    "$PLUGIN_INSTALL_PATH/external-skills/$s" \
+    "$PLUGIN_INSTALL_PATH/codex-skills/$s" \
+    "$PLUGIN_INSTALL_PATH/skills/$s"; do
+    if [[ -d "$candidate" && -f "$candidate/SKILL.md" ]]; then
+      src="$candidate"
+      break
+    fi
+  done
+  [[ -n "$src" ]] \
+    || die "installed artifact is missing portable skill '$s': $PLUGIN_INSTALL_PATH"
+  PORTABLE_SKILL_SOURCES+=("$src")
 done
 
 # Every skill name the plugin owns, derived from the installed artifact so the
 # list can never drift or be influenced by the checkout invoking this script.
 MANAGED_SKILLS=()
-for d in "$PLUGIN_INSTALL_PATH"/skills/*/ "$PLUGIN_INSTALL_PATH"/codex-skills/*/; do
-  if [[ -d "$d" ]]; then
-    MANAGED_SKILLS+=("$(basename "$d")")
-  fi
+for skill_root in skills codex-skills external-skills; do
+  for d in "$PLUGIN_INSTALL_PATH/$skill_root"/*/; do
+    if [[ -d "$d" ]]; then
+      MANAGED_SKILLS+=("$(basename "$d")")
+    fi
+  done
 done
 MANAGED_SKILLS+=(look-before-you-leap)
 
@@ -261,12 +394,10 @@ sync_external_lane() {
   mkdir -p "$target"
   clear_managed "$lane" "$target"
 
-  local installed=0 s src
-  for s in "${EXTERNAL_SKILLS[@]}"; do
-    src="$PLUGIN_INSTALL_PATH/codex-skills/$s"
-    if [[ ! -d "$src" ]]; then
-      src="$PLUGIN_INSTALL_PATH/skills/$s"
-    fi
+  local installed=0 index s src
+  for ((index = 0; index < ${#PORTABLE_SKILLS[@]}; index++)); do
+    s="${PORTABLE_SKILLS[$index]}"
+    src="${PORTABLE_SKILL_SOURCES[$index]}"
     cp -R "$src" "$target/$s"
     installed=$((installed + 1))
   done
@@ -274,33 +405,32 @@ sync_external_lane() {
 }
 
 # Claude: clear only — the plugin cache is the single source of these skills.
-clear_managed claude "$HOME/.claude/skills"
-
-if command -v codex >/dev/null; then
-  sync_external_lane codex "$HOME/.codex/skills"
-else
-  warn "codex CLI not on PATH — skipping codex skill sync"
+if [[ "$host" == claude || "$host" == both ]]; then
+  clear_managed claude "$HOME/.claude/skills"
 fi
 
-if command -v grok >/dev/null; then
-  sync_external_lane grok "$HOME/.grok/skills"
-else
-  warn "grok CLI not on PATH — skipping grok skill sync"
-fi
+sync_external_lane codex "$HOME/.codex/skills"
+sync_external_lane grok "$HOME/.grok/skills"
 
 # ---- final state report ----------------------------------------------------
 
-echo ""
-echo "============================================================"
-echo "  Installed plugins"
-echo "============================================================"
-claude plugin list
+if [[ "$host" == claude || "$host" == both ]]; then
+  echo ""
+  echo "============================================================"
+  echo "  Installed plugins"
+  echo "============================================================"
+  claude plugin list
+
+  echo ""
+  echo "============================================================"
+  echo "  Marketplaces"
+  echo "============================================================"
+  claude plugin marketplace list
+fi
 
 echo ""
-echo "============================================================"
-echo "  Marketplaces"
-echo "============================================================"
-claude plugin marketplace list
-
-echo ""
-ok "done. Restart Claude Code (or run /reload-plugins in an open session) to pick up the install."
+if [[ "$host" == codex ]]; then
+  ok "done. Start a new Codex session to pick up the plugin and synced skills."
+else
+  ok "done. Restart Claude Code (or run /reload-plugins in an open session) to pick up the install."
+fi

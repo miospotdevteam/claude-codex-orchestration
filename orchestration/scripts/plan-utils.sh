@@ -106,10 +106,11 @@ owner_is_implementation() {
 }
 
 lane_is_required() {
-  local owner=$1
-  local lane=$2
+  local plan_dir=$1
+  local step_id=$2
+  local lane=$3
   local required_json
-  required_json=$(required_lanes_json_for_owner "$owner")
+  required_json=$(required_lanes_json_for_step "$plan_dir" "$step_id")
   jq -e --arg lane "$lane" 'index($lane) != null' <<<"$required_json" >/dev/null
 }
 
@@ -124,6 +125,43 @@ required_lanes_json_for_owner() {
         error("owner is absent from x-requiredVerifierLanes")
       end
   ' "$PLAN_SCHEMA" 2>/dev/null || die "invalid step owner or verifier matrix: $owner"
+}
+
+# Routing profile from plan.json. Empty string identifies a legacy plan.
+routing_profile_from_plan() {
+  local plan_dir=$1
+  local plan_file="$plan_dir/plan.json"
+  [[ -f "$plan_file" ]] || die "missing plan.json in $plan_dir"
+  jq -r '.routingProfile // empty' "$plan_file"
+}
+
+# New plans freeze their verifier lanes through routingProfile. Plans without
+# the field retain the schema-backed owner matrix for backward compatibility.
+required_lanes_json_for_step() {
+  local plan_dir=$1
+  local step_id=$2
+  local profile owner
+  owner=$(step_owner_from_plan "$plan_dir" "$step_id")
+  [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+  if [[ "$owner" == "manual" ]]; then
+    printf '%s\n' '[]'
+    return 0
+  fi
+  profile=$(routing_profile_from_plan "$plan_dir")
+  case "$profile" in
+    codex-primary)
+      printf '%s\n' '["codex","grok"]'
+      ;;
+    fable-primary)
+      printf '%s\n' '["codex","grok","claude"]'
+      ;;
+    "")
+      required_lanes_json_for_owner "$owner"
+      ;;
+    *)
+      die "invalid routingProfile '$profile'"
+      ;;
+  esac
 }
 
 # Owner from plan.json for a step id. Empty string if missing.
@@ -317,7 +355,7 @@ cmd_record_lane_dispatch() {
     die "unknown step id: $step_id"
   owner=$(step_owner_from_plan "$plan_dir" "$step_id")
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
-  if ! lane_is_required "$owner" "$lane"; then
+  if ! lane_is_required "$plan_dir" "$step_id" "$lane"; then
     die "lane '$lane' may not verify $owner step '$step_id'"
   fi
   clear_mirror=false
@@ -401,7 +439,7 @@ cmd_record_deviation() {
     --arg now "$now"
 }
 
-# Owner-to-lanes done gate. Reads progress.json + plan.json; does not write.
+# Profile-or-owner verifier done gate. Reads progress.json + plan.json; does not write.
 check_done_gate() {
   local plan_dir=$1
   local step_id=$2
@@ -412,7 +450,7 @@ check_done_gate() {
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
 
   local required_json lane lane_verdict
-  required_json=$(required_lanes_json_for_owner "$owner")
+  required_json=$(required_lanes_json_for_step "$plan_dir" "$step_id")
   while IFS= read -r lane; do
     [[ -n "$lane" ]] || continue
     lane_verdict=$(jq -r --arg id "$step_id" --arg lane "$lane" \
@@ -510,15 +548,16 @@ cmd_record_verdict() {
 
   owner=$(step_owner_from_plan "$plan_dir" "$step_id")
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
-  if ! lane_is_required "$owner" "$lane"; then
+  if ! lane_is_required "$plan_dir" "$step_id" "$lane"; then
     die "lane '$lane' may not verify $owner step '$step_id'"
   fi
 
-  local mirror=false invalidate=false
+  local mirror=false invalidate=false required_json
   if lane_is_authoritative "$owner" "$lane"; then
     mirror=true
   fi
-  if [[ "$verdict" != "PASS" ]] && owner_is_implementation "$owner"; then
+  required_json=$(required_lanes_json_for_step "$plan_dir" "$step_id")
+  if [[ "$verdict" != "PASS" ]] && jq -e 'length > 0' <<<"$required_json" >/dev/null; then
     invalidate=true
   fi
 

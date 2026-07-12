@@ -1,7 +1,7 @@
 ---
 name: codex-dispatch
 description: >-
-  Dispatch Codex and Grok implementation work and Claude, Codex, and Grok verification through the plugin's direction-locked wrappers, then consume only the bounded contract JSON. Use for `codex-impl` or `grok-impl` frontier steps, every implementation-step verification, and synthetic read-only checks such as a Codex-drafted message for a predominantly Grok-authored milestone. The owner matrix is exact: `claude-impl` requires Codex plus Grok, `codex-impl` requires Claude plus Grok, and `grok-impl` requires Codex only. Do NOT use for implementing `claude-impl` or `manual` steps, for bypassing a wrapper, for Grok self-verification, or for degraded single-lane completion.
+  Invoke Codex and Grok through the plugin's direction-locked wrappers and parse the bounded Summary / Verdict / Findings contract. Use for Codex/Grok implementation and for the wrapper portion of the active profile's all-pass verifier gate. Under fable-primary the conductor adds an independent Fable verifier; under codex-primary the Codex-native dispatch body applies. Never read raw wrapper output or bypass the wrappers.
 allowed-tools: Read, Bash, Edit, Write
 ---
 
@@ -13,39 +13,31 @@ direction-locked verification dispatch. The conductor never invokes
 the plugin wrappers and reads only the parsed Summary / Verdict /
 Findings / FilesTouched JSON.
 
-## Hard rule: the owner determines every required verifier
+## Hard rule: the frozen routing profile determines verification
 
-The matrix is settled and exact:
+For every profiled implementation step, dispatch the complete verifier set
+over the same fixed diff:
 
-| Step owner | Required verifier lanes | Verify wrappers |
-|---|---|---|
-| `claude-impl` | `codex`, `grok` | `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` |
-| `codex-impl` | `claude`, `grok` | `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` |
-| `grok-impl` | `codex` only | `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` |
-| `manual` | none | none |
+| Routing profile | Required verifier lanes |
+|---|---|
+| `codex-primary` | Codex wrapper + Grok wrapper |
+| `fable-primary` | Codex wrapper + Grok wrapper + independent `Agent(model: "fable")` |
 
-Consequences:
+Manual steps are verifier-exempt. Unprofiled legacy plans retain the schema's
+owner matrix: `claude-impl` requires Codex+Grok, `codex-impl` requires
+Claude+Grok, and `grok-impl` requires Codex only.
 
-- A step reaches `done` only after every lane in its row has a current
-  `PASS`. An unrecorded, unavailable, or non-PASS required lane always
-  leaves the step `in_progress`.
-- Grok never verifies `grok-impl` work. Codex is Grok's sole verifier,
-  and no Claude-family verifier runs on a Grok-owned step.
-- Codex never self-verifies `codex-impl` work, and Claude never
-  self-verifies `claude-impl` work. `plan-utils.sh` refuses verdicts and
-  lane dispatches that are outside the owner's row.
+- A step reaches `done` only after every profile-required lane (or every lane
+  in its legacy owner row) has a current `PASS`.
 - A `FINDINGS` or `FAIL` from any required lane invalidates the other
   lanes' earlier PASS records. Fix the implementation, then dispatch
-  and record every required verifier in the owner's row again. Never
+  and record every required verifier again. Never
   reuse a sibling PASS from before the fix.
 - The former `--degraded` completion flag is removed. Passing it is an
   error, and there is no fallback verifier or single-lane done path for
   an implementation step.
 
-This policy's own bootstrap step is not exempt: when the matrix is
-introduced by a `codex-impl` step, the conductor manually applies its
-new done gate and requires both Claude and Grok PASS before completing
-that step.
+The immutable profile, not conversational state, is the gate source of truth.
 
 ## Required-lane outages and the 10-minute capacity rule
 
@@ -68,8 +60,7 @@ step `done`.
 Use Grok materially more for general implementation work; it is the
 measured slack lane. Reserve `claude-impl` for taste-led or Claude-only
 work, and use `codex-impl` when the plan assigns Codex. Increased Grok
-implementation volume does not change the verification matrix: Codex is
-always Grok's sole verifier, and Grok never reviews its own work.
+implementation volume does not change the frozen profile gate.
 
 G3 commit-message rule: when a milestone diff is predominantly
 Grok-authored, draft its commit message either through an out-of-band
@@ -86,7 +77,7 @@ its verdict is ignored for this out-of-band use.
 - `owner: grok-impl` reaches the frontier: dispatch
   `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`.
 - Any implementation step is ready for verification: dispatch every
-  verifier wrapper in its matrix row.
+  verifier required by its profile or legacy owner row.
 - The conductor needs a bounded out-of-band review or a G3 milestone
   message draft: use the appropriate read-only verify wrapper with a
   synthetic plan and step id.
@@ -100,18 +91,14 @@ This skill owns two IMPLEMENT wrappers and three VERIFY wrappers:
 
 | Wrapper | Direction | Mutation policy |
 |---|---|---|
-| `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh` | IMPLEMENT | may edit |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` | IMPLEMENT | may edit |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` | VERIFY | headless `-p`; write and command tools denied |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` | VERIFY | Codex read-only sandbox |
-| `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh` | VERIFY | Write, Edit, and Bash denied |
+| `run-codex-impl.sh` | IMPLEMENT | may edit |
+| `run-grok-impl.sh` | IMPLEMENT | may edit |
+| `run-codex-verify.sh` | VERIFY | read-only Codex sandbox |
+| `run-grok-verify.sh` | VERIFY | write, edit, and shell denied |
+| `run-claude-verify.sh` | VERIFY | legacy owner-matrix compatibility; write and command tools denied |
 
-The script identity pins the direction; prompt text cannot turn a
-verifier into an implementer. All verify wrappers accept
-`--plan-id`, `--step-id`, `--root-dir`, optional `--skill`, and either
-`--diff-file` or a `---DIFF---` stdin sentinel. All emit the same parsed
-contract JSON. Grok's wrappers create and pass a distinct internal
-`--leader-socket` on every invocation; callers do not supply or reuse it.
+The Fable conductor adds the third `Agent(model: "fable")` verifier. The step
+is done only when Codex, Grok, and Fable have all returned PASS.
 
 The legacy Claude bridge tools are disabled. Never instruct Codex or
 Grok to call `verify_step`, `frontend_implement`, or `attack_plan`.
@@ -170,8 +157,9 @@ separate from `record-verdict`: after resume or compaction, a required
 `verdicts.<lane>` record means the step is `verifying`. Derive that
 state from `progress.json`, never from conversational memory.
 
-For example, a `codex-impl` verification persists and launches both
-required lanes:
+For example, a legacy `codex-impl` verification persists and launches its
+Claude and Grok lanes. Profiled plans use the same sequence for every lane in
+their frozen verifier set:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-lane-dispatch \
@@ -187,16 +175,37 @@ render_step_and_diff | "${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh" \
 
 ## Persist verdicts and apply the done gate
 
-Record one bounded result per dispatched lane. The lane vocabulary is
-`claude`, `codex`, and `grok`:
+Always go through `plan-utils.sh`. Atomic writes; no jq one-offs.
+Every verify verdict is recorded with its lane (`codex`, `grok`, or `claude`)
+so the profile gate has per-lane records to check:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
   "$PLAN_DIR" "$STEP_ID" \
-  "$VERDICT" "$SUMMARY" "$FINDINGS_JSON" "$FILES_JSON" "$LANE"
+  "$CODEX_VERDICT" "$CODEX_SUMMARY" "$CODEX_FINDINGS_JSON" "$CODEX_FILES_JSON" codex
+"${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
+  "$PLAN_DIR" "$STEP_ID" \
+  "$GROK_VERDICT" "$GROK_SUMMARY" "$GROK_FINDINGS_JSON" "$GROK_FILES_JSON" grok
+"${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" record-verdict \
+  "$PLAN_DIR" "$STEP_ID" \
+  "$FABLE_VERDICT" "$FABLE_SUMMARY" "$FABLE_FINDINGS_JSON" "$FABLE_FILES_JSON" claude
+
+# The conductor also records the Fable result with lane `claude`.
+# Then flip status — the done gate enforces the plan's routingProfile.
+# FINDINGS or FAIL from ANY lane keeps the step in_progress and triggers fix +
+# re-verify of all profile-required reviewers; pause only after
+# three non-converging iterations or a genuine design question.
+if [[ "$ALL_REQUIRED_VERDICTS_PASS" == true ]]; then
+  "${CLAUDE_PLUGIN_ROOT}/scripts/plan-utils.sh" \
+    set-step-status "$PLAN_DIR" "$STEP_ID" done
+fi
+# On FINDINGS/FAIL: the step is already in_progress from its
+# dispatch-time start-step; re-dispatch the fix-up through start-step
+# (fresh dispatch record) — never a bare set-step-status flip.
 ```
 
-Only after every lane in the owner's row has a current PASS may the
+Only after every profile-required lane, or every lane in a legacy owner row,
+has a current PASS may the
 conductor attempt:
 
 ```bash
@@ -204,10 +213,10 @@ conductor attempt:
   "$PLAN_DIR" "$STEP_ID" done
 ```
 
-The helper reads the machine-readable matrix in
-`${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json` and refuses an
-incomplete gate. A required lane outage remains `in_progress` with a
-deviation; it never becomes a degraded completion.
+The helper reads `routingProfile` from the immutable plan and falls back to
+the schema's machine-readable owner matrix only for unprofiled legacy plans.
+It refuses an incomplete gate. A required lane outage remains `in_progress`
+with a deviation; it never becomes a degraded completion.
 
 On `FINDINGS` or `FAIL`, keep the step `in_progress`, dispatch the fix
 through a fresh `start-step` call, then persist and run every required
@@ -258,33 +267,34 @@ re-dispatch.
 
 | Exit | Meaning | Action |
 |---|---|---|
-| 0 | Contract parsed | Persist the lane verdict |
-| 1 | Bad wrapper invocation | Fix the caller; do not mutate step completion |
-| 2 | Executor invocation failed | For recognizable capacity, apply the 10-minute retry. Otherwise record a deviation; a required verifier stays `in_progress`. An implementation executor failure may block its step. |
-| 3 | Contract missing or malformed | The Claude wrapper has already retried exactly once. For Codex or Grok, retry once with a strict contract reminder. If the bounded retry still fails, record the deviation and keep any required verification lane `in_progress`. |
-| 4 | Grok binary absent | A Grok implementation dispatch is unavailable. A required Grok verify lane remains `in_progress` with a deviation; never replace it with Claude or Codex. |
+| 0 | Contract block parsed | Read JSON, record verdict |
+| 1 | Bad invocation (missing args, etc.) | Bug in this skill — fix |
+| 2 | executor CLI invocation failed (`codex exec` or `grok`) | Step → `blocked` with reason `executor-unavailable`; surface. Exit 4 (the `grok` binary not on PATH) is a distinct case — see the next row. |
+| 3 | Contract block missing or malformed | Retry exactly once with a stricter reminder. A second failure blocks the step/profile gate with reason `contract-parse-failed`; never shrink the reviewer set. |
+| 4 | `grok` binary not on PATH (Grok wrapper only) | Block with reason `grok-unavailable`; Grok is required by both profiles. |
 
 Verdict handling is family-independent:
 
-- `PASS`: persist it; attempt `done` only if the full owner row passes.
-- `FINDINGS`: persist it, fix every finding, and re-run the full row.
-- `FAIL`: persist it, fix the failure, and re-run the full row.
+- `PASS`: persist it; attempt `done` only if the full required set passes.
+- `FINDINGS`: persist it, fix every finding, and re-run the full required set.
+- `FAIL`: persist it, fix the failure, and re-run the full required set.
 
 After three non-converging fix-and-reverify rounds, or immediately when
 a finding exposes a genuine design decision, pause and surface the
 state. This convergence guard is distinct from the one malformed-output
 retry.
 
-## Explicit non-goals
-
-- Never invoke an executor CLI directly; wrappers only.
-- Callers do not pass model-selection flags to wrappers. They persist
-  the actual model and effort in dispatch state; wrapper internals own
-  their CLI model flags.
-- Never accept a same-family self-verdict outside the owner matrix.
-- Never maintain HMAC receipts, sidecars, or digest agents. The parsed
-  contract and durable progress records are the boundary.
-- Never infer `verifying` from memory when disk dispatch state exists.
+- It does not invoke `codex exec` or `grok` directly. Wrappers only.
+- It does not pass `--model` / `-m` to anything, on either lane.
+  Callers never pass a model to either wrapper pair. They pass a bounded
+  scenario enum; Codex maps it to the allowed effort internally and Grok pins
+  `-m grok-4.5` in-script. The model is the wrapper's identity, never
+  the caller's choice.
+- It does not write its own prompts to Codex outside the rendered
+  step block — the direction header is part of the wrapper, not the
+  caller's responsibility.
+- It does not maintain receipts or HMAC sidecars. The bounded contract and
+  durable lane record are the receipt.
 
 ## Interaction with other skills
 
@@ -294,5 +304,5 @@ retry.
   this skill uses `start-step`, `record-lane-dispatch`,
   `record-verdict`, and `set-step-status`.
 - `writing-plans` produces the immutable step block.
-- `conductor` selects the owner, launches the wrappers, and applies the
-  matrix without exceptions.
+- `conductor` selects the owner, launches the required verifier set, and
+  applies the frozen profile or legacy matrix without exceptions.

@@ -9,7 +9,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: run-codex-verify.sh --plan-id <id> --step-id <id> --root-dir <path> [--skill <name>] [--diff-file <path>]
+usage: run-codex-verify.sh --plan-id <id> --step-id <id> --root-dir <path> [--scenario <planning|exploration|implementation|design|bulk|review>] [--skill <name>] [--diff-file <path>]
 EOF
 }
 
@@ -24,6 +24,7 @@ STEP_ID=""
 ROOT_DIR=""
 SKILL=""
 DIFF_FILE=""
+SCENARIO="review"
 
 while (($# > 0)); do
   case "$1" in
@@ -45,6 +46,11 @@ while (($# > 0)); do
     --skill)
       (($# >= 2)) || die_invocation "--skill requires a value"
       SKILL="$2"
+      shift 2
+      ;;
+    --scenario)
+      (($# >= 2)) || die_invocation "--scenario requires a value"
+      SCENARIO="$2"
       shift 2
       ;;
     --diff-file)
@@ -69,6 +75,20 @@ case "$STEP_ID" in */* | *..*) die_invocation "--step-id must be a plain identif
 [[ -n "$ROOT_DIR" ]] || die_invocation "--root-dir is required"
 [[ "$ROOT_DIR" = /* ]] || die_invocation "--root-dir must be an absolute path"
 [[ -d "$ROOT_DIR" ]] || die_invocation "--root-dir does not exist or is not a directory: $ROOT_DIR"
+case "$SCENARIO" in
+  planning|design)
+    REASONING_EFFORT="xhigh"
+    ;;
+  exploration|implementation|review)
+    REASONING_EFFORT="high"
+    ;;
+  bulk)
+    REASONING_EFFORT="medium"
+    ;;
+  *)
+    die_invocation "invalid --scenario: $SCENARIO"
+    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PARSER="$SCRIPT_DIR/parse-contract.sh"
@@ -162,6 +182,7 @@ EOF
 if ! codex exec \
   -C "$ROOT_DIR" \
   -s read-only \
+  -c "model_reasoning_effort=\"$REASONING_EFFORT\"" \
   --skip-git-repo-check \
   -o "$CODEX_LAST_MESSAGE_FILE" \
   - <"$PROMPT_FILE" >"$CODEX_STDOUT_FILE" 2>"$CODEX_STDERR_FILE"; then

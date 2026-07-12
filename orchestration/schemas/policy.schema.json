@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orchestration.claude/schemas/policy.schema.json",
+  "title": "Orchestration policy",
+  "description": "Controls whether Claude workers may be used by the orchestration plugin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "claude_workers"
+  ],
+  "properties": {
+    "claude_workers": {
+      "description": "Whether Claude workers may perform any work.",
+      "enum": [
+        "allow",
+        "deny"
+      ],
+      "default": "deny"
+    }
+  }
+}

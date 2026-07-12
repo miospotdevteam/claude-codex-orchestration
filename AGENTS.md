@@ -109,8 +109,8 @@ for cross-family verification policy.
 - Conductor → Codex/Grok: when a step is well-defined enough to implement
   or verify against acceptance criteria.
 - Conductor → `remote-agent-host`: when natural language explicitly asks to
-  start, continue, wait for, inspect, reveal, steer, interrupt, kill, or reclaim
-  one of the supported Mini sessions. This Claude-only route uses the guarded
+  list, start, continue, wait for, inspect, reveal, steer, interrupt, kill,
+  synchronize, release, or run a diagnostic Mini session. This Claude-only route uses the guarded
   helper, inspects before every input and after every lifecycle wake, and is
   not dispatched as a Codex/Grok plan step.
 - Sub-agent → Conductor: every sub-agent terminates with one summary
@@ -131,10 +131,19 @@ spec (`docs/`) and the routing-eval harness (`eval/`) at the repo root.
 Each role's behavior is enforced by the corresponding files (paths
 below are relative to `orchestration/` unless noted):
 
-- **Manifests** — `.claude-plugin/marketplace.json` at the repo root
-  declares this repo as a one-plugin marketplace pointing at
-  `./orchestration` as the plugin source. `orchestration/.claude-plugin/plugin.json`
-  is the minimal plugin manifest (name + description). Claude Code
+- **Manifests and host install** — `.agents/plugins/marketplace.json` exposes
+  `./orchestration/codex-plugin` to `codex plugin marketplace add`, while
+  `.claude-plugin/marketplace.json` exposes `./orchestration` to Claude Code.
+  The Codex sub-root uses the required conventional `skills/` entrypoints,
+  which delegate to the canonical bodies in the parent package's
+  `codex-skills/`. `install.sh --host codex|claude|both` defaults to the no-Claude
+  Codex host; `--host codex` must never require or invoke Claude. Use
+  `--host both` once when both subscription hosts should remain available, then
+  switch orchestration authority atomically with
+  `scripts/orchestration-routing.sh activate codex-primary|fable-primary`.
+  `orchestration/.claude-plugin/plugin.json` is the Claude manifest;
+  `orchestration/codex-plugin/.codex-plugin/plugin.json` is the Codex manifest.
+  Claude Code
   requires the plugin to live in a real subdirectory — `"source": "."`
   in marketplace.json is rejected as "unsupported".
 - **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
@@ -143,41 +152,38 @@ below are relative to `orchestration/` unless noted):
   `webapp-testing`, `skill-review-standard`, `remote-agent-host`). The
   conductor invokes them via the `Skill` tool; the harness auto-discovers
   them by scanning `skills/<name>/SKILL.md` (no manifest list needed).
-- **Codex-side skill bodies** — `codex-skills/<skill>/SKILL.md` for the
-  dual-install pattern. Currently only `react-native-mobile` ships a
-  Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
-  decides which side of a dual-install skill gets a given step.
+- **Host and portable skill bodies** — `codex-skills/<skill>/SKILL.md` contains
+  the four Codex-host orchestration skills (`conductor`, `persistent-plans`,
+  `writing-plans`, `codex-dispatch`). `external-skills/<skill>/SKILL.md`
+  contains the exact 13 work skills copied to both Codex and Grok. Claude loads
+  its host and work skills directly from `skills/`. The active routing profile
+  decides which host owns orchestration and which model lanes execute each
+  scenario. With no project `.orchestration/routing.json`, the shipped
+  `codex-primary` preset is effective; a Fable switch is always explicit.
 - **External wrappers** — `scripts/run-codex-impl.sh` and
   `scripts/run-grok-impl.sh` (IMPLEMENT-direction), plus
-  `scripts/run-codex-verify.sh` and `scripts/run-grok-verify.sh`
-  (VERIFY-direction). Each pins its direction header in-script — the
+  `scripts/run-codex-verify.sh`, `scripts/run-grok-verify.sh`, and the legacy
+  compatibility `scripts/run-claude-verify.sh` (VERIFY-direction). Each pins its direction header in-script — the
   prompt body cannot override.
 - **Plan + contract utilities** — `scripts/plan-utils.sh` (read/write
   plan files atomically) and `scripts/parse-contract.sh` (extract the
   shared external-wrapper contract block).
-- **Mini handoff** — `skills/remote-agent-host/SKILL.md` owns the
-  natural-language route; `scripts/remote-agent.sh` is its only transport and
-  session-control entry point. It supports only `miospot` / `orchestration`
-  and `claude` / `codex` / `grok`, with `status`, `start`, `inspect`,
-  `continue`, `send`, `interrupt`, `kill`, `wait`, `reveal`, and `reclaim`.
-  Its options are `--host`, `--prompt-file`, `--active-plan`,
-  `--include-ignored`, `--approve-ignored`, `--cursor`, and `--timeout`.
-  `start` transfers
-  ownership to one exact Mini writer; session controls do not synchronize or
-  release that ownership. Remote-only `reclaim` transfers verified content and
-  releases last; equal+quiescent `reclaim` is release-only.
-  Prompt text is file-backed and never placed in argv. `wait` is one blocking
-  event call with a restart-aware cursor retained from successful `start`, a
-  running `status`, or the prior wait; `reveal` opens Terminal on the exact
-  existing session. Neither event, tmux exit, nor timeout proves lease
-  quiescence.
-  Transfers cover tracked and ordinary untracked regular files, plus at most
-  one identically included-and-approved ignored path and the three explicitly
-  selected active-plan files. The Mini protocol state and restore journal are
-  authoritative; the local state file is diagnostic only. Every writer record
-  remains active until an explicit safe protocol transition clears it; no role
-  may bypass an active writer, divergence, CAS, changed-snapshot, restore, or
-  recovery-required refusal with raw SSH, rsync, or tmux commands.
+- **Mini workflows** — `skills/remote-agent-host/SKILL.md` owns the
+  natural-language route; `scripts/remote-agent.sh` is its only transport.
+  Discover resident work with `list`, then use opaque workflow IDs for
+  `inspect`, `wait`, `send`, `interrupt`, `kill`, `release`, `reveal`, and
+  `sync`. `start-conductor PROJECT PLAN_ID` creates the resident Claude-backed
+  workflow; direct Claude/Codex/Grok access uses the separate full-lease
+  `diagnostic ACTION PROJECT HARNESS` family and is not mobile-resumable.
+  Prompt text is private-file-backed and never placed in argv. Wait is one
+  cursor-based blocking call followed by one bounded inspect. Kill proves
+  quiescence but does not transfer or release; sync queues a claim-time
+  direction-derived mirror job, and release clears ownership only after
+  verified alignment. The Mini registry and restore evidence are authoritative;
+  no role may bypass active-writer, divergence, CAS, changed-snapshot, restore,
+  or recovery-required refusals with raw SSH, rsync, or tmux. Preserve unrelated
+  dirty Mini work and use a previously installed matching helper only for
+  bounded migration across relay/registry version skew.
 - **Hooks** — six event registrations explicitly supersede the prior
   exactly-two-read-only-hooks design. `SessionStart` and `PostCompact` run the
   bounded context handlers `session-start.sh` and `post-compact.sh`. `Stop`,
@@ -186,16 +192,13 @@ below are relative to `orchestration/` unless noted):
   only closed labels to a private supervisor queue. The Notification allowlist
   is exactly `permission_prompt`, `idle_prompt`, and `elicitation_dialog`; no
   handler edits user Claude settings or stores prompt/transcript/terminal text.
-- **Schemas** — `schemas/plan.schema.json` and
-  `schemas/progress.schema.json` describe the plan files the conductor
-  reads.
+- **Schemas** — four schemas describe plan, progress, routing, and policy
+  state.
 - **Templates** — `templates/masterPlan.template.md` is the starter
   for `writing-plans`.
-- **Tests** — `tests/scripts/*.test.sh` and `tests/hooks/*.test.sh`.
-  There are 15 plugin suites: 12 script suites (including `agent-supervisor`,
-  `remote-agent-protocol`, and `remote-agent`) and 3 hook suites (including
-  `agent-event`). The repo-root routing eval adds 5 suites under `eval/tests/`
-  but is not shipped with the plugin.
+- **Tests** — 29 shipped plugin suites under `tests/scripts/*.test.sh` and
+  `tests/hooks/*.test.sh` (26 script plus 3 hook suites). The repo-root routing
+  eval adds 5 suites under `eval/tests/` but is not shipped with the plugin.
 
 The full design spec sits under `docs/01-philosophy.md` …
 `docs/11-routing-eval.md`. Read `docs/02-conductor.md` for the

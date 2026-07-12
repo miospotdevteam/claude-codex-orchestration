@@ -10,6 +10,7 @@
     "title",
     "createdAt",
     "createdBy",
+    "routingProfile",
     "frozen",
     "context",
     "steps"
@@ -27,6 +28,13 @@
     },
     "createdBy": {
       "type": "string"
+    },
+    "routingProfile": {
+      "description": "Immutable routing and verifier-gate profile selected for this plan.",
+      "enum": [
+        "codex-primary",
+        "fable-primary"
+      ]
     },
     "approvedAt": {
       "type": "string",

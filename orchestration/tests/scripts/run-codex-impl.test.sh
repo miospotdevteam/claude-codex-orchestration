@@ -129,11 +129,17 @@ MOCK
 
 invoke_impl() {
   local root_dir="$1"
-  "$WRAPPER" \
+  local scenario="${2:-}"
+  local args=(
     --plan-id "codex-wrapper-tests" \
     --step-id "step-01-wrapper-tests" \
     --root-dir "$root_dir" \
-    --skill "test-driven-development" <<'EOF'
+    --skill "test-driven-development"
+  )
+  if [[ -n "$scenario" ]]; then
+    args+=(--scenario "$scenario")
+  fi
+  "$WRAPPER" "${args[@]}" <<'EOF'
 # Step
 Exercise the Codex impl wrapper.
 EOF
@@ -219,6 +225,10 @@ test_happy_path_and_prompt() {
     fail "$name" "argv missing workspace-write sandbox"
     return
   }
+  assert_argv_has_pair "$argv_file" "-c" 'model_reasoning_effort="high"' || {
+    fail "$name" "argv missing default implementation reasoning effort"
+    return
+  }
   for forbidden in -m --model --reasoning-effort; do
     assert_argv_lacks_line "$argv_file" "$forbidden" || {
       fail "$name" "argv unexpectedly includes $forbidden"
@@ -237,6 +247,95 @@ test_happy_path_and_prompt() {
       return
     }
   done
+
+  pass "$name"
+}
+
+test_scenario_reasoning_map() {
+  local name="scenario selects direction-locked reasoning without a model override"
+  local mappings=(
+    planning xhigh
+    exploration high
+    implementation high
+    design xhigh
+    bulk medium
+    review high
+  )
+  local index scenario effort case_dir root_dir bin_dir argv_file status
+
+  for ((index = 0; index < ${#mappings[@]}; index += 2)); do
+    scenario="${mappings[index]}"
+    effort="${mappings[index + 1]}"
+    case_dir="$TMP_DIR/scenario-$scenario"
+    root_dir="$case_dir/root"
+    bin_dir="$case_dir/bin"
+    argv_file="$case_dir/argv.txt"
+    mkdir -p "$root_dir"
+    write_mock_codex "$bin_dir"
+
+    set +e
+    PATH="$bin_dir:$ORIGINAL_PATH" \
+      CODEX_MOCK_MODE="pass" \
+      CODEX_MOCK_ARGV="$argv_file" \
+      CODEX_MOCK_PROMPT="$case_dir/prompt.txt" \
+      invoke_impl "$root_dir" "$scenario" >"$case_dir/stdout.txt" 2>"$case_dir/stderr.txt"
+    status=$?
+    set -e
+
+    if [[ "$status" -ne 0 ]]; then
+      fail "$name" "$scenario exited $status; stderr=$(<"$case_dir/stderr.txt")"
+      return
+    fi
+    assert_argv_has_pair "$argv_file" "-c" "model_reasoning_effort=\"$effort\"" || {
+      fail "$name" "$scenario did not map to $effort"
+      return
+    }
+    for forbidden in -m --model; do
+      assert_argv_lacks_line "$argv_file" "$forbidden" || {
+        fail "$name" "$scenario unexpectedly includes $forbidden"
+        return
+      }
+    done
+    if grep -Eq '^model=' "$argv_file"; then
+      fail "$name" "$scenario unexpectedly overrides the model via config"
+      return
+    fi
+  done
+
+  pass "$name"
+}
+
+test_invalid_scenario_exits_1() {
+  local name="invalid --scenario rejected before side effects"
+  local case_dir="$TMP_DIR/invalid-scenario"
+  local root_dir="$case_dir/root"
+  local bin_dir="$case_dir/bin"
+  local stderr_file="$case_dir/stderr.txt"
+  local status
+
+  mkdir -p "$root_dir"
+  write_mock_codex "$bin_dir"
+
+  set +e
+  PATH="$bin_dir:$ORIGINAL_PATH" \
+    CODEX_MOCK_ARGV="$case_dir/argv.txt" \
+    CODEX_MOCK_PROMPT="$case_dir/prompt.txt" \
+    invoke_impl "$root_dir" "unknown" >/dev/null 2>"$stderr_file"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 1 ]]; then
+    fail "$name" "expected exit 1, got $status; stderr=$(<"$stderr_file")"
+    return
+  fi
+  assert_file_contains "$stderr_file" "invalid --scenario" || {
+    fail "$name" "stderr missing scenario validation message"
+    return
+  }
+  if [[ -e "$case_dir/argv.txt" || -e "$root_dir/.temp" ]]; then
+    fail "$name" "invalid scenario caused a Codex invocation or log side effect"
+    return
+  fi
 
   pass "$name"
 }
@@ -343,6 +442,8 @@ test_logs_real_plan_vs_synthetic() {
 }
 
 test_happy_path_and_prompt
+test_scenario_reasoning_map
+test_invalid_scenario_exits_1
 run_with_mock "trailing footer after block still exits 0" "footer_noise" 0
 run_with_mock "empty last message falls back to isolated stdout" "stdout_fallback" 0
 run_with_mock "codex non-zero exits 2" "nonzero" 2

@@ -1,0 +1,230 @@
+{
+  "codex_primary": {
+    "format_version": 2,
+    "profile": "codex-primary",
+    "policy": {
+      "claude_workers": "deny"
+    },
+    "routing": {
+      "orchestrator": {
+        "strategy": "single",
+        "lanes": [
+          {
+            "id": "primary",
+            "model": "gpt-5.6-sol",
+            "reasoning": "xhigh"
+          }
+        ]
+      },
+      "planning_convergence": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          {
+            "id": "codex-plan",
+            "model": "gpt-5.6-sol",
+            "reasoning": "xhigh"
+          },
+          {
+            "id": "grok-plan",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          }
+        ],
+        "convergence": {
+          "owner": "orchestrator"
+        }
+      },
+      "exploration": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          {
+            "id": "codex-explore",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          },
+          {
+            "id": "grok-explore",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          }
+        ],
+        "convergence": {
+          "owner": "orchestrator"
+        }
+      },
+      "implementation": {
+        "strategy": "frontier",
+        "lanes": [
+          {
+            "id": "codex-implement",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          }
+        ]
+      },
+      "verification_review": {
+        "strategy": "parallel_gate",
+        "lanes": [
+          {
+            "id": "codex-review",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          },
+          {
+            "id": "grok-review",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          }
+        ],
+        "gate": {
+          "require": "all",
+          "cross_family_required": true
+        }
+      },
+      "design_taste": {
+        "strategy": "single",
+        "lanes": [
+          {
+            "id": "design",
+            "model": "gpt-5.6-sol",
+            "reasoning": "xhigh"
+          }
+        ]
+      },
+      "bulk_simple": {
+        "strategy": "frontier",
+        "lanes": [
+          {
+            "id": "bulk",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium"
+          }
+        ]
+      }
+    }
+  },
+  "fable_primary": {
+    "format_version": 2,
+    "profile": "fable-primary",
+    "policy": {
+      "claude_workers": "allow"
+    },
+    "routing": {
+      "orchestrator": {
+        "strategy": "single",
+        "lanes": [
+          {
+            "id": "primary",
+            "model": "claude-fable",
+            "reasoning": "xhigh"
+          }
+        ]
+      },
+      "planning_convergence": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          {
+            "id": "codex-plan",
+            "model": "gpt-5.6-sol",
+            "reasoning": "xhigh"
+          },
+          {
+            "id": "grok-plan",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          },
+          {
+            "id": "claude-plan",
+            "model": "claude-fable",
+            "reasoning": "xhigh"
+          }
+        ],
+        "convergence": {
+          "owner": "orchestrator"
+        }
+      },
+      "exploration": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          {
+            "id": "codex-explore",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          },
+          {
+            "id": "grok-explore",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          },
+          {
+            "id": "claude-explore",
+            "model": "claude-fable",
+            "reasoning": "high"
+          }
+        ],
+        "convergence": {
+          "owner": "orchestrator"
+        }
+      },
+      "implementation": {
+        "strategy": "frontier",
+        "lanes": [
+          {
+            "id": "codex-implement",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          },
+          {
+            "id": "claude-implement",
+            "model": "claude-fable",
+            "reasoning": "high"
+          }
+        ]
+      },
+      "verification_review": {
+        "strategy": "parallel_gate",
+        "lanes": [
+          {
+            "id": "codex-review",
+            "model": "gpt-5.6-sol",
+            "reasoning": "high"
+          },
+          {
+            "id": "grok-review",
+            "model": "grok-4.5",
+            "reasoning": "high"
+          },
+          {
+            "id": "claude-review",
+            "model": "claude-fable",
+            "reasoning": "high"
+          }
+        ],
+        "gate": {
+          "require": "all",
+          "cross_family_required": true
+        }
+      },
+      "design_taste": {
+        "strategy": "single",
+        "lanes": [
+          {
+            "id": "design",
+            "model": "claude-fable",
+            "reasoning": "xhigh"
+          }
+        ]
+      },
+      "bulk_simple": {
+        "strategy": "frontier",
+        "lanes": [
+          {
+            "id": "bulk",
+            "model": "gpt-5.6-sol",
+            "reasoning": "medium"
+          }
+        ]
+      }
+    }
+  }
+}

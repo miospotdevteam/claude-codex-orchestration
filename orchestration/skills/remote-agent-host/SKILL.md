@@ -1,218 +1,162 @@
 ---
 name: remote-agent-host
-description: Route natural-language requests to start, continue, inspect, wait for, reveal, control, or reclaim a supported agent session on the configured Mac Mini through the plugin's guarded helper. Use when the user asks to launch work on the Mini, check whether the Mini agent needs input, wait for lifecycle progress, show its Terminal, steer or stop it, resume it with more input, or safely bring its work back. Do NOT use for ordinary local execution, arbitrary remote hosts or projects, remote shell administration, or requests to improvise SSH, tmux, file-copy, or rsync commands.
+description: Route natural-language requests to discover, start, continue, inspect, wait for, reveal, control, synchronize, or release supported Mac Mini workflows through the guarded workflow-ID helper. Use when the user asks to manage resident Mini work or a bounded diagnostic harness. Do not use for ordinary local execution, arbitrary hosts or projects, or improvised SSH, tmux, rsync, file-copy, or shell administration.
 allowed-tools: Read, Bash, AskUserQuestion
 ---
 
 # remote-agent-host
 
-Translate the user's Mini intent into the shipped guarded helper. The helper is
-the only transport and session-control boundary:
-
-```sh
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
-```
-
-Do not substitute the following skill-local-looking path; it is not the
-shipped entry point in this layout:
+Translate the user's Mini intent into the stateless guarded relay:
 
 ```text
-${CLAUDE_PLUGIN_ROOT}/skills/remote-agent-host/scripts/remote-agent.sh
+${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh [--host HOST] VERB [ARGUMENTS]
 ```
 
-Never reconstruct, remember, suggest, or execute raw SSH, rsync, tmux, or
-supervisor commands. Do not bypass a helper refusal. The helper's preflight,
-mutex, lease, generation, snapshot, and quiescence checks are authoritative.
-This skill is Claude-only natural-language orchestration: do not send it to an
-external implementation lane and do not create a `codex-skills` copy.
+This helper is the only transport boundary. Never reconstruct or execute raw
+SSH, rsync, tmux, supervisor, workflow-registry, or mirror-worker commands.
+Never bypass a refusal. The Mini registry owns workflow identity, lifecycle,
+input latches, request replay, mirror jobs, leases, and recovery decisions.
+The MacBook relay owns no durable orchestration state.
 
 ## Required inputs
 
-Resolve these from the user's request and current context:
+- Host: use `REMOTE_AGENT_HOST`, the guarded state-file default, or a literal
+  `--host HOST` the user already supplied.
+- Project: exactly `miospot` or `orchestration` when starting a workflow.
+- Plan selector: one exact plan ID for `start-conductor PROJECT PLAN_ID`.
+- Workflow: discover its opaque `WORKFLOW_ID` with `list`; never synthesize it.
+- Prompt: place bytes in a private regular file, pass `--prompt-file FILE`,
+  then delete the file. Prompt text never belongs in argv, logs, state, or a
+  request ID.
 
-- `PROJECT`: exactly `miospot` or `orchestration`. Ask if ambiguous.
-- `HARNESS`: exactly `claude`, `codex`, or `grok`; default to `claude` only
-  when the user did not name an agent family.
-- Mini host: use the helper's configured `REMOTE_AGENT_HOST` or state-file
-  default. Pass `--host` only when the user explicitly supplies a host.
-- Prompt text: write it to a private temporary file, pass only
-  `--prompt-file FILE`, and delete the file after the helper returns. Never put
-  prompt content in argv or interpolate it into a shell command.
-- Active plan: pass `--active-plan NAME` only for a known active plan and only
-  as its single directory name.
+If one of these cannot be resolved without guessing, ask one narrow question.
 
-The helper selects the local checkout from `PROJECT`, independent of caller
-cwd: `miospot` uses `LOCAL_MIOSPOT_ROOT` or `$HOME/Projects/miospot`, while
-`orchestration` uses `LOCAL_ORCHESTRATION_ROOT` or
-`$HOME/Projects/orchestration`. If the project, harness, host, or plan cannot
-be resolved without guessing, ask one narrow question instead of attempting a
-transport command.
+## Closed command set
+
+```text
+remote-agent.sh [--host HOST] list
+remote-agent.sh [--host HOST] inspect WORKFLOW_ID
+remote-agent.sh [--host HOST] wait WORKFLOW_ID --cursor CURSOR --timeout SECONDS
+remote-agent.sh [--host HOST] start-conductor PROJECT PLAN_ID
+remote-agent.sh [--host HOST] send WORKFLOW_ID --prompt-file FILE [--ack-event SEQ]
+remote-agent.sh [--host HOST] send WORKFLOW_ID --cancel-pending
+remote-agent.sh [--host HOST] interrupt WORKFLOW_ID
+remote-agent.sh [--host HOST] kill WORKFLOW_ID
+remote-agent.sh [--host HOST] release WORKFLOW_ID
+remote-agent.sh [--host HOST] reveal WORKFLOW_ID
+remote-agent.sh [--host HOST] sync WORKFLOW_ID
+remote-agent.sh [--host HOST] sync WORKFLOW_ID --cancel MIRROR_JOB
+remote-agent.sh [--host HOST] diagnostic ACTION PROJECT HARNESS --prompt-file FILE
+```
+
+Every mutation accepts `--request-id ID`. Retain and reuse the printed ID when
+replaying the exact same mutation after an ambiguous transport result. Never
+reuse it for different prompt bytes or another action.
+
+`start-conductor` is the durable Mini-resident workflow path. The currently
+shipped registry launches the Claude subscription harness for that path.
+Codex or Grok desktop work uses the separate full-lease diagnostic family:
+`diagnostic start|inspect|send|interrupt|kill|release PROJECT HARNESS`, where
+`HARNESS` is `claude`, `codex`, or `grok`. A diagnostic session is not a
+workflow, does not receive a workflow ID, and must never be presented as
+mobile-resumable conductor persistence.
 
 ## Intent map
 
-In the commands below, use the resolved literal `PROJECT` and `HARNESS` atoms;
-add `--host HOST` immediately after `remote-agent.sh` only when the user named a
-host.
-
-| User intent | Exact guarded helper flow |
+| User intent | Guarded flow |
 |---|---|
-| Start Mini work, launch an agent on the Mini | Run the exact `status` → promptless `start` and retain its `bootstrapCursor` → `inspect` and report → private-file `send` recipe below. |
-| Continue Mini work or resume it with new instructions | Run the exact `inspect` and report → private-file `continue` recipe below. |
-| Inspect for input, check whether the agent is waiting, or ask what it needs | Run the exact `inspect` recipe below; summarize the bounded captured state and send nothing. |
-| Wait or monitor the Mini agent for lifecycle progress | Use the retained cursor, or run one `status` to obtain its running-session `bootstrapCursor`, then run the exact single blocking `wait` recipe below; retain the returned monotonic wait cursor, run one `inspect` after any wake, and report only the bounded result. |
-| Reveal or show the Mini Terminal | Run the exact `reveal` recipe below; it attaches Terminal to the existing `remote-agent--PROJECT--HARNESS` session without replacing its pane. |
-| Control Mini work, steer it, or tell it something | Inspect and report first, then use the exact private-file `send` recipe below. Use the exact `interrupt` recipe for stop-now and `kill` for explicit termination. |
-| Reclaim Mini work or take over locally | Follow the reclaim protocol below; only then run the exact `reclaim` recipe. |
+| List open Mini work or ask which sessions exist | `list`; report workflow IDs, project, phase, input latch, pending message, and mirror labels from the bounded result. |
+| Start durable Mini work | `list` first, then `start-conductor PROJECT PLAN_ID`; retain the returned workflow ID and cursor. Start is currently Claude-only. |
+| Continue or resume a workflow | `inspect WORKFLOW_ID`, report the bounded state, then `send WORKFLOW_ID --prompt-file FILE`. |
+| Check whether input is needed | `inspect WORKFLOW_ID`; send nothing unless the user supplied an answer or instruction. |
+| Wait or monitor | One blocking `wait WORKFLOW_ID --cursor CURSOR --timeout SECONDS`, then one `inspect`. Retain the returned cursor. |
+| Reveal Terminal | `reveal WORKFLOW_ID`; this sends no input and changes no ownership. |
+| Steer, stop, or terminate | Inspect first; then `send`, `interrupt`, or explicit `kill`. |
+| Synchronize or reclaim Mini work | Follow the mirror-and-release protocol below. `sync` and `release` are separate operations. |
+| Run Codex/Grok/Claude outside a resident workflow | Use the exact `diagnostic ACTION PROJECT HARNESS` family and label it diagnostic. |
 
-```sh
-# start
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh status PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh start PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh inspect PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh send PROJECT HARNESS --prompt-file FILE
+For `reveal WORKFLOW_ID`, prompt content is never placed in argv; the action sends no input and never replaces or respawns the existing pane.
 
-# continue / inspect / wait / reveal
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh inspect PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh continue PROJECT HARNESS --prompt-file FILE
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh wait PROJECT HARNESS --cursor EPOCH:NUMBER --timeout SECONDS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh reveal PROJECT HARNESS
+## Capture before prompting or messaging
 
-# steer / stop / terminate / reclaim
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh send PROJECT HARNESS --prompt-file FILE
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh interrupt PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh kill PROJECT HARNESS
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh reclaim PROJECT HARNESS
-```
+Before every `send`, run `inspect` and report a bounded capture: at most 40
+relevant lines or 4 KiB. Classify the workflow as running, waiting for input,
+finished, or unclear. Do not paste a transcript. If inspection fails or the
+state is unclear, send nothing.
 
-`status` is a synchronization preflight, not a substitute for `inspect` when
-the user asks what the agent is doing or whether it needs input. It returns
-exactly one status JSON object with `authority` and `supervisor` members. The
-`authority` member contains the synchronization probe, and the `supervisor`
-member contains the bounded labels-only session state. For a running session,
-retain `supervisor.bootstrapCursor` and reuse it directly as `--cursor`. A
-successful `start` returns a distinct bootstrap envelope after its lease
-commit; retain that envelope's top-level `bootstrapCursor`.
+When `inspect` exposes a current input-needed sequence, acknowledge that exact
+event with `--ack-event SEQ` on the answer. If the conductor is busy, the
+registry may queue one message. A second queued message fails closed with
+`queue-full`; do not overwrite it. Use `--cancel-pending` only when the user
+explicitly cancels the queued input.
 
-## Capture-before-input contract
+## Event-driven wait
 
-Capture state before every prompt or message, including the initial prompt.
-Before every prompt or message is sent to an existing or newly started Mini
-session, run `inspect` and report the captured state to the user. Keep the
-report bounded: at most 40 relevant terminal lines or 4 KiB, whichever is
-smaller. State whether the session appears running, waiting for input,
-finished, or unclear; include only the small tail needed to support that
-classification. Do not paste a full transcript or raw diagnostic dump.
+Lifecycle monitoring is one blocking wait, not repeated inspection, Terminal
+capture, screenshots, or Computer Use. Use the cursor returned by `list`,
+`inspect`, `start-conductor`, or the previous wait. Cursors are monotonic within
+their restart-aware epoch; never invent one. Timeout and session exit are wake
+results, not proof of process or lease quiescence.
 
-Only after that report may `continue` or `send` transmit the prompt. If inspect
-fails or the state is unclear, send no input and report the helper failure.
-This applies to initial instructions too: start the session without a prompt,
-inspect it, report the capture, and then send the initial prompt.
+Claude main completion, subagent completion, and failure stay distinct. The
+input-needed allowlist is exactly `permission_prompt`, `idle_prompt`, and `elicitation_dialog`.
+After any wake, run one bounded `inspect`. Computer Use
+is reserved for explicit exceptional interaction after a wake, never polling.
 
-## Lifecycle wait and Terminal reveal
+## Safe reclaim: mirror-and-release protocol
 
-Lifecycle monitoring is a blocking event wait, not repeated `inspect` calls.
-Pass the most recent restart-aware cursor back to `wait`; cursors increase
-monotonically; retain the monotonic wait cursor. A changed epoch identifies a
-supervisor restart. Main-turn
-completion and subagent completion remain distinct event scopes. `Stop` means
-the Claude main turn completed, `SubagentStop` means one Claude subagent
-completed, and `StopFailure` means the main turn failed. The input-needed
-allowlist is exactly `permission_prompt`, `idle_prompt`, and `elicitation_dialog`;
-every other notification is ignored. Timeout and tmux
-session exit are normal, distinct wake results. A timeout means no supported
-event or exit was observed before the deadline, and tmux exit means only that
-the session is absent. Neither those results nor any Claude hook event proves
-process or lease quiescence. Codex and Grok normally expose only exit and
-timeout because plugin lifecycle events are emitted by Claude hooks.
+Never synchronize while an active writer is still changing the project. Every
+writer record remains live/active until an explicit guarded transition clears
+it. Never use PID or heartbeat state to infer staleness; tmux, timeout, and lifecycle events cannot infer it either.
 
-Do not invent an initial cursor. Retain the top-level `bootstrapCursor` from a
-successful `start`, or `supervisor.bootstrapCursor` from the one nested JSON
-object returned by a running `status`, and pass that exact `EPOCH:NUMBER`
-directly to the first `wait`. When no cursor is available in current context,
-run `status` once as the normal bootstrap path; if its `supervisor` member
-reports the exact session absent and therefore has no `bootstrapCursor`, report
-that there is no running session to wait for. Never use `inspect` to synthesize
-a cursor or bypass the helper by invoking the Mini supervisor directly.
+1. Run `list` and `inspect WORKFLOW_ID`; report the bounded state.
+2. If the workflow is active, request termination authority unless the user
+   already explicitly asked to kill/reclaim it.
+3. Run `kill WORKFLOW_ID`. A successful kill makes the workflow quiescent but
+   does not transfer content or release the lease.
+4. Run `sync WORKFLOW_ID`. The registry queues one mirror job; claim-time
+   authority derives the safe direction. Never supply or infer a direction.
+5. Wait for the labels-only `mirror-done` or `mirror-failed` event. Inspect the
+   workflow after the wake. Divergence, live-writer, CAS loss, changed
+   snapshots, restore failure, or `recovery-required` is a hard stop.
+6. Run `release WORKFLOW_ID` only after the registry proves quiescence and
+   aligned content. Release clears ownership last; it is not a file transfer.
 
-After an event wake, keep a bounded `inspect` capture of at most 40 lines or 4 KiB.
-The capture is ephemeral output;
-event envelopes never contain or persist pane, model, or user text. A wait or
-event never synchronizes the worktree, mutates ownership, or releases a lease.
-Never loop on `inspect`, screenshots, or Computer Use to detect progress.
-Computer Use is reserved for exceptional interactive recovery after an event
-or explicit user request, not lifecycle polling.
+An initial seed may use `sync WORKFLOW_ID --seed`. Ignored content is excluded
+unless the user approves one exact literal project-relative ignored path and
+the identical value is passed to both `--include-ignored PATH` and
+`--approve-ignored PATH`. Never approve globs, absolute paths, symlinks,
+directories, `.git`, or inferred neighbors.
 
-`reveal` opens the Mini Terminal on the exact existing
-`remote-agent--PROJECT--HARNESS` tmux session. Reveal prompt content is never placed in argv;
-reveal sends no input and never replaces, respawns, or kills the existing pane.
-It is visibility only: it does not start a session or alter lease state.
+## Diagnostic full-lease path
 
-The supervisor starts the installed `claude`, `codex`, or `grok` subscription
-TUI in tmux. Authentication must already exist on the Mini through that TUI's
-normal interactive subscription login. Never copy API keys, browser profiles,
-cookies, or local authentication material and never edit user Claude settings
-to install or emulate lifecycle hooks; the plugin manifest owns its hooks.
-On the provisioned Mini, Claude's machine-local subscription preferences are
-`model=fable` and `effortLevel=xhigh`. Treat them as a provisioning invariant,
-not as launch flags: the supervisor still starts the exact `claude --yolo`
-command, and this skill never copies or silently rewrites user settings.
+Diagnostic sessions exist for direct desktop harness access. Start with
+`diagnostic start PROJECT HARNESS`, inspect before input, and use
+`diagnostic send PROJECT HARNESS --prompt-file FILE`. The exact harness launch
+remains subscription-backed (`claude --yolo`, `codex --yolo`, or
+`grok --yolo`). On the provisioned Mini, Claude defaults to `model=fable` and
+`effortLevel=xhigh`—the Mini Claude default is Fable xhigh. Those preferences
+are provisioning invariants, not as launch flags or launch arguments.
 
-## Synchronization safety
+A diagnostic full lease blocks a resident workflow for the same project.
+Terminate with `diagnostic kill`, verify through `diagnostic inspect`, then use
+`diagnostic release`. Do not claim diagnostic work is visible in the workflow
+list or recoverable by the phone app.
 
-Never sync or synchronize files while an active writer owns the project on
-the Mini. The existence of any writer record is treated as live/active until
-an explicit safe protocol transition clears it; a quiescent record is eligible
-only for that guarded reclaim transition, not for a new start. Never use PID or
-heartbeat signals to infer a stale writer; tmux state, timeout, and lifecycle
-events cannot infer one either.
-Treat an active-writer, mutex, lease, CAS, divergence, changed-snapshot, or
-recovery-required refusal as a hard stop. Report the bounded error and do not
-retry through another command or transport.
+## Version-skew refusal
 
-Normal outbound start may transfer tracked and ordinary untracked files. An
-ignored file or ignored path is excluded unless all of these are true:
-
-1. The user names and approves one exact, literal, project-relative ignored
-   path. General consent such as "include ignored files" is insufficient.
-2. Repeat the exact path in the confirmation question and receive explicit
-   approval for that same spelling.
-3. Pass the identical string to both `--include-ignored PATH` and
-   `--approve-ignored PATH`. Never approve a glob, directory expansion,
-   absolute path, symlink, `.git` content, or inferred neighboring file.
-
-If more than one ignored path is needed, handle each as a separate explicit
-decision rather than widening the transfer universe.
-
-## Safe reclaim protocol
-
-Reclaim means safely returning ownership to the local host. Remote-only state
-may also return content; reclaim is never permission to race the Mini writer.
-
-1. Run `status` and `inspect`, then report their bounded state.
-2. If any writer or agent is active, do not sync. Ask for explicit permission
-   to terminate it unless the user already explicitly requested kill/reclaim
-   with termination.
-3. Run `kill PROJECT HARNESS`. A successful kill includes the helper's
-   quiescence check. If kill or quiescence confirmation fails, do not reclaim.
-4. Run `status` again. Proceed only when the helper reports a quiescent writer
-   record and either remote-only state or equal state. Quiescence authorizes
-   only the guarded reclaim transition; the writer record remains active until
-   that transition clears it.
-5. Run `reclaim PROJECT HARNESS` once. Remote-only is the only content-transfer
-   path and uses verified inbound staging; equal+quiescent is release-only with
-   zero content transfer. Report the bounded result and stop on any mismatch,
-   divergence, active-writer, CAS, restore, or recovery error. Reclaim is the
-   explicit safe protocol transition that clears a quiescent writer record;
-   no process-age heuristic can substitute for it.
+Exit 127 with no registry envelope means the remote `workflow-registry` is not
+installed at the expected version. Treat this as deployment version skew. Do
+not fall back to raw SSH or reinterpret local diagnostic mirrors as authority.
+Use the previously installed, matching guarded helper only for the bounded
+migration needed to quiesce and align the old session; then upgrade both sides
+before using workflow-ID commands.
 
 ## Reporting
 
-Return a compact result containing the intent handled, project and harness,
-the bounded captured state observed before input, the helper action attempted,
-and whether local or Mini ownership changed. Redact prompt bodies, host secrets,
-temporary paths, and raw protocol payloads. A helper failure is the final
-result unless the user changes the requested action or supplies missing exact
-confirmation.
-
-When validating edits to this skill, the structural checker is available at
-`${CLAUDE_PLUGIN_ROOT}/skills/skill-review-standard/scripts/validate-structure.sh`.
+Return the user intent, workflow ID or diagnostic project/harness, bounded
+observed state, helper action, request ID for mutations, mirror state when
+relevant, and whether ownership changed. Redact prompt bodies, raw protocol
+payloads, temporary paths, hosts, transcripts, and secrets. A helper refusal is
+the final result unless the user changes the request or supplies missing exact
+input.

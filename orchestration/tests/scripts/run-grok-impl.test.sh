@@ -340,6 +340,10 @@ test_argv_and_prompt_assertions() {
     fail "$name" "argv missing -m grok-4.5"
     return
   }
+  assert_argv_has_pair "$argv_file" "--reasoning-effort" "high" || {
+    fail "$name" "argv missing --reasoning-effort high"
+    return
+  }
   assert_argv_has_line "$argv_file" "--always-approve" || {
     fail "$name" "argv missing --always-approve"
     return

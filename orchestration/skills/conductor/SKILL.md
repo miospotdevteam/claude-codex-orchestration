@@ -11,26 +11,29 @@ central invariant is that **the conductor dispatches; it does not do
 the heavy work itself**. This skill is the contract for that
 invariant.
 
-## Hard rule: verification follows the exact owner matrix
+Before dispatch, `${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-routing.sh show
+<project-root>` must report `fable-primary`,
+`${CLAUDE_PLUGIN_ROOT}/scripts/orchestration-policy.sh get <project-root>` must
+report `allow`, and the current Claude session must be Fable xhigh. A missing or
+malformed profile, a different host/model, or unavailable Fable blocks the
+profile. Do not silently fall back to Opus/Sonnet; tell the user to activate
+`codex-primary` and continue in Codex if Fable is unavailable.
+
+## Hard rule: verification is the fable-primary three-family all-pass gate
+
+**Every implementation step receives independent Codex, Grok, and Fable
+review over the same fixed diff. All three must PASS.** The wrapper verifiers
+never call the bridge directly.
 
 The verification policy, per owner:
 
-- `claude-impl` steps → verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (cross-family)
-  and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
-- `codex-impl` steps → verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` and
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
-- `grok-impl` steps → verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` only. Grok never
-  self-verifies, and no Claude-family verifier runs on Grok-owned work.
-- Findings from any required lane invalidate sibling PASS records;
-  after the fix, every verifier in the owner's row re-runs.
-- The degraded single-lane completion path is removed. If any required
-  lane is down, record a deviation and keep the step `in_progress`.
-  Recognizable capacity failures use the 10-minute retry rule below,
-  including the Claude verifier lane. An unverified step never flips
-  `done` and never rides a milestone commit.
+- Dispatch `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`,
+  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`, and one
+  `Agent(model: "fable")` read-only verifier in parallel.
+- Findings from any verifier enter the fix-and-re-verify loop; all three rerun
+  after a fix.
+- A missing lane or two contract-parse failures blocks the step. Never degrade
+  the selected profile to fewer reviewers.
 
 BRIDGE-DISABLED (2026-05-24): Anthropic disabled the legacy
 `claude-bridge` MCP call-back tools (`verify_step`,
@@ -49,20 +52,13 @@ template, or sub-agent prompt that asks Codex or Grok to call a bridge
 MCP tool is a bug — re-dispatch with the contract-block instruction
 instead.
 
-## Hard rule: quality arbitration is the Fable + Codex judge pair
+## Hard rule: quality arbitration is the Fable + Codex + Grok panel
 
-When the conductor needs to **rank candidate artifacts, break a tie
-between approaches, or score output quality** (distinct from step
-verification, which stays cross-family), it dispatches BOTH arbiters —
-Fable via `Agent(model: "fable")` and Codex via
-`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` (read-only,
-machine-default model) — and consumes their consensus. Self-bias guard
-(measured): an arbiter's score of its *own family's* artifact counts
-only if the other arbiter concurs; on a split over an own-family
-artifact, add a grok or opus tiebreak vote. Blind the artifacts when
-practical. This arbitration pair is distinct from step verification:
-verification follows the exact owner matrix above; quality arbitration
-runs both arbiters and consumes their consensus.
+When the conductor needs to rank candidates or score output quality, dispatch
+Fable, Codex, and Grok independently and consume their converged judgment.
+Self-family scores count only when a different family concurs. Blind artifacts
+when practical. Arbitration and verification use the same three families but
+different prompts and acceptance contracts.
 
 ## Hard rule: always fix findings and re-verify
 
@@ -76,8 +72,8 @@ Concretely:
 
 - **FINDINGS verdict** → dispatch a fix-up sub-agent (at the scorecard
   tier, per the rule below), then re-dispatch **every verifier the
-   step's owner requires** (claude-impl: Codex+Grok; codex-impl:
-   Claude+Grok; grok-impl: Codex only) on the same step. Do not record the step as `done`
+  active profile requires** (Codex + Grok + Fable in this profile) on the same
+  step. Do not record the step as `done`
   with FINDINGS.
 - **FAIL verdict** → same loop. The findings array is the spec for
   the fix-up sub-agent.
@@ -112,47 +108,32 @@ repo shared with the second machine, run the sync protocol first:
 check `git status` on both machines (SSH), bring the working copy to
 par with HEAD via commit+push / `pull --ff-only`, and only then begin.
 
-## Hard rule: implementation sub-agent model follows the scorecard
+## Hard rule: every Claude worker is Fable
 
-**Every Claude sub-agent the conductor dispatches MUST carry an
-explicit `model` on the `Agent` tool — including read-only scouts —
-chosen per the routing matrix's Model Scorecard.** No silent defaults,
-anywhere. The conductor's own model is whatever the user is running;
-the tiers below govern *dispatched* sub-agents.
-
-The tiers:
+**Every Claude sub-agent the conductor dispatches MUST carry explicit
+`model: "fable"` on the `Agent` tool — including read-only scouts, planners,
+implementers, and reviewers.** The active `fable-primary` preset names Fable
+for every Claude lane. No silent defaults or smaller-tier substitutions.
 
 - **Before any Claude implementation dispatch, check the lane.** A
-  `claude-impl` step must be taste-led or gated on a Claude-only
-  skill; general implementation that merely *could* run on Opus
+  `claude-impl` step must be taste-led or gated on a Fable-preferred
+  skill; general implementation that merely *could* run on Fable
   belongs on `grok-impl` (the Grok lane is the measured slack quota;
   the Claude quota is a binding constraint). Re-route rather than
   dispatch when the step doesn't justify the Claude lane.
-- **Opus is the floor and the default *within* the Claude lane.**
-  A justified `owner: claude-impl` step →
-  `Agent(subagent_type: "general-purpose", model: "opus", ...)` unless a
-  rule below moves it. Taste-led refactoring, multi-file edit, and TDD
-  implementation sub-agents default here too.
-- **Escalate to Fable** (`model: "fable"`) for the hardest *and* most
-  user-facing implementation — work that needs top intelligence and top
-  taste at once (public SDK/API surface, the flagship UI, an end-to-end
-  multi-step build). Escalate without asking when a lower tier's output
-  does not meet the bar: judge the output, not the price tag.
-- **Sonnet** (`model: "sonnet"`) is permitted ONLY for cheap,
-  read-heavy scouting or mechanical Claude-side work where taste does
-  not ship. It is never the owner of code that lands.
-- **Never Haiku** for execution or verification.
-- Read-only scouts (`Explore`, `Plan`) MUST carry an explicit
-  `model: "sonnet"` — cheap read-heavy scouting is exactly Sonnet's
-  lane. They never inherit the agent definition's default silently.
+- A justified `owner: claude-impl` step uses
+  `Agent(subagent_type: "general-purpose", model: "fable", ...)`.
+- Read-only scouts (`Explore`, `Plan`) and Fable verifier agents also carry
+  explicit `model: "fable"`.
+- Never use Opus, Sonnet, or Haiku in this profile. If Fable is unavailable,
+  block and direct the user to activate `codex-primary` in a Codex session.
 - Codex dispatches (`codex-impl` / verify) are unaffected — Codex is a
   separate model under `codex-dispatch`'s wrappers, not a Claude
   sub-agent, and its wrappers never take a `-m` flag.
 
-Any dispatch that omits an explicit `model`, uses Haiku, or defaults to
-Sonnet for shipping code is a bug. Silent session-model inheritance is
-a bug anywhere — scouts included. Self-correct by re-dispatching at the
-right tier before consuming the result.
+Any Claude dispatch that omits explicit `model: "fable"` is a bug. Silent
+session-model inheritance is a bug anywhere—scouts included. Self-correct
+before consuming the result.
 
 ## Hard rule: retry transient provider capacity after 10 minutes
 
@@ -190,7 +171,7 @@ user-visible line before it fires.** Exact format:
 
 For `Agent` dispatches, the tool's `description` parameter MUST also
 embed the step id and model, format `<step-id> · <model> · <short
-title>` (e.g. `step-02 · opus · conductor skill`). The harness task
+title>` (e.g. `step-02 · fable · conductor skill`). The harness task
 panel renders the description under the user's input field, so this is
 what makes each sub-agent's model visible live — it complements the
 `→` announcement line and the durable `progress.json` dispatch record.
@@ -286,11 +267,9 @@ explicit words ("just do it" / "quick" / "no plan" / "solo plan is
 fine") skip it. The panel protocol runs before drafting: the identical
 brief goes **in parallel, independently** to Codex
 (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`, step id `panel-codex`),
-Grok (`${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`, `panel-grok`; two-model panel on exit 4),
-and a Claude planner (`Agent`, model Fable whenever available,
-otherwise Opus — the strongest model drafts the plan; Opus is the
-implementation tier) — then one Claude convergence sub-agent (same
-rule: Fable if available, else Opus) merges the drafts with
+Grok (`${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`, `panel-grok`),
+and a Fable planner (`Agent(model: "fable")`). The host Fable conductor
+converges all three drafts with
 definite decisions where they disagree. Announce each panel dispatch
 with the standard `→` line. Never chain panelists on one evolving
 draft, and never read the raw drafts from the conductor thread — only
@@ -354,16 +333,13 @@ The conductor:
 
 Per-step routing:
 
-- `owner: codex-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`;
-  verified via `${CLAUDE_PLUGIN_ROOT}/scripts/run-claude-verify.sh` and
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; both must PASS.
+- `owner: codex-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`.
 - `owner: grok-impl` → `codex-dispatch` with `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh` (the
-  `codex-dispatch` skill owns both wrapper lanes); verified via
-  `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh` only.
+  `codex-dispatch` skill owns both wrapper lanes).
 - `owner: claude-impl` → dispatch `general-purpose` sub-agent to
-  implement, then BOTH `${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-verify.sh`
-  and `${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-verify.sh`; `done` requires
-  both PASS.
+  implement.
+- After any implementation owner, dispatch Codex, Grok, and Fable read-only
+  verification in parallel; `done` requires all three PASS.
 - `owner: manual` → flip `blocked` with a note; continue with the
   rest of the frontier.
 

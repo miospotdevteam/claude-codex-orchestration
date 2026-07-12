@@ -1,5 +1,13 @@
 # 12 — Phone-from-anywhere control surface
 
+> **Historical design input — not the current product contract.** This PWA/SSE
+> proposal predates the Mini-resident workflow registry, mirror journal, APNs
+> notification backend, and the user's explicit native-app decision. Do not
+> implement or ship a web app from this document. The resumed T3/mobile plan
+> must replace it with a native iOS client over the guarded workflow-ID API,
+> while preserving the security and single-writer invariants worth carrying
+> forward.
+
 This document specifies a **private, installable phone web app that lets one
 operator drive the same guarded Mac Mini agent sessions from anywhere**, over a
 private network, without opening any new authority. It re-exposes the agent

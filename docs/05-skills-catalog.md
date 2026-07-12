@@ -136,20 +136,16 @@ the catalog stays at nine.)
 **Triggers**
 - A plan step with `owner: codex-impl` or `owner: grok-impl` is on the
   frontier.
-- A step's executor needs verification — per the dual mandate in
-  `docs/09-routing-matrix.md`: at least one cross-family verifier, and
-  Grok always among the verifiers when its lane is available
-  (`run-grok-verify.sh` alone for `codex-impl`; BOTH
-  `run-codex-verify.sh` and `run-grok-verify.sh` for `grok-impl` /
-  `claude-impl`, `done` requiring both PASS; `run-codex-verify.sh` as
-  the degraded fallback when the Grok lane is down).
+- A step's executor needs verification. `codex-primary` always requires final
+  PASS verdicts from Codex and Grok; `fable-primary` always requires final PASS
+  verdicts from Codex, Grok, and Fable. The requirement is independent of the
+  implementation owner and missing lanes block completion.
 - The conductor needs an out-of-band Codex or Grok check (rare).
 
 **Anti-triggers**
-- Implementing a step whose `owner` is `claude-impl` or `manual` —
-  verifying finished `claude-impl` work still fires this skill (both
-  `run-codex-verify.sh` and `run-grok-verify.sh` per the dual-verify
-  policy).
+- Implementing a step whose `owner` is `claude-impl` or `manual` — the skill
+  still fires for the Codex and Grok portions of the active profile's review
+  gate after implementation finishes.
 - Tasks that don't go through the plan system (free-form
   conversation).
 
@@ -163,9 +159,8 @@ the catalog stays at nine.)
   and `step.files`.
 - Parse the contract block out of stdout. Reject and retry once if
   the block is missing.
-- On Grok exit 4 (`grok` not on PATH): fall verification back to
-  `run-codex-verify.sh` and record the deviation; flip a `grok-impl`
-  step `blocked` with reason `grok-unavailable`.
+- On Grok exit 4 (`grok` not on PATH), block the step with reason
+  `grok-unavailable`; never weaken the active profile's required verifier set.
 - Write the parsed verdict, findings, and files-touched into
   `progress.json`.
 - Never read raw Codex or Grok stream output or treat unparsed text as
@@ -295,119 +290,63 @@ auto-discovers them by scanning `skills/<name>/SKILL.md` — no list in
 
 | Skill | One-line | Routing |
 |---|---|---|
-| `doc-coauthoring` | Collaborative authoring of RFCs, ADRs, runbooks, API docs, and other prose artifacts | Claude-only (Claude-only skill set in the routing matrix) |
-| `frontend-design` | Distinctive production-grade frontend interfaces — landing pages, dashboards, design-system work | Claude-only |
-| `svg-art` | Hand-coded SVG artwork — patterns, illustrations, decorative backgrounds, filter effects | Claude-only |
-| `immersive-frontend` | Award-winning WebGL / Three.js / scroll-driven 3D experiences | Claude-only |
-| `mcp-builder` | Building production-quality MCP servers that expose APIs/databases/services as LLM tools | Codex-default with Claude-side design |
-| `react-native-mobile` | Premium native-feeling React Native mobile apps; dual-installable (Claude for UI/UX, Codex for code-heavy) | Conditional — see RN-mobile Routing Directive in `docs/09-routing-matrix.md` |
-| `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Codex-default with Claude design for test plans |
-| `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Claude-only (meta) |
-| `remote-agent-host` | Guarded natural-language start, continue, wait, inspect, reveal, interrupt, kill, and reclaim lifecycle for supported Mac Mini sessions | Claude-only (host orchestration) |
+| `doc-coauthoring` | Collaborative authoring of RFCs, ADRs, runbooks, API docs, and other prose artifacts | Portable; active profile selects the model lane |
+| `frontend-design` | Distinctive production-grade frontend interfaces — landing pages, dashboards, design-system work | Portable; Fable taste lane in `fable-primary`, Sol taste lane in `codex-primary` |
+| `svg-art` | Hand-coded SVG artwork — patterns, illustrations, decorative backgrounds, filter effects | Portable; active profile selects the model lane |
+| `immersive-frontend` | Award-winning WebGL / Three.js / scroll-driven 3D experiences | Portable; active profile selects the model lane |
+| `mcp-builder` | Building production-quality MCP servers that expose APIs/databases/services as LLM tools | Portable; active profile selects design and implementation lanes |
+| `react-native-mobile` | Premium native-feeling React Native mobile apps | Portable; active profile's design-taste route handles UI/UX and frontier route handles code-heavy work |
+| `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Portable; active profile selects test planning and implementation lanes |
+| `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Portable meta-skill; active profile selects the reviewer lanes |
+| `remote-agent-host` | Guarded natural-language discovery, workflow-ID lifecycle, mirror sync/release, and full-lease diagnostic control for the Mac Mini | Claude-only (host orchestration) |
 
 ### `remote-agent-host` lifecycle contract
 
-This skill triggers only when the user asks to start, continue, wait for,
-inspect, reveal, control, interrupt, kill, or reclaim work on the configured
-Mini. It does not trigger for ordinary local execution, arbitrary remote
-administration, or unsupported projects and hosts. Its sole executable
-boundary is:
+This Claude-host skill maps user intent to the stateless
+`${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh` relay. The current closed
+interface discovers durable workflows with `list`, then addresses them by
+opaque `WORKFLOW_ID`: `inspect`, `wait`, `send`, `interrupt`, `kill`,
+`release`, `reveal`, and `sync`. `start-conductor PROJECT PLAN_ID`
+creates a resident workflow. Prompt bytes use a private `--prompt-file`; every
+mutation carries a replayable request ID.
 
-```text
-${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
-```
+The Mini registry—not the caller—owns lifecycle, input latches, queued messages,
+mirror jobs, leases, and recovery. Monitoring uses one cursor-based blocking
+wait followed by one bounded inspect; screenshots and Computer Use are never a
+polling loop. A prompt is sent only after inspection and a bounded report.
 
-The closed command set is `status`, `start`, `inspect`, `continue`, `send`,
-`interrupt`, `kill`, `wait`, `reveal`, and `reclaim`; projects are exactly
-`miospot` and `orchestration`; harnesses are exactly `claude`, `codex`, and
-`grok`. The skill uses only `--host`, `--prompt-file`, `--active-plan`,
-`--include-ignored`, `--approve-ignored`, `--cursor`, and `--timeout`. It maps
-natural language to that interface. `PROJECT` also selects the local checkout
-independently of caller cwd: `LOCAL_MIOSPOT_ROOT` or `$HOME/Projects/miospot`,
-and `LOCAL_ORCHESTRATION_ROOT` or `$HOME/Projects/orchestration`. It
-defaults the harness to Claude only
-when no family was named, puts prompts in private temporary files, and reports
-a bounded `inspect` capture before every input. A launch is therefore
-`status` → promptless `start` and retain `bootstrapCursor` → `inspect` and
-report → `send`, even though the lower-level helper permits an optional prompt
-on `start`.
+File alignment is an explicit mirror operation. Kill establishes quiescence but
+does not transfer content or release ownership. `sync WORKFLOW_ID` queues a
+job whose direction is derived from claim-time authority; release is permitted
+only after verified alignment and clears ownership last. Active-writer,
+divergence, CAS, restore, or recovery refusals are final. No PID, heartbeat,
+terminal, exit, or timeout signal implies staleness.
 
-Wait is `${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh wait PROJECT HARNESS
---cursor EPOCH:NUMBER --timeout SECONDS`, with a retained monotonic cursor and
-a 1–300 second bound. It is one blocking call, followed by one bounded
-`inspect`, never repeated inspection or screenshot polling. `reveal` opens
-Terminal on the exact existing `remote-agent--PROJECT--HARNESS` session and
-does not send input, replace its pane, synchronize files, or alter ownership.
-The first wait uses the bounded labels-only top-level `bootstrapCursor`
-returned by a successful `start`, or `supervisor.bootstrapCursor` from the one
-nested JSON object returned by a running `status`; later waits retain the most
-recent returned epoch and cursor, including across supervisor restarts.
+The resident `start-conductor` path is currently Claude-subscription-backed.
+Direct Claude, Codex, or Grok TUIs use
+`diagnostic ACTION PROJECT HARNESS`, which holds a full project lease but is
+not a workflow and is not mobile-resumable. The supervisor launches the
+subscription harness with its exact `--yolo` command; Mini Claude provisioning
+defaults to Fable xhigh without turning that preference into launch flags.
 
-Claude `Stop`, `SubagentStop`, and `StopFailure` map respectively to main
-completed, subagent completed, and main failed; the scopes stay distinct. Only
-`permission_prompt`, `idle_prompt`, and `elicitation_dialog` are accepted as
-input-needed notifications. Tmux exit and timeout are separate wake results.
-No event, exit, or timeout proves the writer lease is quiescent; only guarded
-kill/reclaim protocol checks do. Event records contain closed labels only, in
-private state; prompt, transcript, model, environment, and terminal text are
-never queued. Codex and Grok normally produce only exit/timeout wakes because
-the lifecycle observers are Claude plugin hooks.
+The relay is version-coupled to the Mini registry. Exit 127 without a registry
+envelope is deployment skew. Migration may use only the previously installed
+matching guarded helper to quiesce and align the old session before both sides
+upgrade; raw SSH, rsync, tmux, and local diagnostic mirrors never substitute
+for authority.
 
-Ownership is a lease, not continuous synchronization. `start` accepts equal
-or local-only state and makes the Mini the single writer. `inspect`,
-`continue`, `send`, `interrupt`, and `kill` do not synchronize project files;
-even a quiescent `kill` does not reclaim them or release the lease. Safe
-reclaim checks `status` and `inspect`, obtains termination permission when
-needed, and kills and verifies quiescence. Remote-only state then pulls through
-private verified staging and releases ownership last; equal+quiescent state is
-post-verified and released with zero content transfer. Every writer record is
-treated as live/active until an explicit safe protocol transition clears it;
-quiescent reclaim is that transition, and PID or heartbeat state never creates
-an inferred stale class.
+### Codex host and portable skill bodies
 
-The normal transfer universe is tracked and ordinary untracked regular files.
-Ignored content requires exact per-path consent and identical literal values
-for `--include-ignored` and `--approve-ignored`; globs, absolute paths,
-symlinks, `.git`, directory expansion, and inferred neighbors are excluded.
-`--active-plan NAME` adds exactly the selected plan's `plan.json`,
-`progress.json`, and `masterPlan.md`, with snapshot-change detection.
-Destination apply uses a private restore journal: verified restore leaves
-ownership unchanged; failed restore retains authoritative recovery evidence
-and the mutex. The local state mirror is diagnostic only. The helper assumes
-the Mini protocol, launchers, worktrees, authentication, and transport are
-already provisioned. The supervisor launches the installed subscription TUI
-for Claude, Codex, or Grok, which must already be authenticated interactively
-on the Mini; it promises no backend bootstrap, implicit secret copy,
-continuous sync, chat persistence, or reboot survival. A human may attach on
-the Mini only through the guarded `reveal` intent; visibility neither changes
-ownership nor substitutes for reclaim. The skill never improvises raw tmux or
-transport commands, never edits user Claude settings, and uses Computer Use
-only for exceptional explicit interaction after a wake—not as a polling loop.
+`codex-skills/` contains exactly the four canonical Codex-host orchestration
+bodies: `conductor`, `persistent-plans`, `writing-plans`, and
+`codex-dispatch`. Codex plugin ingestion requires a conventional `skills/`
+directory, so `codex-plugin/skills/` exposes four small entrypoints that load
+those canonical bodies from the parent package. The entrypoints are the plugin
+discovery surface; `codex-skills/` remains the single source of behavioral
+truth.
 
-The skill also routes the two cession intents, `cede` and `uncede`, that arm and
-cancel a phone-originated Mini-content start. `cede` runs the same canonical
-worktree gate under the Mini mutex and issues a single-use, MacBook-issued
-cession only from a clean, equal, writer-none relation; `uncede` cancels an
-unconsumed one. A phone-started session carries an explicit `origin=phone` writer
-record and is live/active exactly like any other lease, and every guarded MacBook
-operation fails closed if local content has drifted from an active cession's
-baseline. The phone control surface — an installable app served tailnet-only from
-the Mini that re-calls the host-independent verbs and queues the two
-ownership-changing ones — is specified in full in
-`12-phone-control-surface.md`; this catalog is updated to the shipped contract
-once that surface lands.
-
-### Codex-side skill bodies (`codex-skills/`)
-
-For the dual-install pattern (currently `react-native-mobile`), Codex
-also gets its own copy of the skill body at
-`codex-skills/<name>/SKILL.md`. The routing matrix at
-`docs/09-routing-matrix.md` decides which side gets which step:
-UI/UX/animation work goes to Claude; data-flow / native modules /
-code-heavy work goes to Codex. The two SKILL.md files keep the same
-wording about the split so both sides see the same rule.
-
-`codex-skills/` is loaded by `codex exec` separately from the Claude
-Code plugin manifest; it is not discovered by the Claude Code harness
-at all. The wrappers and the user read these bodies directly from the
-`codex-skills/` tree.
+`external-skills/` contains the exact 13 portable work-skill packages copied
+identically into `~/.codex/skills` and `~/.grok/skills` by `install.sh`. It
+includes the external-lane React Native body; UI/UX taste routes through the
+active profile's design owner, while code-heavy work routes through the
+frontier. Claude continues to discover its own bodies from `skills/`.

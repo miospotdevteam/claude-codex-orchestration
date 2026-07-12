@@ -1,31 +1,33 @@
 ---
 name: "react-native-mobile"
-description: "Codex-facing React Native mobile implementation skill for code-heavy Expo and React Native work: data flow, networking, native modules, storage, list virtualization, performance, tests, and non-visual logic. Route UI/UX animation, haptic feel, gesture taste, and visual polish to Claude per the Routing Directive."
+description: "External-lane React Native mobile implementation skill for code-heavy Expo and React Native work: data flow, networking, native modules, storage, list virtualization, performance, tests, and non-visual logic. Send UI/UX animation, haptic feel, gesture taste, and visual polish through the active design-taste route instead of assuming a provider. Do NOT use for a standard React web app, backend-only work, or a taste-led mobile step assigned to another lane."
 ---
 
-# React Native Mobile — Codex Implementation
+# React Native Mobile — External Implementation
 
 Use this skill for code-heavy React Native and Expo implementation where the
 primary work is wiring behavior, data, native modules, storage, performance,
-or tests. This is the Codex-facing companion to the Claude
-`react-native-mobile` skill.
+or tests. This is the provider-neutral external-lane companion to the
+interactive `react-native-mobile` skill.
 
 ## Routing Directive
 
 ```text
-UI/UX (animations, haptics, gestures, visual polish) → claude.
-Code-heavy (data flow, networking, native modules, non-visual logic) → codex.
+UI/UX (animations, haptics, gestures, visual polish) → active design-taste lane.
+Code-heavy (data flow, networking, native modules, non-visual logic) → active implementation lane.
 ```
 
-- If a step is mostly UI/UX, do not implement it here. Route it to
-  `owner: "claude-impl"`.
-- If a step is mostly code-heavy, implement it with `owner: "codex-impl"`.
+- If a step is mostly UI/UX, do not implement it here unless the approved
+  route explicitly assigns this worker the design-taste role. Return it to
+  the orchestrator for policy-aware routing; never assume Claude is available.
+- If a step is mostly code-heavy, implement it in the selected external
+  implementation lane.
 - If a step mixes UI/UX and code-heavy work, split it into sequential steps
   with `dependsOn` instead of forcing one owner.
 
 ## Scope
 
-Codex-appropriate React Native work includes:
+External-lane React Native work includes:
 
 - State-machine wiring, reducers, stores, selectors, cache invalidation, and
   optimistic mutation rollback.
@@ -41,7 +43,7 @@ Codex-appropriate React Native work includes:
 - Tests, type safety, lint fixes, accessibility props required by existing
   components, and non-visual platform-specific branches.
 
-Out of scope for this Codex skill:
+Out of scope for this implementation skill:
 
 - Choosing animation personality, haptic feel, gesture taste, native
   look-and-feel, visual layout, color, typography, or polish.
@@ -123,5 +125,5 @@ Run the project's relevant checks after implementation:
 - Manual or automated checks for offline, failure, stale-response, and
   permission-denied paths when those paths were touched.
 
-Report any UI/UX work that should be split out to Claude instead of folding it
-into the Codex implementation.
+Report any UI/UX work that should be split into the configured design-taste
+lane instead of folding it into a code-heavy implementation.

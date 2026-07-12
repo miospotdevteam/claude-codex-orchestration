@@ -1,9 +1,12 @@
 # orchestration — v2
 
-This repository is **v2 of the `orchestration` plugin for Claude Code**.
+This repository is **v2 of the `orchestration` plugin for Codex and Claude
+Code**. The default install is the no-Claude Codex host; Claude remains an
+explicitly selectable host and optional worker family.
 It contains both the design spec (under `docs/`) and the plugin
 implementation that descends from it (under `orchestration/`:
-`.claude-plugin/plugin.json`, `skills/`, `codex-skills/`, `hooks/`,
+`.claude-plugin/plugin.json`, `codex-plugin/.codex-plugin/plugin.json`, `skills/`,
+`codex-skills/`, `external-skills/`, `config/`, `hooks/`,
 `scripts/`, `schemas/`, `templates/`, `tests/`). A routing-eval harness
 lives in the top-level `eval/` directory. See the layout block below.
 
@@ -41,37 +44,44 @@ receipts and signatures.
   with a fixed Summary / Verdict / Findings prompt contract.
 - A parallel Grok lane (`run-grok-impl.sh`, `run-grok-verify.sh`) sharing
   the same direction-locked contract; see `docs/10-grok-integration.md`.
-- Nine plugin-root scripts total: those four wrappers, `plan-utils.sh`,
-  `parse-contract.sh`, the guarded `remote-agent.sh` host helper, and the
-  Mini-side `agent-supervisor` plus `remote-agent-v1` authority.
-- JSON Schemas for `plan.json` and `progress.json`, plus a `masterPlan.md`
-  template.
+- Five direction-locked model wrappers: two implementation wrappers and three
+  verification wrappers (Codex, Grok, and the legacy Claude verifier).
+- Sixteen plugin-root scripts covering wrappers, plan/routing helpers, the
+  guarded workflow relay, and the Mini-resident registry/mirror/APNs backend.
+- Four JSON Schemas for plans, progress, routing, and policy, plus a
+  `masterPlan.md` template.
 
 ## Repository layout
 
 ```
 claude-codex-orchestration/      ← repo root = marketplace root
+├── .agents/plugins/
+│   └── marketplace.json         ← Codex marketplace metadata
 ├── .claude-plugin/
 │   └── marketplace.json         ← marketplace metadata (this repo as marketplace)
 ├── README.md                    ← you are here
 ├── AGENTS.md                    ← the three roles (conductor, sub-agents, Codex)
 ├── LICENSE                      ← MIT
-├── install.sh                   ← conditional uninstall + install via claude CLI,
-│                                   plus codex/grok CLI-side skill sync
+├── install.sh                   ← --host codex|claude|both (Codex default)
 ├── .claude/
 │   └── CLAUDE.md                ← context for any Claude session editing this repo
 ├── docs/                        ← the design spec (markdown only)
 │   ├── 01-philosophy.md … 12-phone-control-surface.md
 │
-├── orchestration/               ← plugin root (marketplace source: "./orchestration")
+├── orchestration/               ← shared package + Claude plugin source
 │   ├── .claude-plugin/
 │   │   └── plugin.json          ← minimal plugin manifest (name, description)
+│   ├── codex-plugin/            ← Codex marketplace source
+│   │   ├── .codex-plugin/plugin.json
+│   │   └── skills/              ← conventional entrypoints to canonical bodies
 │   ├── skills/                  ← 9 core + 9 auxiliary skills
-│   ├── codex-skills/            ← Codex-side bodies for dual-install skills
+│   ├── codex-skills/            ← 4 Codex-host orchestration skills
+│   ├── external-skills/         ← exact 13 portable Codex/Grok work skills
+│   ├── config/                  ← canonical Codex/Fable routing profiles
 │   ├── hooks/                   ← manifest + 2 read-only notice handlers +
 │   │                               1 fail-open private-queue observer handler
-│   ├── scripts/                 ← four wrappers + five plan/contract/Mini helpers
-│   ├── schemas/                 ← JSON schemas for plan + progress files
+│   ├── scripts/                 ← 5 wrappers + 11 plan/routing/Mini helpers
+│   ├── schemas/                 ← plan, progress, routing, and policy schemas
 │   ├── templates/               ← starter templates (e.g. masterPlan)
 │   └── tests/                   ← hook + script tests
 │
@@ -83,11 +93,15 @@ claude-codex-orchestration/      ← repo root = marketplace root
 
 ## Install
 
-Prerequisites:
+Prerequisites depend on the selected host:
 
-- Claude Code CLI installed and authenticated.
-- `codex` CLI (`codex exec`) installed and authenticated — the impl and
-  verify wrappers shell out to it.
+- Default `--host codex`: authenticated `codex` and `grok` CLIs. Codex is the
+  Sol xhigh root; Grok 4.5 is the independent planning, review, and verification
+  counterweight. This path never requires or invokes `claude`.
+- `--host claude`: authenticated Claude Code, Codex, and Grok CLIs. Fable is
+  the root; Codex and Grok remain required planning and verification lanes.
+- `--host both`: all three authenticated CLIs. This is the easiest setup for
+  explicit host switching without reinstalling later.
 - `orbit-mcp` on `PATH` — the plugin declares an `orbit` MCP server
   used to surface `masterPlan.md` for human review before execution
   and to coordinate the plan-mode handoff (`EnterPlanMode` →
@@ -96,18 +110,14 @@ Prerequisites:
 - `jq` on `PATH` — used by the plan helpers, the contract parser, and
   the hooks.
 
-The optional Mac Mini handoff additionally requires local `git`, `ssh`,
-`rsync`, and a SHA-256 implementation, plus an already provisioned Mini.
-The requested `PROJECT` selects the local checkout independently of caller cwd:
-`miospot` uses `LOCAL_MIOSPOT_ROOT` or `$HOME/Projects/miospot`, and
-`orchestration` uses `LOCAL_ORCHESTRATION_ROOT` or
-`$HOME/Projects/orchestration`. The selected root must be the canonical,
-non-symlink Git toplevel on an attached branch.
-The Mini must already expose the shipped `remote-agent-v1` protocol and
-`agent-supervisor` as executables on `PATH`; the supervisor launches the
-installed `claude`, `codex`, or `grok` subscription TUI. Each TUI must already
-be authenticated interactively on the Mini, and real worktrees must exist at
-the configured project roots. Configure its SSH
+The optional Mac Mini workflow path additionally requires local `git`, `ssh`,
+and a SHA-256 implementation, plus an already provisioned Mini. The Mini must
+expose the matched `workflow-registry`, supervisor, mirror worker, gateway,
+APNs sender, and protocol authority generation on `PATH`; the MacBook's
+`remote-agent.sh` talks only to `workflow-registry`. The supervisor launches
+the installed `claude`, `codex`, or `grok` subscription TUI. Each TUI must
+already be authenticated interactively on the Mini, and real worktrees must
+exist at the configured project roots. Configure its SSH
 host with `--host`, `REMOTE_AGENT_HOST`, or the single-line
 `${XDG_STATE_HOME:-$HOME/.local/state}/orchestration-remote-host` file. The
 helper neither installs this backend nor copies SSH keys, API keys, cookies,
@@ -121,21 +131,51 @@ Clone this repo somewhere stable, then run `install.sh`:
 git clone https://github.com/miospotdevteam/claude-codex-orchestration.git \
   ~/projects/claude-codex-orchestration
 cd ~/projects/claude-codex-orchestration
-bash install.sh
+bash install.sh                         # Codex-primary surface; no Claude invocation
+# bash install.sh --host both           # prepare both hosts
+# bash install.sh --host both           # install once for profile switching
 ```
 
-`install.sh` is idempotent: it uninstalls any existing `orchestration`
-plugin, adds (or updates) the marketplace, and installs the latest
-version. It resolves the single absolute `installPath` reported by
-`claude plugin list --json` and treats that installed plugin-cache artifact—not
-the invoking checkout—as canonical. Claude loads plugin skills from that cache;
-the installer removes duplicate plugin-owned copies from `~/.claude/skills`
-and syncs the seven injectable lane skills into `~/.codex/skills` and
-`~/.grok/skills`. Unowned skills are preserved. Safe to re-run after upgrading.
+`install.sh` is host-aware and idempotent. Every mode installs and validates the
+Codex dependency; Claude modes additionally install the Claude plugin. The
+selected provider's machine-readable installed artifact—not the invoking
+checkout—is canonical. Before cleanup, the installer validates the exact 13
+portable work skills, then syncs them into `~/.codex/skills` and
+`~/.grok/skills`; host-only conductor/plan/dispatch bodies remain plugin-owned.
+`--host codex` performs this without invoking Claude. Unowned skills are
+preserved. Safe to re-run after upgrading.
+
+The effective profile defaults to the shipped `codex-primary` preset when a
+project has no routing file. A project override lives at
+`.orchestration/routing.json` and is managed by `orchestration-routing.sh`.
+Activate either profile atomically:
+
+```bash
+orchestration/scripts/orchestration-routing.sh activate codex-primary .
+# later, if Fable remains available:
+orchestration/scripts/orchestration-routing.sh activate fable-primary .
+```
+
+`codex-primary` requires a Sol xhigh Codex host and denies Claude workers.
+`fable-primary` requires a Fable xhigh Claude host and enables the approved
+Fable/Codex/Grok lanes. Activation reports the required next host but does not
+launch it. Invalid routing fails closed to `deny`; legacy `policy.json` remains
+a compatibility fallback only when no project routing override exists. The standalone
+[model routing configurator](docs/model-routing-configurator.html) emits the
+same validated, activatable profiles.
+
+Codex model selection remains an authenticated machine preference, not an
+installer mutation. For the default lane, configure `~/.codex/config.toml` with
+`model = "gpt-5.6-sol"` and `model_reasoning_effort = "xhigh"`. The Grok
+wrappers independently pin `grok-4.5` with high reasoning effort.
 
 ### Manual install (if you prefer)
 
 ```bash
+# Codex
+codex plugin marketplace add miospotdevteam/claude-codex-orchestration
+codex plugin add orchestration@claude-codex-orchestration
+
 # Add this repo as a Claude Code marketplace
 claude plugin marketplace add miospotdevteam/claude-codex-orchestration
 
@@ -143,7 +183,7 @@ claude plugin marketplace add miospotdevteam/claude-codex-orchestration
 claude plugin install orchestration@claude-codex-orchestration
 ```
 
-After install, start a Claude Code session in any project. The
+After install, start the selected host in any project. On Claude, the
 `SessionStart` hook injects a one-line notice if an active plan
 already exists; otherwise the `conductor` skill is on standby.
 
@@ -154,7 +194,10 @@ claude plugin marketplace update claude-codex-orchestration
 claude plugin update orchestration
 ```
 
-Or simply re-run `bash install.sh` from the clone.
+Or re-run `bash install.sh --host codex|claude|both` from the clone. Host
+installation and orchestration authority are separate: with both hosts
+installed, switch explicitly using `orchestration-routing.sh activate
+codex-primary|fable-primary`; no reinstall is required.
 
 Restart Claude Code or run `/reload-plugins` in an open session after install
 or upgrade. Do not edit the plugin cache or user Claude settings by hand; make
@@ -174,13 +217,20 @@ artifact; it does not pin the invoking checkout. A historical rollback must be
 published or registered as a marketplace version and then installed through
 the Claude plugin CLI—never copied into Claude's cache manually.
 
-The Mini backend has no fixed installation directory; install the shipped
-`orchestration/scripts/agent-supervisor` and
-`orchestration/scripts/remote-agent-v1` together on the Mini's `PATH`. Before
-upgrading them, retain the previous matched pair. If backend rollback is
-needed, stop active sessions through the guarded helper, restore both files
-together, and start a new session; never mix backend versions or bypass lease,
-restore-journal, or recovery-required state.
+The Mini backend has no fixed installation directory; its supervisor,
+workflow registry, mirror worker, gateway, APNs sender, and protocol authority
+must be deployed as one matched generation on the Mini's `PATH`. Retain the
+previous matched generation before upgrading. If rollback is needed, stop
+active work through the matching guarded helper and restore the generation as
+a unit; never mix relay/backend versions or bypass lease, restore-journal, or
+recovery-required state.
+
+An unrelated dirty Mini worktree is not an invitation to deploy over it.
+Never reset, clean, checkout, overwrite, or raw-rsync it. List, inspect, wait,
+sync, and release through the guarded `remote-agent` protocol only; its lease,
+snapshot, divergence, restore-journal, and recovery-required refusals are
+authoritative. Mirror verified content and release ownership before changing
+host or updating the matched relay/registry generation.
 
 Claude model and effort are authenticated user preferences, not supervisor
 launch arguments. For this Mini deployment, select Fable and xhigh once in the
@@ -225,127 +275,64 @@ For trivial work — a typo, a one-line config tweak — say "just do it"
 and the conductor skips the plan. The discipline is gentle on
 purpose.
 
-### Mac Mini handoff
+### Mac Mini workflows
 
-The `remote-agent-host` skill turns natural-language requests into the guarded
-`${CLAUDE_PLUGIN_ROOT}/scripts/remote-agent.sh` interface. Its exact CLI is:
+The `remote-agent-host` skill translates natural-language Mini requests into
+one stateless guarded relay:
 
 ```text
-remote-agent.sh [--host HOST] COMMAND PROJECT [HARNESS] [OPTIONS]
-commands: status, start, inspect, continue, send, interrupt, kill, wait, reveal, reclaim
-projects: miospot, orchestration
-harnesses: claude, codex, grok
-options: --prompt-file FILE --active-plan NAME
-         --include-ignored PATH --approve-ignored PATH
-         --cursor EPOCH:NUMBER --timeout SECONDS
+remote-agent.sh [--host HOST] list
+remote-agent.sh [--host HOST] inspect WORKFLOW_ID
+remote-agent.sh [--host HOST] wait WORKFLOW_ID --cursor CURSOR --timeout SECONDS
+remote-agent.sh [--host HOST] start-conductor PROJECT PLAN_ID
+remote-agent.sh [--host HOST] send WORKFLOW_ID --prompt-file FILE [--ack-event SEQ]
+remote-agent.sh [--host HOST] interrupt|kill|release|reveal WORKFLOW_ID
+remote-agent.sh [--host HOST] sync WORKFLOW_ID [--cancel MIRROR_JOB]
+remote-agent.sh [--host HOST] diagnostic ACTION PROJECT HARNESS
 ```
 
-Ask naturally: “start Claude on the Mini for orchestration”, “wait for the Mini
-Claude agent”, “check what the Mini Codex session needs”, “continue the Mini
-Grok session with these instructions”, “reveal the Mini Terminal”, “interrupt
-the Mini agent”, or “reclaim the Mini work locally”.
-The project must be exactly `miospot` or `orchestration`; the harness defaults
-to `claude` only when no family was named. Prompts go through a private file,
-never command-line text. For a new session the skill runs `status`, starts
-without a prompt, inspects and reports a bounded capture, then sends the first
-prompt. Before any later input it also inspects and reports first.
+Ask naturally: “list the Mini workflows”, “resume this workflow”, “check
+whether it needs input”, “wait for its next event”, “reveal its Terminal”,
+“synchronize and release it”, or “start a Codex diagnostic session”. The relay
+never orchestrates locally and stores no workflow state. `list` discovers
+opaque workflow IDs; every later resident-workflow operation uses that ID.
 
-The command lifecycle is single-writer:
+`start-conductor` creates the durable Mini-resident workflow. The shipped
+registry currently launches the Claude subscription harness for this path.
+Codex and Grok desktop sessions use the separate full-lease `diagnostic`
+family and must not be described as mobile-resumable workflows.
 
-| Command | Meaning |
-|---|---|
-| `status` | Compare the exact local transfer snapshot with the Mini and compose one bounded envelope from authority state plus exact supervisor session/bootstrap state. A running session includes a directly reusable `bootstrapCursor`; status is a preflight, not a transcript. |
-| `start` | Accept only equal or local-only state, transfer if needed, launch the exact session, commit the Mini lease, and return its bounded `bootstrapCursor` envelope. Remote-only work must be reclaimed first. |
-| `inspect` | Capture the bounded session state without synchronizing files. |
-| `continue` | Capture, then send one required `--prompt-file`; no file synchronization. |
-| `send` | Send one required prompt to an existing session; the natural-language skill performs a separate `inspect` first. |
-| `interrupt` | Request an immediate interrupt; it does not release project ownership. |
-| `kill` | Terminate the session and verify quiescence; it still does not reclaim files or release the project lease. |
-| `wait` | Block once for a labels-only lifecycle event, tmux exit, or timeout using a retained `--cursor EPOCH:NUMBER` and a 1–300 second `--timeout`; then perform one bounded inspect. |
-| `reveal` | Open Terminal on the exact existing `remote-agent--PROJECT--HARNESS` session without input, pane replacement, synchronization, or ownership changes. |
-| `reclaim` | With no live writer, remote-only state uses verified inbound staging and content transfer before releasing the lease last; equal+quiescent state is release-only with zero content transfer. |
+Prompts travel only through private files. Before every send, inspect and report
+at most 40 relevant lines or 4 KiB. Monitoring is event-driven: issue one
+blocking `wait`, retain its restart-aware monotonic cursor, then inspect once.
+Never loop on captures, screenshots, or Computer Use.
 
-Claude `Stop`, `SubagentStop`, and `StopFailure` mean main-turn completed,
-subagent completed, and main-turn failed; they are distinct. Only
-`permission_prompt`, `idle_prompt`, and `elicitation_dialog` are treated as
-input-needed notifications. Tmux exit and timeout are separate wakes. None of
-these signals proves lease quiescence—only guarded kill/reclaim protocol checks
-do. Private event-file contents contain only allowlisted `scope` and `kind`
-labels; the filename carries the cursor, and the supervisor adds session,
-epoch, and cursor to the wait envelope. Prompt, transcript, model, environment,
-and terminal text are excluded.
-Codex and Grok normally expose only exit and timeout because Claude plugin hooks
-do not run in those TUIs.
+Synchronization is separate from lifecycle control. Kill makes a workflow
+quiescent but does not move files or release ownership. `sync WORKFLOW_ID`
+queues a mirror job whose safe direction is derived at claim time. Only after a
+`mirror-done` event and aligned state may `release WORKFLOW_ID` clear the
+lease last. Divergence, live-writer conflicts, CAS loss, restore failure, or
+`recovery-required` always fail closed. PID, heartbeat, terminal, exit, and
+timeout state never infer staleness.
 
-Lifecycle monitoring is event-driven: issue one blocking `wait`, then one
-bounded `inspect` (at most 40 lines or 4 KiB). Do not loop on inspect or
-screenshots. Computer Use is reserved for an explicit exceptional interactive
-problem after a wake, not a polling loop.
-
-`wait` uses a restart-aware cursor retained from `start`, a running `status`, or
-a prior wait result. `start` returns a bounded labels-only envelope after lease
-commit; `status` composes authority and supervisor state after its
-synchronization probe. Its `bootstrapCursor` is passed directly to the first
-wait, so bounded inspect is no longer a cursor fallback. The skill never
-guesses a cursor or invokes the Mini supervisor directly.
-
-`start` snapshots the current branch, HEAD, and content of tracked files plus
-ordinary untracked regular files. Ignored files, symlinks, `.git`, and files
-outside that universe are excluded. One ignored file may be added only when
-the user approves one exact literal project-relative path and the identical
-string is passed to both `--include-ignored` and `--approve-ignored`; globs,
-directories, absolute paths, and inferred neighbors are refused. An active
-plan is opt-in with `--active-plan NAME` and adds only
-`plan.json`, `progress.json`, and `masterPlan.md` from that one
-`.temp/plan-mode/active/NAME/` directory. A changed source snapshot aborts the
-handoff. There is no continuous or bidirectional sync while the Mini owns the
-lease.
-
-Transfers use private staging and a restore journal. If destination apply
-fails and restoration verifies, ownership does not advance. If restoration
-also fails, the Mini retains authoritative `recovery-required` evidence and
-the mutex; stop and perform explicit administrative recovery rather than
-retrying, reclaiming, or bypassing the helper. Every writer record remains
-live/active until an explicit safe protocol transition clears it; two-sided
-divergence, lost generation checks, active-writer conflicts, and post-sync
-mismatches likewise fail closed. No PID, heartbeat, tmux, timeout, or event
-signal is used to infer process staleness. Local state under
-`${XDG_STATE_HOME:-$HOME/.local/state}/orchestration/remote-agent/` is only a
-private diagnostic mirror, not an authoritative backup; the protocol state
-and restore journal on the Mini are authoritative.
-
-For a human who needs interactive visibility, ask to “reveal the Mini
-Terminal.” The guarded `reveal PROJECT HARNESS` route attaches Terminal to the
-exact session without sending input or replacing its pane. Visibility does not
-transfer files, change the lease, or replace reclaim. A live tmux session can
-outlast a local chat or SSH disconnect, but this plugin does not provide
-chat-transport persistence, a Mini boot service, or reboot survival.
+The Mini and MacBook must run matching relay/registry generations. Exit 127
+without a registry envelope indicates version skew, not an absent workflow.
+During an upgrade, use only the previously installed matching guarded helper to
+quiesce and align the old session; never fall back to raw SSH, rsync, or tmux.
 
 ## Testing
 
-Run the fifteen shipped plugin test suites against installation, helpers,
-skills, wrappers, and hooks:
+Run all 29 shipped plugin suites against installation, helpers, skills,
+wrappers, Mini services, and hooks:
 
 ```bash
 cd orchestration
-bash tests/scripts/parse-contract.test.sh    # contract-block parsing cases
-bash tests/scripts/plan-utils.test.sh        # plan-file helper cases
-bash tests/scripts/agent-supervisor.test.sh  # Mini session/event adapter cases
-bash tests/scripts/remote-agent-protocol.test.sh # Mini authority/lease cases
-bash tests/scripts/remote-agent.test.sh      # guarded Mini lifecycle cases
-bash tests/scripts/run-codex-impl.test.sh    # Codex impl wrapper cases
-bash tests/scripts/run-codex-verify.test.sh  # Codex verify wrapper cases
-bash tests/scripts/run-grok-impl.test.sh     # Grok impl wrapper cases
-bash tests/scripts/run-grok-verify.test.sh   # Grok verify wrapper cases
-bash tests/scripts/skill-contracts.test.sh   # cross-skill contracts
-bash tests/scripts/validate-structure.test.sh # skill structure checker
-bash tests/scripts/install.test.sh           # install/cache synchronization
-bash tests/hooks/session-start.test.sh       # 5 session-start hook cases
-bash tests/hooks/post-compact.test.sh        # 4 post-compact hook cases
-bash tests/hooks/agent-event.test.sh         # private lifecycle observer cases
+for test_file in tests/scripts/*.test.sh tests/hooks/*.test.sh; do
+  bash "$test_file"
+done
 ```
 
-All fifteen suites use shell test harnesses, sandbox under `mktemp -d`,
+All 29 suites use shell test harnesses, sandbox under `mktemp -d`,
 and clean up after themselves. Each exits non-zero on any failure.
 
 Syntax / lint checks for the shell scripts:
@@ -377,6 +364,7 @@ The full design lives under `docs/`. Read in order:
 9. `docs/09-routing-matrix.md` — model routing, panel planning, and verification lanes.
 10. `docs/10-grok-integration.md` — Grok wrappers + prompt contract.
 11. `docs/11-routing-eval.md` — the routing eval harness that validates the matrix.
+12. `docs/12-phone-control-surface.md` — the evolving private phone-control contract.
 
 When you're working on the plugin, your own session is itself an
 exercise of the system: a non-trivial change should produce a plan
@@ -399,7 +387,7 @@ rule without restoring gates.
   sanitized labels to their private queue, but never persist user/model text.
 - No `lib/` shared between skills. Skills reference each other by
   name in prose, not by shared imports.
-- No Mini backend bootstrap, secret copying, continuous synchronization,
-  chat persistence, or Mini reboot-survival guarantee.
+- No secret copying, continuous unguarded synchronization, public workflow
+  endpoint, transcript persistence, or raw terminal streaming.
 
 See `docs/01-philosophy.md` for the full rationale.

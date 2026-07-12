@@ -227,7 +227,7 @@
           "type": "string"
         },
         "verdicts": {
-          "description": "Per-lane verifier records (claude / codex / grok). Owner-matrix done-gating reads these.",
+          "description": "Per-lane verifier records (claude / codex / grok). Routing-profile all-pass gating reads these; legacy plans use their owner-matrix gate.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -238,6 +238,9 @@
               "$ref": "#/$defs/laneVerdict"
             },
             "grok": {
+              "$ref": "#/$defs/laneVerdict"
+            },
+            "claude": {
               "$ref": "#/$defs/laneVerdict"
             }
           }

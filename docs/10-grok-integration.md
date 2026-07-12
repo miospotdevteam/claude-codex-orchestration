@@ -90,6 +90,7 @@ The impl wrapper invokes:
 ```
 grok --prompt-file <file> --cwd <root> \
   -m grok-4.5 \
+  --reasoning-effort high \
   --always-approve \
   --max-turns 80
 ```
@@ -99,6 +100,7 @@ The verify wrapper invokes:
 ```
 grok --prompt-file <file> --cwd <root> \
   -m grok-4.5 \
+  --reasoning-effort high \
   --max-turns 80 \
   --deny 'Write' --deny 'Edit' --deny 'Bash'
 ```
@@ -118,6 +120,10 @@ wrapper is the one place to update if the id changes again, and a stale
 id fails loudly (the CLI rejects an unknown model) rather than silently
 falling back. Pinning it also avoids config drift from the
 user-configurable CLI default (`~/.grok/config.toml`).
+
+**`--reasoning-effort high`.** Both wrappers pin Grok 4.5 to high reasoning
+effort. This keeps planning, review, and verification behavior consistent even
+when the user's Grok CLI default changes.
 
 ## Read-only enforcement
 

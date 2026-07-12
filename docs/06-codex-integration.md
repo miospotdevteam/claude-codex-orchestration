@@ -51,6 +51,9 @@ Invoked when a plan step has `owner: codex-impl`.
 - `--plan-id <planId>` — for log filenames.
 - `--step-id <stepId>` — for log filenames.
 - `--root-dir <path>` — project root Codex should operate in.
+- `--scenario <name>` — optional routing scenario. Allowed values are
+  `planning`, `exploration`, `implementation`, `design`, `bulk`, and
+  `review`; omitted calls default to `implementation`.
 - Stdin: the rendered step block (description, acceptance criteria,
   file list, progress checklist).
 
@@ -60,11 +63,14 @@ Invoked when a plan step has `owner: codex-impl`.
    present) the step's specified `skill`, and embeds the **full
    contract template** verbatim so Codex has the exact block to
    reproduce.
-2. Invokes `codex exec -C <root-dir> -s workspace-write
-   --skip-git-repo-check -o <last-message-file>` with the prompt on
-   stdin. No determinism or temperature flag is passed; `-o` is
-   Codex's own output-last-message file, where the model's final
-   message is written for the wrapper to parse.
+2. Maps the validated scenario to a fixed reasoning effort and invokes
+   `codex exec -C <root-dir> -s workspace-write -c
+   'model_reasoning_effort="<effort>"' --skip-git-repo-check -o
+   <last-message-file>` with the prompt on stdin. The `-c` override is
+   Codex's supported configuration interface; no model flag or model
+   configuration override is accepted or passed. `-o` is Codex's own
+   output-last-message file, where the model's final message is written
+   for the wrapper to parse.
 3. Captures Codex's stdout and stderr in separate files and writes a
    merged copy to a log file
    (`.temp/plan-mode/active/<planId>/logs/codex-impl-<stepId>.log`)
@@ -82,15 +88,19 @@ Invoked after any step (regardless of impl owner) to confirm
 acceptance criteria.
 
 **Inputs**: same CLI args as impl, plus the **diff** of the changes
-to verify (passed via stdin or referenced by path).
+to verify (passed via stdin or referenced by path). When `--scenario`
+is omitted, verify defaults it to `review` rather than
+`implementation`.
 
 **Behavior**:
 1. Builds a system prompt that fixes the direction to **VERIFY**,
    forbids any code edits, embeds the step block, skill, and diff,
    and prints the contract template inline.
-2. Invokes `codex exec -C <root-dir> -s read-only
-   --skip-git-repo-check -o <last-message-file>` — read-only mode,
-   same output-last-message file as impl, no determinism flag.
+2. Applies the same scenario-to-effort mapping and invokes `codex exec
+   -C <root-dir> -s read-only -c
+   'model_reasoning_effort="<effort>"' --skip-git-repo-check -o
+   <last-message-file>` — read-only mode, same output-last-message file
+   as impl. Scenario selection never relaxes the read-only sandbox.
 3. Captures stdout and stderr separately and writes a merged copy to
    `codex-verify-<stepId>.log`.
 4. Parses the `-o` last-message file (falling back to the isolated
@@ -102,6 +112,26 @@ The verify wrapper has **no `--root-dir`** write permissions in
 mind — even though Codex is technically capable of editing files, the
 verify prompt instructs it not to, and any diff produced by a verify
 call is treated as a bug.
+
+### Scenario-to-reasoning lock
+
+Both wrappers validate `--scenario` against the same closed enum before
+creating logs or invoking Codex. The mapping is internal and cannot be
+overridden per call:
+
+| Scenario | `model_reasoning_effort` |
+|---|---|
+| `planning` | `xhigh` |
+| `exploration` | `high` |
+| `implementation` | `high` |
+| `design` | `xhigh` |
+| `bulk` | `medium` |
+| `review` | `high` |
+
+This is a reasoning lock, not a model selector. The wrappers deliberately
+do not accept `--model`, do not pass `-m` / `--model`, and do not inject a
+`model=...` configuration override. The active Codex installation remains
+the source of truth for the model itself.
 
 ## The prompt contract
 
@@ -181,10 +211,10 @@ user — **not** the raw Codex output.
   named artifact.
 - **No `lbyl-digest` sub-agent.** Codex output is already bounded by
   the contract; the digester existed to bound it twice.
-- **No `--model` flag plumbed through user-visible config.** The
-  Codex wrappers pass no model flag at all; `codex exec` uses its own
-  configured default. Changing the model is a wrapper change, never a
-  per-call knob.
+- **No `--model` flag plumbed through user-visible config.** The Codex
+  wrappers pass no model flag or model configuration override at all;
+  `codex exec` uses its own configured default. Scenario is a closed
+  reasoning-effort selector, not a model knob.
 
 ## Computer use
 

@@ -10,13 +10,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILLS_DIR="$SCRIPT_DIR/../../skills"
 CODEX_SKILLS_DIR="$SCRIPT_DIR/../../codex-skills"
+EXTERNAL_SKILLS_DIR="$SCRIPT_DIR/../../external-skills"
 REMOTE_AGENT_HOST_SKILL="$SKILLS_DIR/remote-agent-host/SKILL.md"
 CONDUCTOR_SKILL="$SKILLS_DIR/conductor/SKILL.md"
 
 # Shipped skill bodies we audit (one SKILL.md per skill directory,
-# both the Claude-side skills/ and the external codex-skills/ lane).
+# the Claude-side skills/, Codex host skills, and provider-portable lane).
 SKILL_FILES=()
-for f in "$SKILLS_DIR"/*/SKILL.md "$CODEX_SKILLS_DIR"/*/SKILL.md; do
+for f in "$SKILLS_DIR"/*/SKILL.md "$CODEX_SKILLS_DIR"/*/SKILL.md \
+  "$EXTERNAL_SKILLS_DIR"/*/SKILL.md; do
   [[ -f "$f" ]] && SKILL_FILES+=("$f")
 done
 
@@ -26,6 +28,9 @@ VALID_SKILLS=(Explore general-purpose Plan)
 for d in "$SKILLS_DIR"/*/; do VALID_SKILLS+=("$(basename "$d")"); done
 if [[ -d "$CODEX_SKILLS_DIR" ]]; then
   for d in "$CODEX_SKILLS_DIR"/*/; do VALID_SKILLS+=("$(basename "$d")"); done
+fi
+if [[ -d "$EXTERNAL_SKILLS_DIR" ]]; then
+  for d in "$EXTERNAL_SKILLS_DIR"/*/; do VALID_SKILLS+=("$(basename "$d")"); done
 fi
 
 PASS_COUNT=0
@@ -77,11 +82,113 @@ test_no_dangling_doc_citations() {
 #     their own ${CLAUDE_PLUGIN_ROOT}/skills/... base and are not this
 #     check's concern — it targets the top-level executable wrappers.)
 test_scripts_are_plugin_root_prefixed() {
-  local name="scripts/*.sh calls are \${CLAUDE_PLUGIN_ROOT}-prefixed"
+  local name="scripts/*.sh calls resolve from a plugin or selected-skill root"
   local hits
-  hits="$(grep_files 'scripts/[A-Za-z0-9._-]+\.sh' | grep -v 'CLAUDE_PLUGIN_ROOT' || true)"
+  hits="$(grep_files 'scripts/[A-Za-z0-9._-]+\.sh' \
+    | grep -vE 'CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|SKILL_ROOT' || true)"
   if [[ -n "$hits" ]]; then
     fail "$name" "$hits"
+  else
+    pass "$name"
+  fi
+}
+
+# (g) Provider packaging is intentionally asymmetric: four orchestration
+#     skills belong only to the Codex host, while thirteen task skills can be
+#     copied into either Codex or Grok's user skill directory. remote-agent-host
+#     remains Claude-only and must never leak into either external surface.
+test_host_and_external_skill_inventories() {
+  local name="host and external skill inventories are exact"
+  local expected_host expected_external actual_host actual_external
+  expected_host="$(printf '%s\n' codex-dispatch conductor persistent-plans writing-plans | sort)"
+  expected_external="$(printf '%s\n' \
+    brainstorming doc-coauthoring engineering-discipline frontend-design \
+    immersive-frontend mcp-builder react-native-mobile refactoring \
+    skill-review-standard svg-art systematic-debugging \
+    test-driven-development webapp-testing | sort)"
+  actual_host="$(find "$CODEX_SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d \
+    -exec basename {} \; | sort)"
+  if [[ -d "$EXTERNAL_SKILLS_DIR" ]]; then
+    actual_external="$(find "$EXTERNAL_SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d \
+      -exec basename {} \; | sort)"
+  else
+    actual_external=""
+  fi
+
+  if [[ "$actual_host" != "$expected_host" ]]; then
+    fail "$name" "Codex host inventory mismatch:\n$actual_host"
+  elif [[ "$actual_external" != "$expected_external" ]]; then
+    fail "$name" "external inventory mismatch:\n$actual_external"
+  elif find "$EXTERNAL_SKILLS_DIR" -mindepth 2 -maxdepth 2 -type d \
+    \( -name conductor -o -name persistent-plans -o -name writing-plans \
+       -o -name codex-dispatch -o -name remote-agent-host \) 2>/dev/null | grep -q .; then
+    fail "$name" "host-only skill leaked into external packaging"
+  else
+    pass "$name"
+  fi
+}
+
+test_external_skills_are_self_contained() {
+  local name="external skills include their complete portable packages"
+  local viol="" skill
+
+  for skill in brainstorming doc-coauthoring engineering-discipline \
+    frontend-design immersive-frontend mcp-builder refactoring \
+    skill-review-standard svg-art systematic-debugging \
+    test-driven-development webapp-testing; do
+    [[ -f "$EXTERNAL_SKILLS_DIR/$skill/SKILL.md" ]] \
+      || { viol+="missing $skill/SKILL.md"$'\n'; continue; }
+    bash "$SKILLS_DIR/skill-review-standard/scripts/validate-structure.sh" \
+      "$EXTERNAL_SKILLS_DIR/$skill" >/dev/null 2>&1 \
+      || viol+="$skill external package fails structural validation"$'\n'
+    case "$skill" in
+      immersive-frontend|mcp-builder|refactoring|skill-review-standard|svg-art|systematic-debugging|webapp-testing)
+        # External copies remove plugin-only cross-skill references while
+        # retaining their provider-neutral implementation guidance.
+        ;;
+      *)
+        diff -q "$SKILLS_DIR/$skill/SKILL.md" \
+          "$EXTERNAL_SKILLS_DIR/$skill/SKILL.md" >/dev/null \
+          || viol+="$skill external body drifted from shared body"$'\n'
+        ;;
+    esac
+  done
+
+  [[ -f "$EXTERNAL_SKILLS_DIR/react-native-mobile/SKILL.md" ]] \
+    || viol+="missing react-native-mobile external override"$'\n'
+
+  if [[ -n "$viol" ]]; then
+    fail "$name" "$viol"
+  else
+    pass "$name"
+  fi
+}
+
+test_external_bodies_are_host_neutral() {
+  local name="portable bodies avoid unconditional Claude APIs and routing"
+  local files hits=""
+  files=(
+    "$EXTERNAL_SKILLS_DIR/brainstorming/SKILL.md"
+    "$EXTERNAL_SKILLS_DIR/doc-coauthoring/SKILL.md"
+    "$EXTERNAL_SKILLS_DIR/frontend-design/SKILL.md"
+    "$EXTERNAL_SKILLS_DIR/skill-review-standard/SKILL.md"
+  )
+
+  hits="$(grep -HnE 'AskUserQuestion|Agent\(|Claude Code sub-agent|baseline Claude|\$\{CLAUDE_PLUGIN_ROOT\}' \
+    "${files[@]}" 2>/dev/null || true)"
+  if [[ -n "$hits" ]]; then
+    fail "$name" "$hits"
+  elif grep -RInF '${CLAUDE_PLUGIN_ROOT}' "$EXTERNAL_SKILLS_DIR" >/dev/null 2>&1; then
+    fail "$name" "external package contains a Claude-plugin-root dependency"
+  elif grep -RInE '^allowed-tools:.*(Agent|AskUserQuestion)' \
+    "$EXTERNAL_SKILLS_DIR" >/dev/null 2>&1; then
+    fail "$name" "external package declares a Claude-only tool"
+  elif grep -nEi 'route .* to Claude|to Claude instead|owner:[[:space:]]*"?claude-impl' \
+    "$EXTERNAL_SKILLS_DIR/react-native-mobile/SKILL.md" >/dev/null 2>&1; then
+    fail "$name" "react-native-mobile contains an unconditional Claude route"
+  elif grep -RInE '\["claude"|claude[[:space:]]+-p' \
+    "$EXTERNAL_SKILLS_DIR/skill-review-standard" >/dev/null 2>&1; then
+    fail "$name" "skill-review-standard contains a provider-locked helper"
   else
     pass "$name"
   fi
@@ -186,21 +293,26 @@ test_remote_agent_host_contract() {
     'safe reclaim protocol|(reclaim|take over).*(stop|terminate|writer|ownership|safe)|(stop|terminate|writer|ownership|safe).*(reclaim|take over)'
     'blocking lifecycle wait|(blocking|block).*(wait|event)|(wait|event).*(blocking|block)'
     'monotonic wait cursor|(monotonic|increasing).*(cursor)|(cursor).*(monotonic|increasing)'
-    'bootstrap cursor for first wait|bootstrapCursor|bootstrap cursor'
-    'one nested status envelope|one status JSON object.*authority.*supervisor|status.*one JSON object.*authority.*supervisor'
-    'status cursor is nested under supervisor|supervisor\.bootstrapCursor|supervisor.*bootstrapCursor'
-    'start has a distinct bootstrap envelope|distinct start.*bootstrap|start.*distinct.*bootstrap'
+    'returned cursor for first wait|(list|inspect|start-conductor).*(return|returned).*(cursor)|(cursor).*(list|inspect|start-conductor)'
     'writer records remain active until protocol transition|writer record.*(live|active).*(explicit|safe).*(transition|clears)|explicit.*(transition|clears).*writer record'
     'no PID or heartbeat stale inference|heartbeat signals to infer a stale writer|(do not|never).*(PID|heartbeat).*(stale|infer)'
     'main and subagent completion are distinct|(main|main-turn).*(subagent).*(distinct|separate|different)|(subagent).*(main|main-turn).*(distinct|separate|different)'
     'input-needed allowlist|permission_prompt.*idle_prompt.*elicitation_dialog'
     'bounded capture after event wake|(wake|event).*(bounded).*(capture|inspect)|(capture|inspect).*(after|following).*(wake|event)'
     'visible Terminal reveal|(reveal|show|open).*(Mini )?Terminal|(Mini )?Terminal.*(reveal|show|open)'
-    'exact reveal session|remote-agent--PROJECT--HARNESS'
+    'workflow-id reveal command|reveal WORKFLOW_ID'
     'reveal keeps prompt out of argv|(reveal|Terminal).*(prompt).*(not|never|without).*(argv)|(prompt).*(not|never|without).*(argv).*(reveal|Terminal)'
     'reveal does not replace the pane|(reveal|Terminal).*(not|never|without).*(replace|replacing).*(pane)|(not|never|without).*(replace|replacing).*(pane).*(reveal|Terminal)'
     'Mini Claude defaults to Fable xhigh|model=fable.*effortLevel=xhigh|Fable.*xhigh'
     'Claude model preference is not a launch flag|not as launch flags|not.*launch arguments'
+    'workflow list is the discovery source|remote-agent\.sh(\s|`)* list|workflow.*list'
+    'workflow start conductor command|start-conductor PROJECT PLAN_ID'
+    'workflow-id inspect command|inspect WORKFLOW_ID'
+    'workflow-id send command|send WORKFLOW_ID'
+    'workflow-id wait command|wait WORKFLOW_ID.*--cursor.*--timeout'
+    'workflow-id release command|release WORKFLOW_ID'
+    'separate mirror sync command|sync WORKFLOW_ID|request-mirror-sync'
+    'diagnostic harness family|diagnostic (ACTION|start).*PROJECT HARNESS'
   )
 
   if [[ ! -f "$REMOTE_AGENT_HOST_SKILL" ]]; then
@@ -219,7 +331,7 @@ test_remote_agent_host_contract() {
     || viol+="missing contract: helper invocation through CLAUDE_PLUGIN_ROOT"$'\n'
 
   # shellcheck disable=SC2016
-  if grep -qiE 'first JSON line|second and final line|appended by a running `status`|stale-writer|stale ownership|break a stale writer' "$REMOTE_AGENT_HOST_SKILL"; then
+  if grep -qiE 'first JSON line|second and final line|appended by a running `status`|stale-writer|stale ownership|break a stale writer|remote-agent\.sh status PROJECT|remote-agent\.sh start PROJECT|remote-agent\.sh continue PROJECT|remote-agent\.sh reclaim PROJECT' "$REMOTE_AGENT_HOST_SKILL"; then
     viol+="obsolete remote status or stale-writer doctrine remains"$'\n'
   fi
 
@@ -274,6 +386,9 @@ test_skill_routes_resolve
 test_no_stale_verdict_phrases
 test_remote_agent_host_contract
 test_conductor_routes_remote_agent_host
+test_host_and_external_skill_inventories
+test_external_skills_are_self_contained
+test_external_bodies_are_host_neutral
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

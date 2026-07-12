@@ -39,7 +39,9 @@ Every plan lives in a single directory at:
 Boundaries:
 
 - **`plan.json` is read-only after approval.** Once `frozen: true`, the
-  definition does not change. Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json`.
+  definition does not change. Its required `routingProfile` is either
+  `codex-primary` or `fable-primary` and durably selects the verifier gate
+  for the plan. Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json`.
 - **`progress.json` is the only file the conductor mutates during
   execution.** Field reference: `${CLAUDE_PLUGIN_ROOT}/schemas/progress.schema.json`.
 - **`masterPlan.md` is for humans.** Not consumed by any tool; not part
@@ -57,8 +59,8 @@ All reads, writes, and frontier computations go through
 - `init-progress <plan-dir>` — initialize progress.json from plan.json.
 - `start-step <plan-dir> <step-id> <executor> <model> <effort>` — atomically start a step and record its implementation dispatch.
 - `record-lane-dispatch <plan-dir> <step-id> <lane> <executor> <model> <effort>` — persist a verifier dispatch before it launches and clear that lane's stale verdict.
-- `set-step-status <plan-dir> <step-id> <status>` — atomic status update. The `done` transition reads the schema-backed matrix: claude-impl requires Codex+Grok, codex-impl requires Claude+Grok, and grok-impl requires Codex only. There is no degraded completion flag.
-- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json> [lane]` — write a verifier's result. Every implementation verifier supplies its `claude`, `codex`, or `grok` lane; lanes outside the owner's matrix row are refused.
+- `set-step-status <plan-dir> <step-id> <status>` — atomic status update. For profiled implementation steps, the `done` transition is owner-independent and fail-closed: `codex-primary` requires Codex+Grok, while `fable-primary` requires Codex+Grok+Claude. Manual steps are exempt. Unprofiled legacy plans use the schema-backed owner matrix. There is no degraded completion flag.
+- `record-verdict <plan-dir> <step-id> <verdict> <summary> <findings-json> <files-json> [lane]` — write a verifier result. Every required verifier supplies its `claude`, `codex`, or `grok` lane; lanes outside the immutable profile or legacy owner row are refused. The top-level verdict is a compatibility mirror only.
 - `set-frontier <plan-dir> <ids…>` / `compute-frontier <plan-dir>` — manage the runnable frontier.
 
 Mutations are atomic (tmp file + rename). If a write fails mid-run,
@@ -115,8 +117,8 @@ When a fresh context window starts (cold start or post-compaction):
    only `pending` steps, so anything left `in_progress` by the
    interrupted session must be settled explicitly, per its recorded
    evidence:
-   - Every required verifier lane already has PASS in
-     `verdicts` → flip `done` (the gate re-checks).
+   - Every verifier required by the immutable `routingProfile` already has
+     PASS in `verdicts` → flip `done` (the gate re-checks).
    - The implementation demonstrably finished (its `files[]` show the
      change; some lane verdict exists or the diff is present) but a
      required verify is missing → dispatch the missing verifier(s)

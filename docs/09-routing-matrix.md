@@ -10,14 +10,32 @@ See also: `docs/05-skills-catalog.md` for the v2 skill catalog,
 `docs/06-codex-integration.md` for the bounded Codex contract,
 `docs/02-conductor.md` for the dispatch-only rule.
 
-**Conductor mode is the default**. The main Claude thread does not
-write code directly — it dispatches every non-trivial step to a
-subagent (`general-purpose` for `claude-impl`, Codex via
-`run-codex-impl.sh` for `codex-impl`) and reads only the parsed Codex
-contract block (`{summary, verdict, findings, filesTouched}`) or a
-sub-agent's bounded return message. **Codex is the default
-implementer.** Claude-impl is the narrow exception, gated on the
-Claude-only skill list (or the RN-mobile Routing Directive).
+**Conductor mode is the default**, but the conductor family is selected by an
+explicit routing profile rather than assumed to be Claude. The active profile
+is one of:
+
+- **`codex-primary`** — GPT-5.6 Sol xhigh is the host and convergence owner;
+  `claude_workers=deny`; Claude is never invoked. Codex and Grok provide the
+  independent planning, exploration, implementation, and verification lanes.
+- **`fable-primary`** — Claude Code running Fable xhigh is the host and
+  convergence owner; `claude_workers=allow`; Codex and Grok remain mandatory
+  external counterweights. If Fable is unavailable, this profile fails closed
+  and the user explicitly activates `codex-primary`; there is no silent
+  Opus/Sonnet orchestrator fallback.
+
+With no project override, the effective profile is the shipped
+`codex-primary` preset. An explicit profile is stored in
+`.orchestration/routing.json` and validated against
+`schemas/routing.schema.json`. A profile cannot change the application hosting
+an already-running thread: activate `codex-primary` and start Codex, or activate
+`fable-primary` and start Claude Code with Fable xhigh selected. Installing
+`--host both` provisions both surfaces once so switching does not require a
+reinstall.
+
+In both profiles the conductor dispatches every non-trivial implementation step
+and reads only bounded return contracts. **Codex is the default implementer.**
+Taste-led work is Fable-preferred only in `fable-primary`; the same domain
+skills route to Sol in `codex-primary`.
 
 ---
 
@@ -44,37 +62,39 @@ conductor's context*. That is why Codex is the default implementer —
 not because it has the most taste, but because it is intelligent,
 cheap, and off-context. Reach for it liberally on bulk mechanical work.
 
-**Orchestrator economics.** The conductor seat gets the strongest
-available model (Fable) because orchestration is *few-tokens* work when
-delegation holds: the conductor reads only bounded contract blocks and
-sub-agent summaries, never raw artifacts, so its tier price is a small
-share of total spend. Bad routing decisions are the expensive failure
-mode, not the conductor's per-token rate. Empirical grounding:
+**Orchestrator economics.** The `fable-primary` seat uses Fable because
+orchestration is *few-tokens* work when delegation holds: the conductor reads
+only bounded contract blocks and sub-agent summaries, never raw artifacts, so
+its tier price is a small share of total spend. `codex-primary` uses Sol xhigh
+when Anthropic is unavailable or intentionally disabled and preserves the same
+dispatch-only context discipline. Bad routing decisions are the expensive
+failure mode, not the conductor's per-token rate. Empirical grounding:
 Anthropic's multi-agent research system — an Opus lead orchestrating
 Sonnet subagents — outperformed single-agent Opus by 90.2%, and the
 orchestrator's token share of the run was small. A lean, cache-stable
 conductor context bills mostly *cached* input, cheapening the seat
-further. **Sonnet 5 is the sanctioned economy conductor** for routine
-sessions where the strongest seat is not warranted.
+further. Those historical tiers are evaluation context only; neither Opus nor
+Sonnet participates in either canonical profile.
 
 ---
 
 ## Model Scorecard
 
-The conductor reaches six models. Route by the axis the step is
-*bottlenecked* on, then escalate per the policy below.
+The historical inventory contains six model tiers, but the canonical profiles
+activate only their named lanes. Route by the axis the step is *bottlenecked*
+on, then apply the profile policy below.
 
 | Model | Reached via | Intelligence | Taste | Route here for |
 |---|---|---|---|---|
-| **Fable 5** | `Agent(model: "fable")` | highest | highest | Plan drafting and convergence (the Claude panel seat is always Fable when available); the hardest *and* most user-facing implementation; end-to-end multi-step work that needs both axes at once — the "steer everything" tier. |
-| **Opus 4.8** | `Agent(model: "opus")` | high | high | Implementation floor *within* the Claude lane — taste-led steps that are not the top of the pile. For implementation without a taste requirement, prefer `grok-impl` (quota economics; see the lane-preference section below). |
-| **Sonnet 5** | `Agent(model: "sonnet")` | mid | mid | Cheap, read-heavy scouting and mechanical Claude-side work where taste does not ship. Never the default for code that lands. |
+| **Fable 5** | `Agent(model: "fable")` | highest | highest | Every Claude planning, exploration, implementation, design, and review lane in `fable-primary`. |
+| **Opus 4.8** | inactive in canonical profiles | high | high | Historical comparison tier only; never a silent substitute for Fable. |
+| **Sonnet 5** | inactive in canonical profiles | mid | mid | Historical comparison tier only; never a silent substitute for Fable. |
 | **Codex / gpt-5.6-sol** | `run-codex-impl.sh` / `run-codex-verify.sh` | high | low | Bulk mechanical work, clear-spec backend, migrations, and off-context implementation. Also the independent second perspective on verify. |
-| **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations — the *second* off-context implementer; also the **mandatory verifier on every implementation step** (sole cross-family verifier for `codex-impl`, second verifier alongside Codex elsewhere). |
+| **Grok 4.5** | `run-grok-impl.sh` / `run-grok-verify.sh` | high | low-mid | Bulk mechanical work, clear-spec backend, migrations, independent planning/exploration, and a required member of every profile's all-pass verifier gate. |
 | **Haiku** | — | low | low | **Never for real work.** Not an execution or verification tier. |
 
-The Claude tiers (Fable / Opus / Sonnet) are selected via the `model`
-field on the `Agent` tool. Codex and Grok are each reached only through
+The Fable profile explicitly selects `model: "fable"` on every Claude `Agent`
+dispatch. Codex and Grok are each reached only through
 their direction-locked wrappers; callers never supply a model to either
 wrapper pair (see *Machine defaults* at the bottom of this doc).
 
@@ -103,7 +123,7 @@ actually established:
 - **Panel planning beats solo and relay** — see the Panel Planning
   section below.
 
-### grok-impl vs codex-impl vs claude-impl (Opus)
+### grok-impl vs codex-impl vs claude-impl (Fable)
 
 The implementation lanes rank by quota economics, measured, not
 assumed. **Measured 2026-07-10:** a full day of heavy orchestration —
@@ -115,18 +135,15 @@ The implementation preference order:
 
 1. **`codex-impl` remains the default external implementer**
    (off-context, effectively free at the margin on the subscription).
-2. **`grok-impl` is preferred over a Claude (Opus) implementation
-   sub-agent for any implementation step that does not need
-   Claude-side taste or a Claude-only skill.** If a step would land on
+2. **`grok-impl` is preferred over a Fable implementation
+   sub-agent for any implementation step that does not need the active
+   profile's taste owner.** If a step would land on
    `claude-impl` merely because the Codex lane is busy, or because "an
-   Opus agent can do it", route it `grok-impl` instead. Grok is also
+   Fable agent can do it", route it `grok-impl` instead. Grok is also
    the second lane when Codex is saturated, and the second half of
    bulk sweeps split across both lanes.
-3. **`claude-impl` (Opus floor) is reserved for taste-led work**: steps
-   whose skill is Claude-only (frontend/design/prose lanes) or where
-   the artifact's shape for human readers is the point. Opus is the
-   implementation floor *within* the Claude lane — not the default
-   destination for implementation in general.
+3. **`claude-impl` exists only in `fable-primary` and is reserved for
+   taste-led work.** The same step routes to Sol under `codex-primary`.
 
 A `claude-impl` step that isn't taste-led or Claude-skill-gated is a
 routing bug twice over: it burns the scarce quota and leaves the slack
@@ -139,20 +156,18 @@ lane idle.
 The scorecard gives defaults, not limits. The conductor applies four
 rules on top of it:
 
-1. **Defaults, not limits.** A lower tier's output that does not meet
-   the bar is re-dispatched to a higher tier *without asking*. Judge
-   the output, not the price tag — escalating costs less than shipping
-   mediocre work.
-2. **Taste escalation is a first-class move.** Codex is the default
-   implementer, but when the artifact is user-facing (SDK, public API,
-   UI, copy), route the *design* to a Claude tier first, or add a
-   Claude taste-pass after Codex. This is the dual-pass review and the
-   "Claude reviews Codex integration impact" rows made explicit.
+1. **Profiles are hard limits.** A weak result is fixed and re-run through the
+   same required lanes. It is never silently re-dispatched to a model absent
+   from the active profile.
+2. **Taste routing is a first-class move.** Codex is the default implementer,
+   but when the artifact is user-facing (SDK, public API, UI, copy), route the
+   design through the active taste owner: Sol xhigh in `codex-primary`, Fable
+   xhigh in `fable-primary`.
 3. **Tiebreak for anything that ships: intelligence > taste > cost.**
    Cost decides only when intelligence and taste do not. It never
    blocks the right model for work that lands.
-4. **Never route real work to Haiku**, and never let Sonnet own code
-   that ships — Sonnet is for cheap read-heavy scouting only.
+4. **Never route real work to Haiku, Opus, or Sonnet in either canonical
+   profile.** Adding another model requires a new named, validated profile.
 
 ---
 
@@ -175,14 +190,18 @@ not one multi-owner step.
 
 ## Task-Type Routing Table
 
+In this table, a `claude-impl` taste/design cell applies only to
+`fable-primary`; `codex-primary` substitutes `codex-impl` at Sol with the same
+portable skill and keeps the dependency graph unchanged.
+
 | Task Category | Default Owner | Override Conditions |
 |---|---|---|
-| **Frontend UI / visual design / UX polish** | `claude-impl` | Skill must be in Claude-only set (`frontend-design`, `svg-art`, `immersive-frontend`). |
-| **Product copy / UX text / content** | `claude-impl` | Skill `doc-coauthoring`. |
-| **Creative / landing page / marketing** | `claude-impl` | Skill `frontend-design` / `immersive-frontend` / `svg-art`. |
-| **Brainstorming / requirements shaping** | `claude-impl` | Skill `brainstorming`. Codex co-explores in parallel and reviews `design.md` before `writing-plans`. |
-| **Plan writing** | `claude-impl` | Skill `writing-plans`. High-ambiguity tasks trigger **automatic panel planning** (see the Panel Planning section below). |
-| **Documentation / API docs / specs** | `claude-impl` | Skill `doc-coauthoring`. Codex verifies technical accuracy via `run-codex-verify.sh` contract block. |
+| **Frontend UI / visual design / UX polish** | active taste owner | Sol + `frontend-design`/`svg-art`/`immersive-frontend` in `codex-primary`; Fable in `fable-primary`. |
+| **Product copy / UX text / content** | active taste owner | Skill `doc-coauthoring`; Sol or Fable by profile. |
+| **Creative / landing page / marketing** | active taste owner | Sol or Fable by profile, with the named portable skill. |
+| **Brainstorming / requirements shaping** | active orchestrator | Host-native `brainstorming`; parallel Codex/Grok exploration remains independent. |
+| **Plan writing** | active orchestrator | Host-native `writing-plans`; automatic profile panel for high ambiguity. |
+| **Documentation / API docs / specs** | active taste owner | Skill `doc-coauthoring`; profile all-pass verification. |
 | **MCP / DB / API / external integration** | `codex-impl` | If the step is purely external-facing design (no code), it may be `claude-impl` with a one-line routing justification in the step description. Otherwise split into design step (`claude-impl`, `doc-coauthoring`) and impl step (`codex-impl`) with `dependsOn`. |
 | **Cross-domain integration** | `codex-impl` | Split mixed work into sequential steps: design (`claude-impl`) → backend impl (`codex-impl`) → frontend impl (`claude-impl`) with `dependsOn`. |
 | **Backend from clear spec (CRUD, services)** | `codex-impl` | — |
@@ -250,28 +269,28 @@ graceful degradation when the server is absent).
 
 These rules override the table above:
 
-1. **Codex is the default implementer.** Under conductor mode, every step
-   is presumed `codex-impl` unless one of three conditions holds: (a) the
-   step's `skill` is in the Claude-only set below, (b) the RN-mobile
-   Routing Directive routes it to `claude-impl`, or (c) a documented
-   routing-matrix override applies (e.g., security-sensitive design,
-   MCP/external-tool reasoning). A `claude-impl` step whose description
-   does not carry a one-line routing justification citing one of these
-   reasons is a planning bug.
+1. **Codex is the default implementer in both profiles.** A step is presumed
+   `codex-impl` unless a documented override applies. In `fable-primary`, a
+   taste-led or prose-led step may route to `claude-impl`. In
+   `codex-primary`, `owner: "claude-impl"` is invalid and the equivalent Sol
+   lane owns the work; never smuggle a Claude fallback into a denied profile.
 
-2. **Claude-only skill set (exact, exhaustive — six skills).** A step's
-   `skill` field forces `owner: "claude-impl"` if and only if the skill is
-   one of EXACTLY:
+2. **Taste/planning skills are profile-dependent, not Claude-only.** The
+   profile-dependent set is:
 
    ```
    frontend-design, svg-art, immersive-frontend,
    brainstorming, writing-plans, doc-coauthoring
    ```
 
-   `react-native-mobile` is NOT in this set — it is conditional (see RN
-   section). v2 does not ship a `digest` skill; raw artifacts are
-   bounded by the wrapper prompt contract, not by a downstream
-   digester.
+   Under `fable-primary`, these prefer Fable and may use `claude-impl`. Under
+   `codex-primary`, `writing-plans` and `brainstorming` are conductor-owned
+   Codex-native workflows, while design/prose implementation routes to
+   `codex-impl` at Sol. The portable domain bodies are installed for Codex and
+   Grok so implementation and independent review see the same contract.
+   `react-native-mobile` remains conditional (see below). `remote-agent-host`
+   remains the one explicit Claude-host-only skill and is never copied into
+   Codex/Grok worker skill directories.
 
 3. **One step has one owner.** Mixed-ownership work is split into two
    sequential single-owner steps linked by `dependsOn`. The plan schema
@@ -288,21 +307,23 @@ These rules override the table above:
    concurrently on every tick. Sequencing is expressed via `dependsOn`,
    not via main-thread serialization.
 
-6. **In-thread `claude-impl` threshold (the only exception to dispatch).**
+6. **In-thread `claude-impl` threshold (Fable profile only).**
    A `claude-impl` step MAY run inside the main thread iff BOTH:
    - the step's `files` array has **≤1 file**, AND
    - the step's `skill` is one of `{brainstorming, writing-plans,
      doc-coauthoring}`.
 
-   Every other `claude-impl` step dispatches to a Claude subagent whose
-   model is chosen per the Model Scorecard above (Opus is the floor;
-   Fable for the hardest / highest-taste work; Sonnet only for cheap
-   read-heavy scouting). Every `codex-impl` step dispatches via
+   This exception exists only in `fable-primary`; `codex-primary` forbids
+   `claude-impl`. Every other `claude-impl` step dispatches to a Claude
+   subagent with explicit `model: "fable"`. Opus and Sonnet are not fallback
+   workers for the named profile. Every `codex-impl` step dispatches via
    `run-codex-impl.sh`.
 
-7. **User can override any assignment.** During Orbit plan review, the
-   user may change any step's `owner`. The routing matrix
-   provides defaults, not mandates.
+7. **User can override profile-valid assignments.** During Orbit plan review,
+   the user may change a step's `owner` to any owner allowed by the active
+   profile. Selecting `claude-impl` while `codex-primary` is active requires an
+   explicit switch to `fable-primary`; the routing matrix never bypasses the
+   profile's worker policy.
 
 8. **Wrapper-modification serialization.** A step that edits
    `run-codex-impl.sh`, `run-codex-verify.sh`, or any other
@@ -313,10 +334,10 @@ These rules override the table above:
    guard" section).
 
 9. **Every dispatch carries an explicit model and announces itself.**
-   Every `Agent` tool dispatch — implementation, scouting, verification
+   In `fable-primary`, every `Agent` tool dispatch — implementation, scouting, verification
    — MUST carry an explicit `model` chosen per the Model Scorecard;
    inheriting the session model is a routing bug. Scouts (`Explore` /
-   `Plan`) default to `sonnet` *explicitly*, never implicitly. Each
+   `Plan`) use `fable` *explicitly*, never implicitly. Each
    dispatch also emits a one-line user-visible announcement of the form:
 
    ```
@@ -325,49 +346,44 @@ These rules override the table above:
 
    In addition, the `Agent` tool's `description` parameter MUST embed
    the step id and model, format `<step-id> · <model> · <short title>`
-   (e.g. `step-01 · opus · docs/09 routing`): the harness's task panel
+   (e.g. `step-01 · fable · docs/09 routing`): the harness's task panel
    below the user's input field renders the description, so embedding
    the model there is what makes the fleet's model composition visible
    live. This complements the `→` announcement line; it does not
    replace it.
 
-10. **Quality arbitration routes to the Fable + Codex judge pair.**
+10. **Quality arbitration follows the active profile.**
     Arbitration — ranking candidate artifacts, breaking a tie between
     approaches, scoring output quality — is distinct from step
     verification (which follows the cross-family rule above). The
-    conductor dispatches BOTH arbiters: **Fable** via
-    `Agent(model: "fable")` and **Codex** via `run-codex-verify.sh`
-    (read-only; machine-default model — expected gpt-5.6-sol; the
-    no-`--model`-flag invariant still holds), and consumes their
-    consensus. **Self-bias guard** (measured: codex +0.30, fable +0.47
-    on their own blind-labeled work; grok/opus ≈ 0): an arbiter's
-    score of an artifact produced by its *own model family* counts
-    only when the other arbiter independently concurs; on a split over
-    an own-family artifact, add a grok or opus tiebreak vote. Blind
-    the artifacts (strip authorship) whenever practical.
+    `codex-primary` dispatches Codex + Grok and requires consensus.
+    `fable-primary` dispatches Fable + Codex + Grok and requires all three
+    bounded judgments before convergence. **Self-bias guard** (measured:
+    codex +0.30, fable +0.47 on their own blind-labeled work; grok/opus ≈
+    0): an arbiter's score of its own-family artifact counts only when a
+    different family independently concurs. Blind artifacts whenever practical.
 
 ---
 
 ## RN-mobile conditional routing
 
-`react-native-mobile` is the only skill that is neither Claude-only nor
-Codex-default. Apply this rule whenever a step's `skill` is
+`react-native-mobile` has profile-dependent taste routing. Apply this rule whenever a step's `skill` is
 `react-native-mobile`:
 
-- **UI/UX (animations, haptics, gestures, visual polish) → claude.**
+- **UI/UX (animations, haptics, gestures, visual polish) → active taste
+  owner:** Fable in `fable-primary`, Sol in `codex-primary`.
 - **Code-heavy (data flow, networking, native modules, non-visual logic) → codex.**
 
 The Routing Directive section in
-`skills/react-native-mobile/SKILL.md` is the source of truth for the
-Claude-side breakdown; the same wording lives in
-`codex-skills/react-native-mobile/SKILL.md` so Codex sees the same
-routing rule. If a step blends both kinds of work, split
+`skills/react-native-mobile/SKILL.md` is the Claude-side body; the portable
+external-lane body under `external-skills/react-native-mobile/SKILL.md` carries
+the profile-aware version for Codex and Grok. If a step blends both kinds of work, split
 it into two sequential steps with `dependsOn` rather than forcing a
 single owner.
 
 Routing-justification examples (write these into the step description,
 not a separate field):
-- `"react-native-mobile UI/UX per Routing Directive → claude-impl"`
+- `"react-native-mobile UI/UX per Routing Directive → active taste owner"`
 - `"react-native-mobile code-heavy per Routing Directive → codex-impl"`
 
 ---
@@ -378,8 +394,8 @@ Some steps cannot determine their owner at plan time:
 
 | Pattern | How It Works |
 |---|---|
-| **Performance optimization** | Codex investigates bottlenecks first (`codex-impl`). Based on findings, fix steps are assigned: backend → `codex-impl`, frontend → `claude-impl`. |
-| **Vague requests** | Claude clarifies with user first (`claude-impl`, `brainstorming` or `doc-coauthoring`). Once requirements are concrete, subsequent steps are assigned normally — most will land on `codex-impl`. |
+| **Performance optimization** | Codex investigates bottlenecks first (`codex-impl`). Backend fixes stay Codex; frontend fixes use the active taste owner (Sol or Fable). |
+| **Vague requests** | The active orchestrator clarifies first using its host-native brainstorming/doc workflow. Once concrete, subsequent steps are assigned normally. |
 
 For these, `writing-plans` creates an investigation/clarification step
 and follows it with placeholder steps whose `owner` is reassigned after
@@ -439,30 +455,30 @@ affordable; wall-clock cost is low because generation is parallel.
 
 1. The conductor writes one planning brief (task statement, discovery
    summary, constraints) to `<plan-dir>/panel/brief.md`.
-2. The identical brief goes to three lanes **in parallel,
+2. The identical brief goes to the active profile's lanes **in parallel,
    independently** — no panelist ever sees another's draft:
    - **Codex** via `run-codex-impl.sh` (synthetic step id
      `panel-codex`, brief on stdin); deliverable
      `<plan-dir>/panel/codex.plan.md`.
    - **Grok** via `run-grok-impl.sh`, same shape, writing
-     `panel/grok.plan.md`. If the grok lane is unavailable (wrapper
-     exit 4), proceed as a two-model panel and note it in
-     `progress.json` `deviations` once progress exists.
-   - **Claude planner** via `Agent` with an explicit model: **Fable
-     whenever available, otherwise Opus** — the plan is the
-     highest-leverage artifact in the loop, so the strongest model
-     drafts it; Opus is the implementation tier, not the planning
-     tier. Writes `panel/claude.plan.md`.
-3. **Convergence.** One Claude sub-agent (same rule: Fable whenever
-   available, otherwise Opus)
-   reads the brief plus all drafts and produces the converged plan:
+     `panel/grok.plan.md`. An unavailable required lane blocks the selected
+     profile rather than shrinking the panel.
+   - **Fable planner (`fable-primary` only)** via `Agent(model: "fable")`.
+     There is no Opus/Sonnet substitution for the named Fable profile. Writes
+     `panel/claude.plan.md`.
+3. **Convergence.** The active orchestrator (Sol for `codex-primary`, Fable
+   for `fable-primary`)
+   reads the brief plus all bounded drafts and produces the converged plan:
    a definite decision wherever the drafts disagree (with a one-line
    reason — never "either works"), redundancy cut, complementary
    strengths kept. The converged output feeds the normal
    `writing-plans` three-file draft. Panel drafts stay in
    `<plan-dir>/panel/` as the audit trail; the conductor reads only
    the converged output, never the raw drafts.
-4. **Never chain panelists on one evolving draft.** Sequential
+4. `codex-primary` therefore has two independent candidates (Codex + Grok);
+   `fable-primary` has three (Codex + Grok + Fable). A missing required lane
+   blocks convergence; it does not silently shrink the selected profile.
+5. **Never chain panelists on one evolving draft.** Sequential
    collaboration anchors on the first draft and measured *worse* than
    the best solo plan. Independence before convergence is the entire
    point of the panel.
@@ -483,31 +499,29 @@ guidance Codex receives in its developer-instructions:
 | `mcp-builder` | MCP server development |
 | `"none"` | Engineering-discipline only |
 
-Skills that stay Claude-only (never injected into Codex):
-- `frontend-design` — visual taste
-- `svg-art` — creative direction
-- `immersive-frontend` — experiential judgment
-- `brainstorming` — Claude leads dialogue, Codex co-explores and reviews
-- `writing-plans` — Claude leads; under Panel Planning, Codex and Grok
-  contribute *independent* panel drafts (they never see each other's)
-- `doc-coauthoring` — Claude writes, Codex verifies accuracy
+The portable worker inventory is exact and shared by Codex and Grok:
 
-`react-native-mobile` is dual-installable — both Claude and Codex have
-their own copies, and routing per step follows the Routing Directive
-above.
+```
+engineering-discipline, test-driven-development, refactoring,
+systematic-debugging, brainstorming, doc-coauthoring, frontend-design,
+svg-art, immersive-frontend, mcp-builder, react-native-mobile,
+webapp-testing, skill-review-standard
+```
 
-**CLI-side installation.** The repo-root `install.sh` syncs exactly the
-injectable set — `engineering-discipline`, the five injectable workflow
-skills above, and the external-lane `react-native-mobile` body — into
-`~/.codex/skills/` **and** `~/.grok/skills/` on every (re)install. It
-also enforces **one canonical copy per lane**: every plugin-managed
-skill name (plus v1 leftovers) is cleared from `~/.claude/skills/`,
-`~/.codex/skills/`, and `~/.grok/skills/` before the sync — Claude
-loads the plugin's skills from the plugin cache only, so a user-level
-copy would double-install. Skills the plugin does not own are never
-touched. Both external lanes carry the same skill set; Claude-only
-skills are never installed CLI-side (panel-planning briefs and
-arbitration instructions travel in the wrapper prompt).
+Host-only orchestration bodies never enter Grok's worker directory. Codex gets
+its native `conductor`, `persistent-plans`, `writing-plans`, and
+`codex-dispatch` bodies from the Codex plugin. Claude gets its existing host
+bodies from the Claude plugin. `remote-agent-host` stays Claude-host-only.
+
+**CLI-side installation.** The repo-root `install.sh` validates the complete
+portable inventory from the installed marketplace artifact before removing
+anything, then synchronizes it into `~/.codex/skills/` and
+`~/.grok/skills/` for every selected host path. Provider-specific overrides
+under `external-skills/` win over shared `skills/` bodies. The installer
+enforces one canonical copy per lane, preserves unowned user skills, and never
+uses the invoking checkout as the install source. `--host codex` performs this
+sync without invoking Claude; `--host both` provisions both conductor surfaces
+for immediate profile switching.
 
 v2 does not ship a `digest` skill. Raw Codex output is bounded by the
 wrapper's prompt contract (the Summary / Verdict / Findings block at
@@ -549,51 +563,39 @@ returned FINDINGS with 6 substantive items — verifier strictness is
 model-version-dependent, so leniency observations must be re-measured
 after upstream model changes. Both observations are further evidence
 *for* cross-family verification, not a routing or model change.
-**Grok is a mandatory verifier on every implementation step.** When
-the Grok lane is configured (the `grok` CLI is installed and
-authenticated):
+**Verification is an all-pass profile gate.** All required reviewers run
+independently over the same fixed diff and acceptance criteria:
 
-- `codex-impl` steps are verified via `run-grok-verify.sh` — Grok is
-  simultaneously the cross-family verifier and the mandated Grok pass.
-- `claude-impl` steps get **two** verifiers: `run-codex-verify.sh`
-  (cross-family) plus `run-grok-verify.sh` (the mandatory Grok second
-  pass). The step is done only when both final verdicts are PASS.
-- `grok-impl` steps also get two: `run-codex-verify.sh` is the
-  authoritative cross-family gate, and the Grok pass is the second
-  voice. Same-family here — acceptable *as the second* because the
-  blind eval measured no Grok self-favoring (−0.04); it is never the
-  sole gate on Grok's own work.
+- `codex-primary` → Codex + Grok in parallel. Both must PASS. Grok is the
+  cross-family gate for Codex-authored work; Codex is the cross-family gate for
+  Grok-authored work.
+- `fable-primary` → Codex + Grok + Fable in parallel. All three must PASS.
+  At least two reviewers are cross-family for any single-family implementer.
 
-Findings from either verifier enter the fix-and-re-verify loop, and
-both verifiers re-run after a fix. **Degradation, by the failing
-verifier's role:** when Grok is the *second* verifier (`claude-impl` /
-`grok-impl`), Grok exit 4 or two consecutive contract-parse failures
-(exit 3 after the strict-reminder retry) defer to the already-run
-Codex verdict with a recorded deviation. When Grok is the *sole*
-verifier (`codex-impl`), the same failures re-dispatch verification
-via `run-codex-verify.sh` — no Codex verdict exists yet — with a
-deviation note. When the **Codex lane** is unavailable (quota or
-capacity after the delayed retries), verification is never skipped:
-the step stays `in_progress` with a deviation until the lane returns.
-The grok-over-Opus implementation preference never overrides this —
-routing more work to `grok-impl` presumes the Codex gate; if Codex is
-down, prefer holding dispatches over accumulating unverifiable work.
+Findings from any reviewer enter the fix-and-re-verify loop, and **every**
+profile-required reviewer re-runs after a fix. Missing binaries, unavailable
+models, or two contract-parse failures block the step; the selected profile is
+never silently degraded to a smaller verifier set. After three non-converging
+rounds, pause for user judgment with the step still `in_progress`.
 
 There are **no signed receipts, no HMAC sidecars, no digester
 subagent** in v2. See `docs/01-philosophy.md` for the rationale.
 
 ---
 
-## Machine defaults — Codex side; scorecard governs the Claude side
+## Direction-locked model and effort selection
 
 Two model-selection regimes coexist, and they must not be confused:
 
-- **Conductor + Codex — machine defaults, never downgrade.** The
-  conductor's own thread runs the user's configured model, and `codex`
-  runs its machine default on the impl/verify side. The Codex wrappers
-  MUST NOT pass `--model` / `-m`: `scripts/run-codex-impl.sh` and
-  `scripts/run-codex-verify.sh` invoke `codex exec` without one, and no
-  caller adds it. The Grok wrappers pin `-m grok-4.5` in-script —
+- **The active conductor is profile-locked.** `codex-primary` requires Sol
+  xhigh; `fable-primary` requires Fable xhigh. A mismatch blocks dispatch.
+- **Codex wrapper model stays machine-selected; effort is scenario-locked.**
+  The Codex wrappers MUST NOT pass `--model` / `-m`. Callers pass only a
+  scenario enum and the wrapper maps it internally: planning/design → xhigh;
+  exploration/implementation/review → high; bulk → medium. This is a bounded
+  direction parameter, not arbitrary model selection.
+- **Grok is fully pinned.** The Grok wrappers pin `-m grok-4.5` and
+  `--reasoning-effort high` in-script —
   the subscription's current default coding model per `grok models` —
   because the CLI default is user-configurable (`~/.grok/config.toml`)
   and an unpinned wrapper would silently follow whatever that config
@@ -602,13 +604,10 @@ Two model-selection regimes coexist, and they must not be confused:
   place to update, and a stale pin fails loudly with "unknown model
   id" (wrapper exit 2) rather than silently running a different model. The verify wrapper additionally enforces read-only via
   `--deny 'Write' --deny 'Edit' --deny 'Bash'`. The invariant is the
-  same for both pairs:
-  **callers never supply a model to either wrapper pair**; the model is
-  the wrapper's business, not the conductor's.
-- **Claude-side implementation sub-agents — scorecard, not lock.** The
-  conductor selects each implementation sub-agent's model via the
-  `Agent` tool's `model` field per the Model Scorecard above (Opus
-  floor, Fable escalation, Sonnet for cheap read-heavy). This is
-  deliberate *tier selection*, not a downgrade — the "never downgrade"
-  rule governs the Codex wrappers and the conductor's own thread, never
-  the choice of Claude tier for a dispatched sub-agent.
+  same for both pairs: **callers never supply a model**; model identity and
+  allowed effort mapping are the wrapper's business.
+- **Claude-side sub-agents are Fable-locked by profile.** Under
+  `fable-primary`, every Claude planning, exploration, implementation, and
+  verification dispatch explicitly uses `model: "fable"`. If Fable cannot run,
+  the profile blocks and the user activates `codex-primary`; no smaller Claude
+  tier is substituted.

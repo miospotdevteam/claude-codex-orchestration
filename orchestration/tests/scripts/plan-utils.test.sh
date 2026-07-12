@@ -49,6 +49,7 @@ create_plan_dir() {
   local owner1=${2:-codex-impl}
   local owner2=${3:-codex-impl}
   local owner3=${4:-codex-impl}
+  local routing_profile=${5:-codex-primary}
   mkdir -p "$dir"
   cat >"$dir/plan.json" <<JSON
 {
@@ -56,6 +57,7 @@ create_plan_dir() {
   "title": "Plan utils test",
   "createdAt": "2026-05-11T00:00:00Z",
   "createdBy": "test",
+  "routingProfile": "$routing_profile",
   "frozen": true,
   "context": {
     "rootDir": "$SANDBOX",
@@ -94,6 +96,16 @@ create_plan_dir() {
 JSON
 }
 
+create_legacy_plan_dir() {
+  local dir=$1
+  local owner1=${2:-codex-impl}
+  local owner2=${3:-codex-impl}
+  local owner3=${4:-codex-impl}
+  create_plan_dir "$dir" "$owner1" "$owner2" "$owner3"
+  jq 'del(.routingProfile)' "$dir/plan.json" >"$dir/plan.next.json"
+  mv "$dir/plan.next.json" "$dir/plan.json"
+}
+
 test_init_progress() {
   local dir="$SANDBOX/init-progress"
   create_plan_dir "$dir"
@@ -105,6 +117,17 @@ test_init_progress() {
      and .currentFrontier == ["step-1", "step-2"]
      and ([.steps[] | .status] | all(. == "pending"))
      and (.steps | keys | sort) == ["step-1", "step-2", "step-3"]'
+}
+
+test_schemas_require_profile_and_allow_three_verdict_lanes() {
+  jq -e '
+    (.required | index("routingProfile")) != null
+    and (.properties.routingProfile.enum | sort) == ["codex-primary", "fable-primary"]
+  ' "$PLAN_SCHEMA" >/dev/null || return 1
+  jq -e '
+    (."$defs".stepProgress.properties.verdicts.properties | keys | sort)
+      == ["claude", "codex", "grok"]
+  ' "$PROGRESS_SCHEMA" >/dev/null
 }
 
 test_get_plan_dir_selects_most_recent() {
@@ -215,7 +238,7 @@ SH
 
 test_record_lane_dispatch_persists_per_lane_and_clears_stale_verdict() {
   local dir="$SANDBOX/lane-dispatch"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "stale claude" '[]' '[]' claude
@@ -249,7 +272,7 @@ test_record_lane_dispatch_persists_per_lane_and_clears_stale_verdict() {
 
 test_record_lane_dispatch_rejects_invalid_input_without_writing() {
   local dir="$SANDBOX/lane-dispatch-invalid"
-  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  create_legacy_plan_dir "$dir" grok-impl grok-impl grok-impl
   "$PLAN_UTILS" init-progress "$dir"
   cp "$dir/progress.json" "$SANDBOX/lane-dispatch-invalid.before"
 
@@ -294,7 +317,7 @@ test_manual_steps_refuse_lane_dispatch_and_verdict() {
 
 test_lane_down_records_deviation_and_remains_in_progress() {
   local dir="$SANDBOX/lane-down-deviation"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
   "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
@@ -354,7 +377,7 @@ test_set_step_status_round_trip() {
   "$PLAN_UTILS" set-step-status "$dir" step-1 in_progress
   started=$(jq -r '.steps["step-1"].startedAt' "$dir/progress.json")
   [[ "$started" != "null" && -n "$started" ]] || return 1
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude pass" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex pass" '[]' '[]' codex
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok pass" '[]' '[]' grok
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   completed=$(jq -r '.steps["step-1"].completedAt' "$dir/progress.json")
@@ -393,9 +416,9 @@ test_compute_frontier() {
   local actual
   create_plan_dir "$dir"
   "$PLAN_UTILS" init-progress "$dir"
-  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude ok" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex ok" '[]' '[]' codex
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok ok" '[]' '[]' grok
-  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "claude ok" '[]' '[]' claude
+  "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "codex ok" '[]' '[]' codex
   "$PLAN_UTILS" record-verdict "$dir" step-2 PASS "grok ok" '[]' '[]' grok
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
   "$PLAN_UTILS" set-step-status "$dir" step-2 done
@@ -407,7 +430,7 @@ test_compute_frontier() {
 
 test_record_verdict_lane_mirrors_authoritative_for_codex_impl() {
   local dir="$SANDBOX/lane-mirror-codex-impl"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
 
   # Grok is authoritative for codex-impl: lane write + top-level mirror.
@@ -434,7 +457,7 @@ test_record_verdict_lane_mirrors_authoritative_for_codex_impl() {
 
 test_record_verdict_lane_mirrors_authoritative_for_claude_impl() {
   local dir="$SANDBOX/lane-mirror-claude-impl"
-  create_plan_dir "$dir" claude-impl claude-impl claude-impl
+  create_legacy_plan_dir "$dir" claude-impl claude-impl claude-impl
   "$PLAN_UTILS" init-progress "$dir"
 
   # Codex is authoritative for claude-impl.
@@ -454,7 +477,7 @@ test_record_verdict_lane_mirrors_authoritative_for_claude_impl() {
 
 test_record_verdict_lane_mirrors_authoritative_for_grok_impl() {
   local dir="$SANDBOX/lane-mirror-grok-impl"
-  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  create_legacy_plan_dir "$dir" grok-impl grok-impl grok-impl
   "$PLAN_UTILS" init-progress "$dir"
 
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex auth" '[]' '[]' codex
@@ -472,6 +495,20 @@ test_record_verdict_lane_mirrors_authoritative_for_grok_impl() {
     return 1
   fi
   cmp -s "$SANDBOX/grok-self-verdict.before" "$dir/progress.json"
+}
+
+test_record_verdict_accepts_claude_lane() {
+  local dir="$SANDBOX/lane-claude"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl fable-primary
+  "$PLAN_UTILS" init-progress "$dir"
+
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "claude review" '[]' '["c.txt"]' claude
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].verdicts.claude.verdict == "PASS"
+    and .steps["step-1"].verdicts.claude.summary == "claude review"
+    and .steps["step-1"].verdicts.claude.findings == []
+    and .steps["step-1"].verdicts.claude.filesTouched == ["c.txt"]
+    and (.steps["step-1"].verdicts.claude.timestamp | test("Z$"))'
 }
 
 test_done_refused_when_only_one_dual_lane_pass() {
@@ -507,7 +544,7 @@ test_degraded_flag_is_removed_without_writing() {
 
 test_done_codex_impl_requires_claude_and_grok_pass() {
   local dir="$SANDBOX/done-codex-impl-two-lanes"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok pass" '[]' '["x.txt"]' grok
   if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
@@ -524,7 +561,7 @@ test_done_codex_impl_requires_claude_and_grok_pass() {
 
 test_done_grok_impl_requires_codex_pass_only() {
   local dir="$SANDBOX/done-grok-impl-codex-only"
-  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  create_legacy_plan_dir "$dir" grok-impl grok-impl grok-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex" '[]' '[]' codex
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
@@ -535,9 +572,75 @@ test_done_grok_impl_requires_codex_pass_only() {
     and (.steps["step-1"].verdicts | has("claude") | not)'
 }
 
+test_codex_profile_requires_codex_and_grok_regardless_owner() {
+  local dir="$SANDBOX/codex-profile-all-owners"
+  local step
+  create_plan_dir "$dir" codex-impl claude-impl grok-impl codex-primary
+  "$PLAN_UTILS" init-progress "$dir"
+
+  for step in step-1 step-2 step-3; do
+    "$PLAN_UTILS" record-verdict "$dir" "$step" PASS "codex pass" '[]' '[]' codex
+    if "$PLAN_UTILS" set-step-status "$dir" "$step" done >/dev/null 2>&1; then
+      return 1
+    fi
+    "$PLAN_UTILS" record-verdict "$dir" "$step" PASS "grok pass" '[]' '[]' grok
+    "$PLAN_UTILS" set-step-status "$dir" "$step" done
+  done
+
+  assert_jq "$dir/progress.json" '
+    [.steps[] | .status] | all(. == "done")'
+}
+
+test_fable_profile_requires_all_three_lanes() {
+  local dir="$SANDBOX/fable-profile-three-lanes"
+  create_plan_dir "$dir" codex-impl codex-impl codex-impl fable-primary
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex pass" '[]' '[]' codex
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "grok pass" '[]' '[]' grok
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "fable pass" '[]' '[]' claude
+  "$PLAN_UTILS" set-step-status "$dir" step-1 done
+  assert_jq "$dir/progress.json" '
+    .steps["step-1"].status == "done"
+    and (.steps["step-1"].verdicts | keys | sort) == ["claude", "codex", "grok"]'
+}
+
+test_profile_lane_admission_and_manual_exemption() {
+  local dir="$SANDBOX/profile-lane-admission"
+  create_plan_dir "$dir" codex-impl manual manual codex-primary
+  "$PLAN_UTILS" init-progress "$dir"
+  cp "$dir/progress.json" "$SANDBOX/profile-lane-admission.before"
+
+  if "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "unexpected Claude" '[]' '[]' claude >/dev/null 2>&1; then
+    return 1
+  fi
+  cmp -s "$SANDBOX/profile-lane-admission.before" "$dir/progress.json" || return 1
+  "$PLAN_UTILS" set-step-status "$dir" step-2 done
+  assert_jq "$dir/progress.json" '.steps["step-2"].status == "done"'
+}
+
+test_profile_no_lane_and_unknown_profile_fail_closed() {
+  local dir="$SANDBOX/profile-fail-closed"
+  create_plan_dir "$dir"
+  "$PLAN_UTILS" init-progress "$dir"
+  "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy-shaped" '[]' '[]'
+  if "$PLAN_UTILS" set-step-status "$dir" step-1 done >/dev/null 2>&1; then
+    return 1
+  fi
+
+  jq '.routingProfile = "unknown"' "$dir/plan.json" >"$dir/plan.next.json"
+  mv "$dir/plan.next.json" "$dir/plan.json"
+  if "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex" '[]' '[]' codex >/dev/null 2>&1; then
+    return 1
+  fi
+  assert_jq "$dir/progress.json" '.steps["step-1"].status != "done"'
+}
+
 test_legacy_no_lane_pass_never_satisfies_implementation_gate() {
   local dir="$SANDBOX/legacy-no-lane"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "legacy" '[]' '["a.txt"]'
   assert_jq "$dir/progress.json" '
@@ -552,7 +655,7 @@ test_legacy_no_lane_pass_never_satisfies_implementation_gate() {
 
 test_findings_invalidate_all_required_lane_passes() {
   local dir="$SANDBOX/findings-invalidate-required-lanes"
-  create_plan_dir "$dir" codex-impl codex-impl codex-impl
+  create_legacy_plan_dir "$dir" codex-impl codex-impl codex-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" start-step "$dir" step-1 codex gpt-5.6-codex xhigh
   "$PLAN_UTILS" record-lane-dispatch "$dir" step-1 claude claude fable xhigh
@@ -580,7 +683,7 @@ test_findings_invalidate_all_required_lane_passes() {
 
 test_non_pass_verdict_reopens_completed_step() {
   local dir="$SANDBOX/non-pass-reopens-done"
-  create_plan_dir "$dir" grok-impl grok-impl grok-impl
+  create_legacy_plan_dir "$dir" grok-impl grok-impl grok-impl
   "$PLAN_UTILS" init-progress "$dir"
   "$PLAN_UTILS" record-verdict "$dir" step-1 PASS "codex pass" '[]' '[]' codex
   "$PLAN_UTILS" set-step-status "$dir" step-1 done
@@ -729,6 +832,7 @@ test_list_plans_real_debris_stale() {
 }
 
 run_test "init-progress creates root frontier and pending steps" test_init_progress
+run_test "schemas require routing profile and allow three verdict lanes" test_schemas_require_profile_and_allow_three_verdict_lanes
 run_test "get-plan-dir selects the most recently updated plan" test_get_plan_dir_selects_most_recent
 run_test "read-plan and read-progress return validated files" test_read_plan_and_progress
 run_test "start-step records status and full dispatch atomically" test_start_step_records_dispatch
@@ -747,12 +851,17 @@ run_test "init-progress refuses existing progress unless forced" test_init_progr
 run_test "record-verdict lane mirrors authoritative for codex-impl" test_record_verdict_lane_mirrors_authoritative_for_codex_impl
 run_test "record-verdict lane mirrors authoritative for claude-impl" test_record_verdict_lane_mirrors_authoritative_for_claude_impl
 run_test "record-verdict lane mirrors authoritative for grok-impl" test_record_verdict_lane_mirrors_authoritative_for_grok_impl
+run_test "record-verdict accepts and stores claude lane" test_record_verdict_accepts_claude_lane
 run_test "done refused when only one of two dual lanes has PASS" test_done_refused_when_only_one_dual_lane_pass
 # Disposition (FORCED F3): the prior green degraded-completion cases were
 # deleted because implementation steps may never complete on a single lane.
 run_test "--degraded is removed and refuses without writing" test_degraded_flag_is_removed_without_writing
 run_test "done for codex-impl requires Claude and Grok PASS" test_done_codex_impl_requires_claude_and_grok_pass
 run_test "done for grok-impl requires Codex PASS only" test_done_grok_impl_requires_codex_pass_only
+run_test "codex profile requires Codex and Grok regardless owner" test_codex_profile_requires_codex_and_grok_regardless_owner
+run_test "fable profile requires Codex Grok and Claude" test_fable_profile_requires_all_three_lanes
+run_test "profile lane admission and manual exemption" test_profile_lane_admission_and_manual_exemption
+run_test "profile no-lane and unknown profile fail closed" test_profile_no_lane_and_unknown_profile_fail_closed
 run_test "legacy no-lane PASS never satisfies an implementation gate" test_legacy_no_lane_pass_never_satisfies_implementation_gate
 run_test "findings invalidate every required lane PASS" test_findings_invalidate_all_required_lane_passes
 run_test "a non-PASS required-lane verdict reopens a completed step" test_non_pass_verdict_reopens_completed_step

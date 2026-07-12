@@ -8,7 +8,7 @@ description: "Post-creation quality gate for skills. Runs structural validation,
 A quality gate that answers one question: **should this skill ship?**
 
 Not a prose rubric. Not a checklist. A functional test backed by structural
-validation. If the skill doesn't add value over baseline Claude, it doesn't
+validation. If the skill doesn't add value over the host model's baseline, it doesn't
 ship.
 
 **Announce at start:** "Running the skill review quality gate."
@@ -19,8 +19,11 @@ ship.
 
 Run the automated validation script on the target skill directory:
 
+Resolve `SKILL_ROOT` as the directory containing this selected `SKILL.md`,
+then run:
+
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/skills/skill-review-standard/scripts/validate-structure.sh <skill-directory>
+bash "$SKILL_ROOT/scripts/validate-structure.sh" <skill-directory>
 ```
 
 The script checks:
@@ -40,14 +43,14 @@ testing — there's no point testing a skill that references nonexistent files.
 
 ## Phase 2: Functional Test
 
-This is the core of the review. A skill that doesn't add value over
-baseline Claude has no reason to exist.
+This is the core of the review. A skill that doesn't add value over the
+current host model's unassisted baseline has no reason to exist.
 
 ### 2.1 Generate a test prompt
 
 Create 1 realistic test prompt — the kind of thing a real user would say
 that should trigger this skill. Make it substantive enough that a skill
-would genuinely help (not a trivial one-liner Claude can handle without
+would genuinely help (not a trivial one-liner the host model can handle without
 any skill).
 
 Present the prompt to the user: "I'll test the skill with this prompt.
@@ -55,7 +58,9 @@ Does it look realistic?"
 
 ### 2.2 Run with-skill vs without-skill
 
-Spawn 2 subagents in parallel:
+Spawn two independent workers in parallel when the host supports workers.
+Otherwise run the two cases in fresh, isolated contexts so the with-skill
+case cannot contaminate the baseline:
 
 **With-skill agent:**
 ```
@@ -169,7 +174,7 @@ for skills that will be used frequently or where trigger precision matters.
 Use the eval scripts in `scripts/`:
 
 ```bash
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/skills/skill-review-standard/scripts"
+SCRIPTS="$SKILL_ROOT/scripts"
 
 # Run 3 evaluation rounds with the test prompt from Phase 2
 python3 "$SCRIPTS/run_eval.py" \
