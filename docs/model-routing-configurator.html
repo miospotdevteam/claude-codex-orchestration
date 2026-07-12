@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orchestration model routing configurator</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07100f;
+      --panel: rgba(15, 29, 27, .86);
+      --panel-strong: #122522;
+      --line: rgba(173, 218, 199, .16);
+      --text: #eff9f3;
+      --muted: #9cb8ad;
+      --mint: #7cf0bd;
+      --mint-deep: #123f31;
+      --amber: #f6c66f;
+      --danger: #ff948c;
+      --shadow: 0 28px 80px rgba(0, 0, 0, .34);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(60, 191, 139, .17), transparent 31rem),
+        radial-gradient(circle at 92% 16%, rgba(246, 198, 111, .09), transparent 24rem),
+        linear-gradient(145deg, #06100e 0%, #091412 55%, #07100f 100%);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .16;
+      background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, black, transparent 70%);
+    }
+
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 64px 0 72px; }
+    .eyebrow { color: var(--mint); text-transform: uppercase; letter-spacing: .16em; font-size: .76rem; font-weight: 800; }
+    h1 { max-width: 840px; margin: 14px 0 16px; font-size: clamp(2.25rem, 6vw, 5.25rem); line-height: .96; letter-spacing: -.055em; }
+    .lead { max-width: 760px; margin: 0; color: var(--muted); font-size: 1.08rem; line-height: 1.7; }
+    .hero { position: relative; margin-bottom: 34px; }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 9px; margin-top: 24px; padding: 9px 13px;
+      border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(7, 16, 15, .6);
+    }
+    .status-pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 16px var(--mint); }
+
+    .panel { border: 1px solid var(--line); border-radius: 24px; background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+    .controls { display: grid; grid-template-columns: 1.15fr .85fr; gap: 1px; overflow: hidden; }
+    .controls > section { padding: 24px; background: rgba(10, 22, 20, .72); }
+    h2 { margin: 0 0 6px; font-size: 1rem; letter-spacing: -.01em; }
+    .hint { margin: 0; color: var(--muted); font-size: .88rem; line-height: 1.55; }
+    .preset-row, .action-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    button {
+      appearance: none; border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px;
+      color: var(--text); background: #10211e; font: inherit; font-size: .88rem; font-weight: 760; cursor: pointer;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    button:hover { transform: translateY(-1px); border-color: rgba(124, 240, 189, .52); }
+    button:disabled { opacity: .42; cursor: not-allowed; transform: none; }
+    button.primary { color: #062116; background: var(--mint); border-color: transparent; }
+    button.active { background: var(--mint-deep); border-color: rgba(124, 240, 189, .62); color: var(--mint); }
+    button:focus-visible, select:focus-visible { outline: 3px solid rgba(124, 240, 189, .3); outline-offset: 2px; }
+
+    .worker-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 18px; padding: 5px; border: 1px solid var(--line); border-radius: 15px; background: #091512; }
+    .worker-toggle button { border: 0; background: transparent; }
+    .worker-toggle button.active { background: var(--mint-deep); }
+
+    .routing { margin-top: 18px; overflow: hidden; }
+    .routing-head { padding: 15px 22px; color: var(--muted); background: rgba(7, 16, 15, .65); font-size: .74rem; text-transform: uppercase; letter-spacing: .11em; font-weight: 800; }
+    .route-row { padding: 20px 22px; border-top: 1px solid var(--line); }
+    .route-row:hover { background: rgba(124, 240, 189, .025); }
+    .route-header { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(210px, .55fr); align-items: start; gap: 18px; }
+    .route-title { font-weight: 780; letter-spacing: -.01em; }
+    .route-copy { margin-top: 5px; color: var(--muted); font-size: .81rem; line-height: 1.45; }
+    .topology-label { display: block; margin-bottom: 6px; color: var(--muted); font-size: .69rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+    .lane-list { position: relative; display: grid; gap: 9px; margin-top: 16px; padding-left: 18px; }
+    .lane-list::before { content: ""; position: absolute; top: 8px; bottom: 8px; left: 4px; width: 1px; background: linear-gradient(var(--mint), rgba(124, 240, 189, .12)); }
+    .lane-row { position: relative; display: grid; grid-template-columns: minmax(100px, .5fr) minmax(180px, 1fr) minmax(120px, .62fr) auto; align-items: center; gap: 10px; }
+    .lane-row::before { content: ""; position: absolute; top: 50%; left: -18px; width: 9px; height: 9px; border: 2px solid var(--panel-strong); border-radius: 50%; background: var(--mint); box-shadow: 0 0 12px rgba(124, 240, 189, .5); transform: translateY(-50%); }
+    .lane-id { overflow: hidden; color: var(--mint); font: .74rem ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+    .lane-remove { min-width: 42px; padding: 10px; color: var(--danger); }
+    .lane-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+    .lane-actions .hint { font-size: .76rem; }
+    .invariant-error { color: var(--danger); }
+    select {
+      width: 100%; min-height: 44px; border: 1px solid var(--line); border-radius: 11px; padding: 0 34px 0 12px;
+      color: var(--text); background: #0a1815; font: inherit; font-size: .86rem;
+    }
+    select:disabled { opacity: .48; }
+
+    .output-grid { display: grid; grid-template-columns: .8fr 1.2fr; gap: 18px; margin-top: 18px; }
+    .summary, .json-panel { padding: 22px; }
+    .guardrail { margin-top: 18px; padding: 14px 15px; border: 1px solid rgba(246, 198, 111, .22); border-radius: 13px; color: #f7dfb4; background: rgba(103, 67, 17, .18); font-size: .84rem; line-height: 1.55; }
+    .guardrail strong { color: var(--amber); }
+    .mapping-list { display: grid; gap: 10px; margin-top: 18px; }
+    .mapping-item { display: grid; grid-template-columns: 1fr auto; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .mapping-item:last-child { border-bottom: 0; }
+    .mapping-model { max-width: 430px; color: var(--mint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .81rem; line-height: 1.5; text-align: right; }
+    pre { min-height: 360px; max-height: 520px; overflow: auto; margin: 18px 0 0; padding: 18px; border: 1px solid var(--line); border-radius: 15px; color: #c6f5dc; background: #06100e; font: .78rem/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+    .copy-state { min-height: 1.4em; margin: 10px 0 0; color: var(--mint); font-size: .78rem; }
+    footer { margin-top: 22px; color: var(--muted); font-size: .82rem; line-height: 1.6; }
+
+    @media (max-width: 780px) {
+      main { width: min(100% - 20px, 680px); padding-top: 38px; }
+      .controls, .output-grid { grid-template-columns: 1fr; }
+      .route-header, .lane-row { grid-template-columns: 1fr; }
+      .lane-row { padding: 12px; border: 1px solid var(--line); border-radius: 13px; }
+      .lane-remove { width: 100%; }
+      .route-row select { min-height: 48px; }
+      .mapping-item { grid-template-columns: 1fr; }
+      .mapping-model { max-width: none; text-align: left; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="hero">
+      <div class="eyebrow">Orchestration control plane</div>
+      <h1>Map every role to the right model.</h1>
+      <p class="lead">Compose a safe no-Claude fleet or selectively allow Claude workers. Single owners, parallel scouts, verifier gates, and runnable frontiers stay explicit instead of collapsing into one model per role.</p>
+      <div class="status-pill" id="policy-status">No-Claude guardrail active</div>
+    </header>
+
+    <div class="panel controls">
+      <section>
+        <h2>Fleet preset</h2>
+        <p class="hint">Presets encode repo-aware topology. Tune models, reasoning, and lane composition without hiding how work fans out or converges.</p>
+        <div class="preset-row">
+          <button type="button" class="active" data-preset="codex_primary">Codex primary · no Claude</button>
+          <button type="button" data-preset="fable_primary">Fable primary · Claude enabled</button>
+        </div>
+      </section>
+      <section>
+        <h2>Claude worker policy</h2>
+        <p class="hint">Deny removes Claude choices and sanitizes the generated mapping. It never falls back to Claude.</p>
+        <div class="worker-toggle" role="group" aria-label="Claude workers">
+          <button type="button" class="active" data-workers="deny">deny</button>
+          <button type="button" data-workers="allow">allow</button>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel routing" aria-labelledby="routes-title">
+      <div class="routing-head" id="routes-title">Scenario topology and model lanes</div>
+      <div id="route-rows"></div>
+    </section>
+
+    <div class="output-grid">
+      <section class="panel summary">
+        <h2>Visible mapping</h2>
+        <p class="hint">This is the human-readable route card to review before saving.</p>
+        <div class="mapping-list" id="mapping-list"></div>
+        <div class="guardrail"><strong>Dirty worktree safe.</strong> Installing or switching hosts must not reset, clean, checkout, overwrite, or raw-rsync a working tree. For Mac Mini work, use the guarded <code>remote-agent</code> start/inspect/wait/reclaim protocol and reclaim only after its lease checks pass.</div>
+      </section>
+      <section class="panel json-panel">
+        <h2>Generated routing profile JSON</h2>
+        <p class="hint">Save an approved profile as <code>.orchestration/routing.json</code>. The routing helper validates and activates it atomically; the worker-policy resolver derives its fail-closed Claude gate from the same file.</p>
+        <div class="action-row">
+          <button type="button" class="primary" id="copy-json">Copy JSON</button>
+          <button type="button" id="download-json">Download JSON</button>
+        </div>
+        <p class="copy-state" id="copy-state" aria-live="polite"></p>
+        <pre id="json-output"></pre>
+      </section>
+    </div>
+
+    <footer>This configurator is self-contained: no network requests, analytics, fonts, frameworks, or external dependencies. It changes no files by itself.</footer>
+  </main>
+
+  <script id="routing-presets" type="application/json">
+{
+  "codex_primary": {
+    "format_version": 2,
+    "profile": "codex-primary",
+    "policy": { "claude_workers": "deny" },
+    "routing": {
+      "orchestrator": {
+        "strategy": "single",
+        "lanes": [{ "id": "primary", "model": "gpt-5.6-sol", "reasoning": "xhigh" }]
+      },
+      "planning_convergence": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          { "id": "codex-plan", "model": "gpt-5.6-sol", "reasoning": "xhigh" },
+          { "id": "grok-plan", "model": "grok-4.5", "reasoning": "high" }
+        ],
+        "convergence": { "owner": "orchestrator" }
+      },
+      "exploration": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          { "id": "codex-explore", "model": "gpt-5.6-sol", "reasoning": "high" },
+          { "id": "grok-explore", "model": "grok-4.5", "reasoning": "high" }
+        ],
+        "convergence": { "owner": "orchestrator" }
+      },
+      "implementation": {
+        "strategy": "frontier",
+        "lanes": [{ "id": "codex-implement", "model": "gpt-5.6-sol", "reasoning": "high" }]
+      },
+      "verification_review": {
+        "strategy": "parallel_gate",
+        "lanes": [
+          { "id": "codex-review", "model": "gpt-5.6-sol", "reasoning": "high" },
+          { "id": "grok-review", "model": "grok-4.5", "reasoning": "high" }
+        ],
+        "gate": { "require": "all", "cross_family_required": true }
+      },
+      "design_taste": {
+        "strategy": "single",
+        "lanes": [{ "id": "design", "model": "gpt-5.6-sol", "reasoning": "xhigh" }]
+      },
+      "bulk_simple": {
+        "strategy": "frontier",
+        "lanes": [{ "id": "bulk", "model": "gpt-5.6-sol", "reasoning": "medium" }]
+      }
+    }
+  },
+  "fable_primary": {
+    "format_version": 2,
+    "profile": "fable-primary",
+    "policy": { "claude_workers": "allow" },
+    "routing": {
+      "orchestrator": {
+        "strategy": "single",
+        "lanes": [{ "id": "primary", "model": "claude-fable", "reasoning": "xhigh" }]
+      },
+      "planning_convergence": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          { "id": "codex-plan", "model": "gpt-5.6-sol", "reasoning": "xhigh" },
+          { "id": "grok-plan", "model": "grok-4.5", "reasoning": "high" },
+          { "id": "claude-plan", "model": "claude-fable", "reasoning": "xhigh" }
+        ],
+        "convergence": { "owner": "orchestrator" }
+      },
+      "exploration": {
+        "strategy": "parallel_converge",
+        "lanes": [
+          { "id": "codex-explore", "model": "gpt-5.6-sol", "reasoning": "high" },
+          { "id": "grok-explore", "model": "grok-4.5", "reasoning": "high" },
+          { "id": "claude-explore", "model": "claude-fable", "reasoning": "high" }
+        ],
+        "convergence": { "owner": "orchestrator" }
+      },
+      "implementation": {
+        "strategy": "frontier",
+        "lanes": [
+          { "id": "codex-implement", "model": "gpt-5.6-sol", "reasoning": "high" },
+          { "id": "claude-implement", "model": "claude-fable", "reasoning": "high" }
+        ]
+      },
+      "verification_review": {
+        "strategy": "parallel_gate",
+        "lanes": [
+          { "id": "codex-review", "model": "gpt-5.6-sol", "reasoning": "high" },
+          { "id": "grok-review", "model": "grok-4.5", "reasoning": "high" },
+          { "id": "claude-review", "model": "claude-fable", "reasoning": "high" }
+        ],
+        "gate": { "require": "all", "cross_family_required": true }
+      },
+      "design_taste": {
+        "strategy": "single",
+        "lanes": [{ "id": "design", "model": "claude-fable", "reasoning": "xhigh" }]
+      },
+      "bulk_simple": {
+        "strategy": "frontier",
+        "lanes": [{ "id": "bulk", "model": "gpt-5.6-sol", "reasoning": "medium" }]
+      }
+    }
+  }
+}
+  </script>
+  <script>
+    (() => {
+      "use strict";
+
+      const presets = JSON.parse(document.getElementById("routing-presets").textContent);
+      const scenarios = [
+        ["orchestrator", "Orchestrator", "Owns decomposition, stopping points, and final decisions."],
+        ["planning_convergence", "Planning & convergence", "Independent candidates fan out, then the orchestrator synthesizes one route."],
+        ["exploration", "Exploration", "Bounded scouts investigate independently in parallel; the orchestrator merges their findings."],
+        ["implementation", "Implementation", "Non-overlapping DAG steps may run concurrently, while each artifact keeps one owner."],
+        ["verification_review", "Verification & review", "Independent verifier families inspect the same fixed diff; every required lane must pass."],
+        ["design_taste", "Design & taste", "Shapes user-facing UI, APIs, naming, copy, and interaction quality."],
+        ["bulk_simple", "Bulk & simple work", "Independent items can spread across the runnable frontier without redundant authorship."]
+      ];
+      const models = [
+        ["gpt-5.6-sol", "GPT-5.6 Sol"],
+        ["gpt-5.6-terra", "GPT-5.6 Terra"],
+        ["gpt-5.6-luna", "GPT-5.6 Luna"],
+        ["grok-4.5", "Grok 4.5"],
+        ["claude-fable", "Claude Fable"],
+        ["claude-opus", "Claude Opus"],
+        ["claude-sonnet", "Claude Sonnet"]
+      ];
+      const reasoningByModel = {
+        "gpt-5.6-sol": ["medium", "high", "xhigh", "max"],
+        "gpt-5.6-terra": ["medium", "high", "xhigh", "max"],
+        "gpt-5.6-luna": ["low", "medium", "high", "xhigh"],
+        "grok-4.5": ["high"],
+        "claude-fable": ["high", "xhigh"],
+        "claude-opus": ["high", "xhigh"],
+        "claude-sonnet": ["medium", "high"]
+      };
+      const strategies = [
+        ["single", "Single owner"],
+        ["parallel_converge", "Parallel · converge"],
+        ["parallel_gate", "Parallel · all-pass gate"],
+        ["frontier", "DAG frontier"]
+      ];
+      const safeRoutes = presets.codex_primary.routing;
+
+      let state = structuredClone(presets.codex_primary);
+      const rows = document.getElementById("route-rows");
+      const output = document.getElementById("json-output");
+      const mapping = document.getElementById("mapping-list");
+      const status = document.getElementById("policy-status");
+      const copyState = document.getElementById("copy-state");
+      const copyButton = document.getElementById("copy-json");
+      const downloadButton = document.getElementById("download-json");
+
+      const isClaude = model => model.startsWith("claude-");
+      const labelFor = model => (models.find(([value]) => value === model) || [model, model])[1];
+      const familyFor = model => model.startsWith("gpt-") ? "codex" : model.startsWith("grok-") ? "grok" : model.startsWith("claude-") ? "claude" : model;
+
+      function normalizeLane(lane, index) {
+        lane.id ||= `lane-${index + 1}`;
+        const efforts = reasoningByModel[lane.model] || ["high"];
+        if (lane.model === "grok-4.5") lane.reasoning = "high";
+        if (!efforts.includes(lane.reasoning)) lane.reasoning = efforts[0];
+      }
+
+      function enforceInvariants() {
+        for (const [key, route] of Object.entries(state.routing)) {
+          if (state.policy.claude_workers === "deny" && route.lanes.some(lane => isClaude(lane.model))) {
+            state.routing[key] = structuredClone(safeRoutes[key]);
+          }
+          state.routing[key].lanes.forEach(normalizeLane);
+        }
+      }
+
+      function validationError() {
+        if (state.format_version !== 2) return "Routing envelope must use format version 2.";
+        const primary = state.routing.orchestrator?.lanes?.[0];
+        if (state.profile === "codex-primary" && (state.policy.claude_workers !== "deny" || primary?.model !== "gpt-5.6-sol" || primary?.reasoning !== "xhigh")) return "Codex-primary requires Sol xhigh and denied Claude workers.";
+        if (state.profile === "fable-primary" && (state.policy.claude_workers !== "allow" || primary?.model !== "claude-fable" || primary?.reasoning !== "xhigh")) return "Fable-primary requires Fable xhigh and allowed Claude workers.";
+        for (const route of Object.values(state.routing)) {
+          if (!Array.isArray(route.lanes) || route.lanes.length === 0) return "Every scenario needs at least one lane.";
+          if (state.policy.claude_workers === "deny" && route.lanes.some(lane => isClaude(lane.model))) return "Claude lane found while Claude workers are denied.";
+          if (route.lanes.some(lane => lane.model === "grok-4.5" && lane.reasoning !== "high")) return "Every Grok 4.5 lane must use high reasoning.";
+          if (["parallel_converge", "parallel_gate"].includes(route.strategy) && route.lanes.length < 2) return "Parallel strategies require at least two lanes.";
+          if (route.strategy === "parallel_gate" && route.gate?.cross_family_required && new Set(route.lanes.map(lane => familyFor(lane.model))).size < 2) return "Parallel verification requires independent model families.";
+        }
+        return "";
+      }
+
+      function modelOptions(selected) {
+        return models
+          .filter(([value]) => state.policy.claude_workers === "allow" || !isClaude(value))
+          .map(([value, label]) => `<option value="${value}"${value === selected ? " selected" : ""}>${label}</option>`)
+          .join("");
+      }
+
+      function reasoningOptions(model, selected) {
+        return reasoningByModel[model]
+          .map(value => `<option value="${value}"${value === selected ? " selected" : ""}>${value}</option>`)
+          .join("");
+      }
+
+      function strategyOptions(selected) {
+        return strategies.map(([value, label]) => `<option value="${value}"${value === selected ? " selected" : ""}>${label}</option>`).join("");
+      }
+
+      function strategyNote(route) {
+        if (route.strategy === "parallel_converge") return "Independent bounded outputs → orchestrator synthesis";
+        if (route.strategy === "parallel_gate") return "Independent reviews → every required lane must PASS";
+        if (route.strategy === "frontier") return "Non-overlapping runnable steps may execute concurrently";
+        return "One lane owns this scenario";
+      }
+
+      function nextLane(key) {
+        const route = state.routing[key];
+        const allowed = models.map(([model]) => model).filter(model => state.policy.claude_workers === "allow" || !isClaude(model));
+        const preferred = ["grok-4.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "claude-sonnet"];
+        const model = preferred.find(candidate => allowed.includes(candidate) && !route.lanes.some(lane => lane.model === candidate)) || allowed[0];
+        return { id: `${familyFor(model)}-${route.lanes.length + 1}`, model, reasoning: reasoningByModel[model][0] };
+      }
+
+      function setStrategy(route, strategy, key) {
+        route.strategy = strategy;
+        delete route.convergence;
+        delete route.gate;
+        if (strategy === "single") route.lanes = [route.lanes[0]];
+        if (["parallel_converge", "parallel_gate"].includes(strategy)) {
+          while (route.lanes.length < 2) route.lanes.push(nextLane(key));
+        }
+        if (strategy === "parallel_converge") route.convergence = { owner: "orchestrator" };
+        if (strategy === "parallel_gate") route.gate = { require: "all", cross_family_required: true };
+      }
+
+      function renderRows() {
+        enforceInvariants();
+        rows.innerHTML = scenarios.map(([key, title, copy]) => {
+          const route = state.routing[key];
+          const lanes = route.lanes.map((lane, index) => `<div class="lane-row" data-lane="${index}">
+            <span class="lane-id">${lane.id}</span>
+            <label><span hidden>Model for ${title} lane ${index + 1}</span><select data-field="model">${modelOptions(lane.model)}</select></label>
+            <label><span hidden>Reasoning for ${title} lane ${index + 1}</span><select data-field="reasoning">${reasoningOptions(lane.model, lane.reasoning)}</select></label>
+            <button type="button" class="lane-remove" data-remove-lane="${index}"${route.lanes.length === 1 ? " disabled" : ""} aria-label="Remove ${lane.id}">−</button>
+          </div>`).join("");
+          return `<article class="route-row" data-route="${key}">
+            <div class="route-header">
+              <div><div class="route-title">${title}</div><div class="route-copy">${copy}</div></div>
+              <label><span class="topology-label">Execution topology</span><select data-field="strategy">${strategyOptions(route.strategy)}</select></label>
+            </div>
+            <div class="lane-list">${lanes}</div>
+            <div class="lane-actions"><button type="button" data-add-lane>Add lane</button><span class="hint">${strategyNote(route)}</span></div>
+          </article>`;
+        }).join("");
+
+        rows.querySelectorAll("select[data-field='strategy']").forEach(select => select.addEventListener("change", event => {
+          const row = event.target.closest(".route-row");
+          setStrategy(state.routing[row.dataset.route], event.target.value, row.dataset.route);
+          renderRows();
+          renderOutput();
+        }));
+
+        rows.querySelectorAll(".lane-row select").forEach(select => select.addEventListener("change", event => {
+          const row = event.target.closest(".route-row");
+          const laneIndex = Number(event.target.closest(".lane-row").dataset.lane);
+          const lane = state.routing[row.dataset.route].lanes[laneIndex];
+          lane[event.target.dataset.field] = event.target.value;
+          if (event.target.dataset.field === "model") lane.reasoning = reasoningByModel[event.target.value][0];
+          renderRows();
+          renderOutput();
+        }));
+
+        rows.querySelectorAll("[data-remove-lane]").forEach(button => button.addEventListener("click", event => {
+          const row = event.target.closest(".route-row");
+          const route = state.routing[row.dataset.route];
+          route.lanes.splice(Number(event.target.dataset.removeLane), 1);
+          if (route.lanes.length === 1 && ["parallel_converge", "parallel_gate"].includes(route.strategy)) setStrategy(route, "single", row.dataset.route);
+          renderRows();
+          renderOutput();
+        }));
+
+        rows.querySelectorAll("[data-add-lane]").forEach(button => button.addEventListener("click", event => {
+          const row = event.target.closest(".route-row");
+          const route = state.routing[row.dataset.route];
+          route.lanes.push(nextLane(row.dataset.route));
+          if (route.strategy === "single") setStrategy(route, "parallel_converge", row.dataset.route);
+          renderRows();
+          renderOutput();
+        }));
+      }
+
+      function mappingSummary(route) {
+        const laneText = route.lanes.map(lane => `${labelFor(lane.model)} · ${lane.reasoning}`).join(" ∥ ");
+        if (route.strategy === "parallel_converge") return `${laneText} → merge`;
+        if (route.strategy === "parallel_gate") return `${laneText} → all PASS`;
+        if (route.strategy === "frontier") return `${laneText} ⇢ frontier`;
+        return laneText;
+      }
+
+      function renderOutput() {
+        enforceInvariants();
+        const error = validationError();
+        output.textContent = JSON.stringify(state, null, 2);
+        mapping.innerHTML = scenarios.map(([key, title]) => `<div class="mapping-item"><span>${title}</span><span class="mapping-model">${mappingSummary(state.routing[key])}</span></div>`).join("");
+        status.textContent = error || (state.policy.claude_workers === "deny" ? "No-Claude guardrail active · no Claude fallback" : "Claude workers allowed · explicit lanes only");
+        status.classList.toggle("invariant-error", Boolean(error));
+        copyButton.disabled = Boolean(error);
+        downloadButton.disabled = Boolean(error);
+        document.querySelectorAll("[data-workers]").forEach(button => button.classList.toggle("active", button.dataset.workers === state.policy.claude_workers));
+      }
+
+      function applyPreset(name) {
+        state = structuredClone(presets[name]);
+        document.querySelectorAll("[data-preset]").forEach(button => button.classList.toggle("active", button.dataset.preset === name));
+        renderRows();
+        renderOutput();
+        copyState.textContent = "";
+      }
+
+      document.querySelectorAll("[data-preset]").forEach(button => button.addEventListener("click", () => applyPreset(button.dataset.preset)));
+      document.querySelectorAll("[data-workers]").forEach(button => button.addEventListener("click", () => {
+        applyPreset(button.dataset.workers === "deny" ? "codex_primary" : "fable_primary");
+      }));
+
+      copyButton.addEventListener("click", async () => {
+        if (validationError()) return;
+        try {
+          await navigator.clipboard.writeText(output.textContent);
+          copyState.textContent = "Copied to clipboard.";
+        } catch (_) {
+          const range = document.createRange();
+          range.selectNodeContents(output);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copyState.textContent = "Clipboard access was blocked; JSON selected for manual copy.";
+        }
+      });
+
+      downloadButton.addEventListener("click", () => {
+        if (validationError()) return;
+        const blob = new Blob([output.textContent + "\n"], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "orchestration-model-routing-v2.json";
+        link.click();
+        URL.revokeObjectURL(link.href);
+        copyState.textContent = "Downloaded orchestration-model-routing-v2.json.";
+      });
+
+      renderRows();
+      renderOutput();
+    })();
+  </script>
+</body>
+</html>
