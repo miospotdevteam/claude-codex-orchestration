@@ -56,10 +56,10 @@ use the design.md and fill gaps only.
 Stage 1 context gathering. The user's brain-dump replaces the
 brainstorming design as the raw material.
 
-**Orbit integration:** After Stage 2 produces a complete draft, present
-it for user approval via Orbit (`orbit_await_review`). After Stage 3
-reader testing, present revisions via Orbit if substantive changes were
-made.
+**Review integration:** After Stage 2 produces a complete draft, present it
+for user approval. When the host provides Orbit, use its review flow; otherwise
+use the normal conversation. After Stage 3 reader testing, present substantive
+revisions through the same available review surface.
 
 ---
 
@@ -147,9 +147,10 @@ Good questions (specific, gap-filling):
   the event-sourcing approach that the payments team uses. Was there a
   specific reason, or should we include it as a considered alternative?"
 
-Ask questions one at a time using the `AskUserQuestion` tool when the
-question has a clear set of possible answers. Use open-ended text when
-the question requires explanation.
+Ask questions one at a time. When the question has a clear set of possible
+answers, use the host's structured input control if available; otherwise
+present a concise choice in conversation. Use open-ended text when the
+question requires explanation.
 
 ### Exit criterion
 
@@ -207,9 +208,9 @@ What to brainstorm per section:
 - **Visual options**: Would a table, diagram, timeline, or code example
   serve better than prose?
 
-Present options to the user. Use `AskUserQuestion` for clear-cut
-choices. Curate together: which options land? Which need revision? Which
-should be combined?
+Present options to the user. Use a structured input control when the host
+provides one, or a concise conversational choice otherwise. Curate together:
+which options land? Which need revision? Which should be combined?
 
 ### 2.3 Iterative drafting
 
@@ -277,9 +278,10 @@ in gaps from memory that readers don't have.
 
 ### 3.1 Sub-agent approach (preferred)
 
-Spawn a fresh Claude Code sub-agent with NO context from the writing
-process. This is critical — the sub-agent must simulate a naive reader,
-not a collaborator who already knows the backstory.
+Spawn a fresh read-only worker with NO context from the writing process.
+This is critical — the worker must simulate a naive reader, not a
+collaborator who already knows the backstory. Use any worker family allowed by
+the active routing policy; never cross a provider-deny boundary for this test.
 
 **Setup:**
 1. Write 2-3 comprehension questions tailored to this document. These
@@ -352,14 +354,15 @@ For each gap identified in 3.1 or 3.2:
 4. If the fix is substantial (more than a sentence), re-run the
    relevant comprehension question on the revised section
 
-### 3.4 Final review via Orbit
+### 3.4 Final review
 
-After reader testing revisions are complete, present the final document
-for user approval:
+After reader testing revisions are complete, present the final document for
+user approval through Orbit when the host exposes it, or through the normal
+conversation otherwise. Handle the response:
 
-1. Fetch Orbit tools: `ToolSearch query: "+orbit await_review"`
-2. Call `orbit_await_review` on the document file
-3. Handle response:
+1. Present the exact document file, not a reconstructed summary.
+2. Wait for an explicit approval or change request.
+3. Handle the result:
    - **Approved**: Document is done. Record completion in plan.json.
    - **Changes requested**: Apply changes, re-run affected reader test
      questions, then re-submit.

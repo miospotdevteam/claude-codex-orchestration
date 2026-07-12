@@ -28,6 +28,7 @@ the next session can reconstruct everything from these three files.
   "title": "Refactor auth to use signed cookies",
   "createdAt": "2026-05-11T14:23:00Z",
   "createdBy": "writing-plans",
+  "routingProfile": "codex-primary",
   "approvedAt": "2026-05-11T14:45:00Z",
   "approvedVia": "orbit",
   "frozen": true,
@@ -42,6 +43,11 @@ the next session can reconstruct everything from these three files.
   ]
 }
 ```
+
+`routingProfile` is required and frozen with the plan. It selects the durable
+verifier gate: `codex-primary` requires Codex + Grok PASS;
+`fable-primary` requires Codex + Grok + Claude/Fable PASS. Activating a
+different project profile never mutates an already-approved plan.
 
 ### Step object
 
@@ -211,15 +217,14 @@ retro-validated or rewritten to match a newer schema.
 
 ### Per-lane verdicts
 
-Alongside the single authoritative `verdict`, a step may carry an
-optional `verdicts` object with `codex` and/or `grok` keys, each the
-same record shape plus a timestamp. This is how the dual-verify
-mandate (see `09-routing-matrix.md`) is stored durably: for
-`claude-impl` and `grok-impl` steps both lanes must record PASS before
-the step flips `done` (the plan-utils `done` transition enforces this;
-a `--degraded <reason>` escape records a deviation instead). The
-top-level `verdict` mirrors the authoritative lane — grok for
-`codex-impl` steps, codex for the others.
+Alongside the single authoritative `verdict`, a step may carry an optional
+`verdicts` object with `codex`, `grok`, and/or `claude` keys, each the same
+record shape plus a timestamp. The plan's frozen `routingProfile` determines
+the completion gate independent of implementation owner: `codex-primary`
+requires Codex and Grok PASS, while `fable-primary` requires Codex, Grok, and
+Claude PASS. Profile plans cannot use `--degraded`; that escape remains only
+for legacy plans without `routingProfile`. The top-level `verdict` remains a
+compatibility summary and cannot substitute for missing per-family verdicts.
 
 ### Status values
 

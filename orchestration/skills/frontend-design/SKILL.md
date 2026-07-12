@@ -84,10 +84,6 @@ Read these before proceeding:
 - Component library docs (Shadcn, MUI, Chakra, etc.) — know what's available
 - Note what's working well and what could be elevated
 
-In integration mode, also read:
-- `references/ui-consistency-checklist.md` — consistency rules
-- `references/ui-consistency-guide.md` — design token discipline
-
 **Both modes:** Write findings to `discovery.md` as part of the conductor's
 Step 1 exploration.
 
@@ -186,11 +182,10 @@ Bad creative seeds (overused or context-blind):
 
 With the axes scored, theme selected, and creative seed chosen, select:
 
-1. **Typography**: Display font + body font (consult
-   `references/frontend-design-guide.md` for sourcing)
+1. **Typography**: Display font + body font, with enough weights and language
+   coverage for the product
 2. **Color**: Start from a curated palette, not from scratch.
-   Read `references/color-palettes.md` and pick the palette that matches
-   your Temperature axis and brand context:
+   Pick a palette that matches your Temperature axis and brand context:
    - **Warm Cream** (Temperature 1-3) — cream backgrounds, warm neutrals
    - **Cool Slate** (Temperature 4-5) — blue-gray base, sharp accents
    - **Dark Gallery** (editorial/photography) — warm-tinted near-blacks
@@ -199,8 +194,7 @@ With the axes scored, theme selected, and creative seed chosen, select:
    brand (keep the lightness relationships — they're tuned for contrast).
    For npm-based projects, also consider **Radix Colors**
    (`@radix-ui/colors`), **Open Color** (`open-color`), or **Palx**
-   (`palx`) — all installed globally. See
-   `references/frontend-design-guide.md` § Pre-built Palette Libraries.
+   (`palx`) when the project already permits those dependencies.
    If generating manually, use HSL shift, OKLCH, or complementary methods
    (see § Palette Generation Methods). State which source/method you used.
 3. **Motion**: Animation philosophy + key moments (load, hover, transitions)
@@ -209,10 +203,10 @@ With the axes scored, theme selected, and creative seed chosen, select:
 
 **Present all choices to the user before proceeding.** Walk through the axis
 scores, creative seed, and concrete selections. When offering alternatives
-or asking the user to choose between options, use the `AskUserQuestion`
-tool for a structured selection UI rather than listing choices in plain text.
-Do NOT proceed to Phase 3 until the user approves the direction. If the
-user disagrees, iterate on the specific choices they reject.
+or asking the user to choose between options, use the host's structured input
+control when available; otherwise present a compact conversational choice.
+Do NOT proceed to Phase 3 until the user approves the direction. If the user
+disagrees, iterate on the specific choices they reject.
 
 Document all approved choices in the masterPlan before writing code.
 
@@ -304,10 +298,6 @@ unconsidered output — avoid them:
 | Theme | Dark bg for warm/creative/casual brands | Light theme for warm brands; dark only for tech/dev/night-use |
 | Theme | Neon/fluorescent accent on non-tech brand | Accent color that matches the brand's warmth and personality |
 
-The full blacklist is in `references/frontend-design-guide.md` § Anti-Slop
-Blacklist. Also read `references/anti-slop.md` for the shared cross-skill
-banlist covering typography, color, layout, animation, illustration, and copy.
-
 ### Content separation: whitespace over containers
 
 The default instinct is to wrap every content group in a bordered,
@@ -342,24 +332,6 @@ subtle dividers to establish visual separation.
 When you do use containers, vary them: not every card needs the same
 border, shadow, and padding. Feature the important one, mute the rest.
 
-### Whitespace quality
-
-Whitespace is not just "empty space" — it's a design tool. Bad whitespace
-is wasted space that makes a page feel unfinished. Good whitespace creates
-rhythm, directs attention, and makes content breathe.
-
-- **Fill the viewport width intentionally** — content should feel like it
-  belongs on the page, not floating in a void. If there are large empty
-  margins on desktop, the content area or layout should expand to use them
-- **Grid items should fill their cells** — portfolio grids, feature grids,
-  and card layouts should feel complete and balanced, not sparse
-- **Section spacing should create rhythm** — consistent vertical rhythm
-  between sections (e.g., 6rem/8rem between major sections) is good. Random
-  amounts of empty space between sections is not
-- **Edge-to-edge on mobile** — on small viewports, eliminate unnecessary
-  horizontal padding. Content should feel full-width, not squeezed into a
-  narrow column with huge side margins
-
 ### Vanilla HTML/CSS
 
 - CSS custom properties for all design tokens
@@ -385,19 +357,6 @@ rhythm, directs attention, and makes content breathe.
 - Use the project's existing spacing/color patterns; introduce new values
   only with justification
 
-### Font sourcing
-
-Consult `references/frontend-design-guide.md` for the full font sourcing
-protocol. Quick reference:
-
-| Source | When | How |
-|---|---|---|
-| Google Fonts | Default for web | `<link>` tag, `font-display: swap` |
-| `@fontsource` | React/Next.js | `npm install @fontsource/font-name` |
-| `next/font` | Next.js | Built-in optimization, auto subset |
-| Variable fonts | When available | Single file, `font-variation-settings` |
-| System fonts | Fallbacks only | Font stack with system-ui |
-
 ### Dark mode
 
 When the design supports dark and light themes:
@@ -418,9 +377,6 @@ When the design supports dark and light themes:
    contrast at both themes.
 5. **Tailwind**: use the `dark:` variant with `darkMode: 'class'` in config.
    **Vanilla CSS**: use `[data-theme="dark"]` or `.dark` class on `<html>`.
-
-See `references/frontend-design-guide.md` § Dark Mode Color Adaptation for
-the full adaptation rules.
 
 ### Micro-interactions
 
@@ -445,38 +401,6 @@ Rules:
   simplify)
 - Consistent easing — pick one curve for the whole project
 
-### Component composition
-
-Define scales for the building blocks so components compose consistently:
-
-**Spacing scale** (padding/gap inside components):
-```
-compact:  px-2 py-1   (8px / 4px)   — tags, badges, dense tables
-default:  px-4 py-2   (16px / 8px)  — buttons, inputs, cards
-spacious: px-6 py-3   (24px / 12px) — hero sections, feature cards
-```
-
-**Border radius scale:**
-```
-none: 0        — tables, full-bleed sections
-sm:   4px      — inputs, small buttons
-md:   8px      — cards, modals, standard buttons
-lg:   12-16px  — feature cards, large containers
-full: 9999px   — pills, avatars, toggle tracks
-```
-
-**Shadow scale** (elevation tiers):
-```
-sm:  0 1px 2px rgba(0,0,0,0.05)                         — subtle lift
-md:  0 4px 6px -1px rgba(0,0,0,0.07)                    — cards, dropdowns
-lg:  0 10px 15px -3px rgba(0,0,0,0.08)                  — modals, popovers
-xl:  0 20px 25px -5px rgba(0,0,0,0.1)                   — large modals, hero elements
-```
-
-In Tailwind, extend these in `tailwind.config`. In vanilla CSS, define as
-custom properties. Shadows need adaptation for dark mode (reduce opacity,
-increase blur).
-
 ### Match complexity to vision
 
 Maximalist designs need elaborate code: extensive animations, layered
@@ -489,8 +413,7 @@ maximalist vision or bloated code for a minimal one.
 
 ## Phase 4: Verification
 
-Run the `references/frontend-design-checklist.md` checklist. The key
-domains:
+Verify the following domains:
 
 **Accessibility:**
 - Color contrast passes WCAG AA (4.5:1 text, 3:1 large text)
@@ -517,8 +440,8 @@ domains:
 
 ### Verification commands
 
-Run the project's own commands first (check `package.json`, `Makefile`,
-`CLAUDE.md`). Supplement with:
+Run the project's own commands first (check `package.json`, `Makefile`, and
+the repository's active instruction files). Supplement with:
 
 - **Type check**: `tsc --noEmit` (or project equivalent)
 - **Lint**: `eslint`, `biome`, or project linter
@@ -564,21 +487,3 @@ This skill produces:
 2. **Implemented code files** (Phase 3)
 3. **Verification results** noted in the masterPlan step's Result field
    (Phase 4) — which checklist items passed, any issues found and resolved
-
----
-
-## Routing to Other References
-
-| Situation | Read / Invoke |
-|---|---|
-| Choosing a color palette | `references/color-palettes.md` — curated CSS variable sets |
-| Working within existing design system | `references/ui-consistency-checklist.md` + `references/ui-consistency-guide.md` |
-| Adding font/animation dependencies | `references/dependency-checklist.md` |
-| User input rendered in UI | `references/security-checklist.md` |
-| Testing UI components | `references/testing-checklist.md` |
-| Design calls for SVG illustrations, patterns, or textures | Invoke `svg-art` — pass design direction (palette, temperature) |
-| Motion tier is Enhanced or Immersive | Invoke `immersive-frontend` — pass design direction |
-
-For the full font sourcing protocol, aesthetic axis deep-dives, animation
-patterns, color systems, and the extended anti-slop blacklist, read
-`references/frontend-design-guide.md`.

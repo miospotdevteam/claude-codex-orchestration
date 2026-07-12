@@ -5,9 +5,13 @@ This document specifies the **target directory tree**, the
 docs** so anyone working on the plugin knows exactly which doc
 informs which file.
 
-The repository is a **one-plugin marketplace**: the marketplace
-manifest lives at the repo root under `.claude-plugin/`, and the
-plugin itself lives in the `orchestration/` subdirectory. This split
+The repository is a **dual-host, one-package marketplace**: Codex metadata lives
+under `.agents/plugins/marketplace.json` and points to
+`orchestration/codex-plugin/`; Claude metadata lives under
+`.claude-plugin/marketplace.json` and points to `orchestration/`. The Codex
+sub-root exists because Codex plugin ingestion requires the conventional
+`skills/` path, while the parent package holds the canonical host bodies and
+portable assets shared with the installer. This split
 matches Claude Code's plugin-source convention — the marketplace's
 `plugins[].source` is a relative path to a subdirectory (Claude Code
 does **not** accept `.` as a same-dir marker; it must be a real
@@ -17,13 +21,26 @@ subdir like `./orchestration`).
 clones this repo into Claude Code's marketplace cache;
 `claude plugin install orchestration@claude-codex-orchestration`
 then installs the plugin from the `orchestration/` subdir.
+The equivalent Codex path is `codex plugin marketplace add
+miospotdevteam/claude-codex-orchestration` followed by `codex plugin add
+orchestration@claude-codex-orchestration`.
 
-`install.sh` resolves exactly one absolute `installPath` from `claude plugin
-list --json`, validates that cached artifact, and uses it as the canonical
+`install.sh --host codex|claude|both` defaults to `codex`. The Codex-only path
+has no Claude prerequisite and never executes the Claude CLI. `--host both`
+prepares both subscription hosts once. Thereafter
+`scripts/orchestration-routing.sh activate codex-primary|fable-primary`
+switches orchestration authority without reinstalling either host.
+Without a project routing file, `codex-primary` is the shipped effective
+default; Fable authority is never inferred from installation state.
+
+`install.sh` always resolves exactly one absolute Codex `source.path`; Claude
+modes also resolve exactly one Claude `installPath`. The selected installed
+artifact is validated before any cleanup and becomes the canonical skill
 source. Claude loads its skills from the plugin cache; same-named plugin-owned
 directories are removed from `~/.claude/skills` rather than copied there. The
-seven injectable external-lane skills are copied from the installed artifact
-to `~/.codex/skills` and `~/.grok/skills`, while unowned skills remain intact.
+exact 13 portable work skills are copied from `external-skills/` (falling back
+to a provider-specific or shared body when applicable) into both
+`~/.codex/skills` and `~/.grok/skills`, while unowned skills remain intact.
 After install, restart Claude Code or run `/reload-plugins`. Never patch the
 cache or user Claude settings directly.
 
@@ -40,18 +57,26 @@ failed restore preserves recovery-required evidence and the mutex.
 
 ```
 claude-codex-orchestration/              ← repo root = marketplace root
+├── .agents/plugins/
+│   └── marketplace.json                 ← Codex marketplace metadata
 ├── .claude-plugin/
 │   └── marketplace.json                 ← marketplace metadata
 ├── README.md                            ← usage / install
 ├── AGENTS.md                            ← three-role contract
 ├── LICENSE                              ← MIT
-├── install.sh                           ← conditional uninstall + install via claude CLI
+├── install.sh                           ← --host codex|claude|both; Codex default
 ├── docs/                                ← design spec (markdown only)
 │   ├── 01-philosophy.md … 11-routing-eval.md
 │
-└── orchestration/                       ← plugin root (source: "./orchestration")
+└── orchestration/                       ← shared package + Claude source
     ├── .claude-plugin/
     │   └── plugin.json                  ← minimal plugin manifest (name, description)
+    │
+    ├── codex-plugin/                    ← Codex source: "./orchestration/codex-plugin"
+    │   ├── .codex-plugin/
+    │   │   └── plugin.json
+    │   └── skills/                      ← 4 conventional loader entrypoints
+    │       └── each delegates to ../../codex-skills/<name>/SKILL.md
     │
     ├── skills/                          ← one subdirectory per skill
     │   ├── conductor/                   ← core: top-level orchestrator
@@ -74,9 +99,20 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   └── remote-agent-host/           ← auxiliary: guarded Mini handoff
     │       (each skill dir contains SKILL.md and optional references/, scripts/)
     │
-    ├── codex-skills/                    ← Codex-side bodies for dual-install skills
+    ├── codex-skills/                    ← canonical Codex-host orchestration bodies
+    │   ├── conductor/
+    │   ├── persistent-plans/
+    │   ├── writing-plans/
+    │   └── codex-dispatch/
+    │       (Codex-host orchestration; never copied to user skill dirs)
+    │
+    ├── external-skills/                 ← exact 13 portable work-skill bodies
+    │   ├── engineering-discipline/ … skill-review-standard/
     │   └── react-native-mobile/
-    │       └── SKILL.md
+    │       (copied identically to Codex and Grok user skill dirs)
+    │
+    ├── config/
+    │   └── routing-presets.json         ← canonical Codex/Fable profiles
     │
     ├── hooks/                           ← event handlers + manifest
     │   ├── hooks.json                   ← maps event names → handler scripts
@@ -125,20 +161,22 @@ claude-codex-orchestration/              ← repo root = marketplace root
 Notes on shape:
 
 The shipped plugin subtree contains 18 Claude-side skills (9 core and 9
-auxiliary), 1 Codex-side skill body, 2 read-only notice handlers and 1 fail-open
-private-queue observer with a six-event manifest, 9 scripts (4 model wrappers
-and 5 helpers), 2 schemas, 1 template, and 15 test suites (12 script suites and
-3 hook suites). The non-shipped routing eval adds 7 scripts and 5 test suites
-at the repo root.
+auxiliary), 4 Codex-host orchestration skills, and 13 portable Codex/Grok work
+skills. It also contains 2 read-only notice handlers and 1 fail-open
+private-queue observer with a six-event manifest, 4 model wrappers, the
+plan/contract/routing/Mini helpers, plan/progress/policy/routing schemas, and 1
+plan template. The test harness discovers its current suite count from disk;
+the non-shipped routing eval remains at the repo root.
 
-- **`.claude-plugin/` holds each manifest.** Claude Code's plugin
+- **Each host keeps its manifest at its required source root.** Claude Code's plugin
   schema places metadata under `.claude-plugin/` rather than at the
   repo root. This repo has two such directories: the repo-root
   `.claude-plugin/marketplace.json` and the plugin's own
-  `orchestration/.claude-plugin/plugin.json`. Even in a single-plugin
+  `orchestration/.claude-plugin/plugin.json`; Codex uses
+  `orchestration/codex-plugin/.codex-plugin/plugin.json`. Even in a single-plugin
   repo the marketplace `source` must point at a real subdirectory
   (`./orchestration`) — Claude Code does **not** accept `"."` as a
-  same-dir marker — which is why the plugin lives in its own subdir
+  same-dir marker — which is why the Claude plugin lives in its own subdir
   rather than sharing the root `.claude-plugin/` directory.
 - **Skills are auto-discovered.** There is no `skills` array in
   `plugin.json`. The harness scans `skills/<name>/SKILL.md` from the

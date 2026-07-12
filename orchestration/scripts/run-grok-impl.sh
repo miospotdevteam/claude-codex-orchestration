@@ -141,6 +141,7 @@ grok \
   --prompt-file "$prompt_file" \
   --cwd "$root_dir" \
   -m grok-4.5 \
+  --reasoning-effort high \
   --always-approve \
   --max-turns 80 \
   >"$stdout_file" 2>"$stderr_file"

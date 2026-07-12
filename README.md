@@ -1,9 +1,12 @@
 # orchestration — v2
 
-This repository is **v2 of the `orchestration` plugin for Claude Code**.
+This repository is **v2 of the `orchestration` plugin for Codex and Claude
+Code**. The default install is the no-Claude Codex host; Claude remains an
+explicitly selectable host and optional worker family.
 It contains both the design spec (under `docs/`) and the plugin
 implementation that descends from it (under `orchestration/`:
-`.claude-plugin/plugin.json`, `skills/`, `codex-skills/`, `hooks/`,
+`.claude-plugin/plugin.json`, `codex-plugin/.codex-plugin/plugin.json`, `skills/`,
+`codex-skills/`, `external-skills/`, `config/`, `hooks/`,
 `scripts/`, `schemas/`, `templates/`, `tests/`). A routing-eval harness
 lives in the top-level `eval/` directory. See the layout block below.
 
@@ -51,23 +54,29 @@ receipts and signatures.
 
 ```
 claude-codex-orchestration/      ← repo root = marketplace root
+├── .agents/plugins/
+│   └── marketplace.json         ← Codex marketplace metadata
 ├── .claude-plugin/
 │   └── marketplace.json         ← marketplace metadata (this repo as marketplace)
 ├── README.md                    ← you are here
 ├── AGENTS.md                    ← the three roles (conductor, sub-agents, Codex)
 ├── LICENSE                      ← MIT
-├── install.sh                   ← conditional uninstall + install via claude CLI,
-│                                   plus codex/grok CLI-side skill sync
+├── install.sh                   ← --host codex|claude|both (Codex default)
 ├── .claude/
 │   └── CLAUDE.md                ← context for any Claude session editing this repo
 ├── docs/                        ← the design spec (markdown only)
 │   ├── 01-philosophy.md … 11-routing-eval.md
 │
-├── orchestration/               ← plugin root (marketplace source: "./orchestration")
+├── orchestration/               ← shared package + Claude plugin source
 │   ├── .claude-plugin/
 │   │   └── plugin.json          ← minimal plugin manifest (name, description)
+│   ├── codex-plugin/            ← Codex marketplace source
+│   │   ├── .codex-plugin/plugin.json
+│   │   └── skills/              ← conventional entrypoints to canonical bodies
 │   ├── skills/                  ← 9 core + 9 auxiliary skills
-│   ├── codex-skills/            ← Codex-side bodies for dual-install skills
+│   ├── codex-skills/            ← 4 Codex-host orchestration skills
+│   ├── external-skills/         ← exact 13 portable Codex/Grok work skills
+│   ├── config/                  ← canonical Codex/Fable routing profiles
 │   ├── hooks/                   ← manifest + 2 read-only notice handlers +
 │   │                               1 fail-open private-queue observer handler
 │   ├── scripts/                 ← four wrappers + five plan/contract/Mini helpers
@@ -83,11 +92,15 @@ claude-codex-orchestration/      ← repo root = marketplace root
 
 ## Install
 
-Prerequisites:
+Prerequisites depend on the selected host:
 
-- Claude Code CLI installed and authenticated.
-- `codex` CLI (`codex exec`) installed and authenticated — the impl and
-  verify wrappers shell out to it.
+- Default `--host codex`: authenticated `codex` and `grok` CLIs. Codex is the
+  Sol xhigh root; Grok 4.5 is the independent planning, review, and verification
+  counterweight. This path never requires or invokes `claude`.
+- `--host claude`: authenticated Claude Code, Codex, and Grok CLIs. Fable is
+  the root; Codex and Grok remain required planning and verification lanes.
+- `--host both`: all three authenticated CLIs. This is the easiest setup for
+  explicit host switching without reinstalling later.
 - `orbit-mcp` on `PATH` — the plugin declares an `orbit` MCP server
   used to surface `masterPlan.md` for human review before execution
   and to coordinate the plan-mode handoff (`EnterPlanMode` →
@@ -121,21 +134,51 @@ Clone this repo somewhere stable, then run `install.sh`:
 git clone https://github.com/miospotdevteam/claude-codex-orchestration.git \
   ~/projects/claude-codex-orchestration
 cd ~/projects/claude-codex-orchestration
-bash install.sh
+bash install.sh                         # Codex-primary surface; no Claude invocation
+# bash install.sh --host both           # prepare both hosts
+# bash install.sh --host both           # install once for profile switching
 ```
 
-`install.sh` is idempotent: it uninstalls any existing `orchestration`
-plugin, adds (or updates) the marketplace, and installs the latest
-version. It resolves the single absolute `installPath` reported by
-`claude plugin list --json` and treats that installed plugin-cache artifact—not
-the invoking checkout—as canonical. Claude loads plugin skills from that cache;
-the installer removes duplicate plugin-owned copies from `~/.claude/skills`
-and syncs the seven injectable lane skills into `~/.codex/skills` and
-`~/.grok/skills`. Unowned skills are preserved. Safe to re-run after upgrading.
+`install.sh` is host-aware and idempotent. Every mode installs and validates the
+Codex dependency; Claude modes additionally install the Claude plugin. The
+selected provider's machine-readable installed artifact—not the invoking
+checkout—is canonical. Before cleanup, the installer validates the exact 13
+portable work skills, then syncs them into `~/.codex/skills` and
+`~/.grok/skills`; host-only conductor/plan/dispatch bodies remain plugin-owned.
+`--host codex` performs this without invoking Claude. Unowned skills are
+preserved. Safe to re-run after upgrading.
+
+The effective profile defaults to the shipped `codex-primary` preset when a
+project has no routing file. A project override lives at
+`.orchestration/routing.json` and is managed by `orchestration-routing.sh`.
+Activate either profile atomically:
+
+```bash
+orchestration/scripts/orchestration-routing.sh activate codex-primary .
+# later, if Fable remains available:
+orchestration/scripts/orchestration-routing.sh activate fable-primary .
+```
+
+`codex-primary` requires a Sol xhigh Codex host and denies Claude workers.
+`fable-primary` requires a Fable xhigh Claude host and enables the approved
+Fable/Codex/Grok lanes. Activation reports the required next host but does not
+launch it. Invalid routing fails closed to `deny`; legacy `policy.json` remains
+a compatibility fallback only when no project routing override exists. The standalone
+[model routing configurator](docs/model-routing-configurator.html) emits the
+same validated, activatable profiles.
+
+Codex model selection remains an authenticated machine preference, not an
+installer mutation. For the default lane, configure `~/.codex/config.toml` with
+`model = "gpt-5.6-sol"` and `model_reasoning_effort = "xhigh"`. The Grok
+wrappers independently pin `grok-4.5` with high reasoning effort.
 
 ### Manual install (if you prefer)
 
 ```bash
+# Codex
+codex plugin marketplace add miospotdevteam/claude-codex-orchestration
+codex plugin add orchestration@claude-codex-orchestration
+
 # Add this repo as a Claude Code marketplace
 claude plugin marketplace add miospotdevteam/claude-codex-orchestration
 
@@ -143,7 +186,7 @@ claude plugin marketplace add miospotdevteam/claude-codex-orchestration
 claude plugin install orchestration@claude-codex-orchestration
 ```
 
-After install, start a Claude Code session in any project. The
+After install, start the selected host in any project. On Claude, the
 `SessionStart` hook injects a one-line notice if an active plan
 already exists; otherwise the `conductor` skill is on standby.
 
@@ -154,7 +197,10 @@ claude plugin marketplace update claude-codex-orchestration
 claude plugin update orchestration
 ```
 
-Or simply re-run `bash install.sh` from the clone.
+Or re-run `bash install.sh --host codex|claude|both` from the clone. Host
+installation and orchestration authority are separate: with both hosts
+installed, switch explicitly using `orchestration-routing.sh activate
+codex-primary|fable-primary`; no reinstall is required.
 
 Restart Claude Code or run `/reload-plugins` in an open session after install
 or upgrade. Do not edit the plugin cache or user Claude settings by hand; make
@@ -181,6 +227,13 @@ upgrading them, retain the previous matched pair. If backend rollback is
 needed, stop active sessions through the guarded helper, restore both files
 together, and start a new session; never mix backend versions or bypass lease,
 restore-journal, or recovery-required state.
+
+An unrelated dirty Mini worktree is not an invitation to deploy over it.
+Never reset, clean, checkout, overwrite, or raw-rsync it. Start, inspect, wait,
+and reclaim through the guarded `remote-agent` protocol only; its lease,
+snapshot, divergence, restore-journal, and recovery-required refusals are
+authoritative. Reclaim verified content before changing host or updating the
+Mini-side matched helper pair.
 
 Claude model and effort are authenticated user preferences, not supervisor
 launch arguments. For this Mini deployment, select Fable and xhigh once in the
@@ -244,8 +297,9 @@ Ask naturally: “start Claude on the Mini for orchestration”, “wait for the
 Claude agent”, “check what the Mini Codex session needs”, “continue the Mini
 Grok session with these instructions”, “reveal the Mini Terminal”, “interrupt
 the Mini agent”, or “reclaim the Mini work locally”.
-The project must be exactly `miospot` or `orchestration`; the harness defaults
-to `claude` only when no family was named. Prompts go through a private file,
+The project must be exactly `miospot` or `orchestration`; name `codex` or
+`claude` explicitly when host choice matters (the helper's legacy omitted-family
+default remains `claude`). Prompts go through a private file,
 never command-line text. For a new session the skill runs `status`, starts
 without a prompt, inspects and reports a bounded capture, then sends the first
 prompt. Before any later input it also inspects and reports first.

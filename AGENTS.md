@@ -131,10 +131,19 @@ spec (`docs/`) and the routing-eval harness (`eval/`) at the repo root.
 Each role's behavior is enforced by the corresponding files (paths
 below are relative to `orchestration/` unless noted):
 
-- **Manifests** — `.claude-plugin/marketplace.json` at the repo root
-  declares this repo as a one-plugin marketplace pointing at
-  `./orchestration` as the plugin source. `orchestration/.claude-plugin/plugin.json`
-  is the minimal plugin manifest (name + description). Claude Code
+- **Manifests and host install** — `.agents/plugins/marketplace.json` exposes
+  `./orchestration/codex-plugin` to `codex plugin marketplace add`, while
+  `.claude-plugin/marketplace.json` exposes `./orchestration` to Claude Code.
+  The Codex sub-root uses the required conventional `skills/` entrypoints,
+  which delegate to the canonical bodies in the parent package's
+  `codex-skills/`. `install.sh --host codex|claude|both` defaults to the no-Claude
+  Codex host; `--host codex` must never require or invoke Claude. Use
+  `--host both` once when both subscription hosts should remain available, then
+  switch orchestration authority atomically with
+  `scripts/orchestration-routing.sh activate codex-primary|fable-primary`.
+  `orchestration/.claude-plugin/plugin.json` is the Claude manifest;
+  `orchestration/codex-plugin/.codex-plugin/plugin.json` is the Codex manifest.
+  Claude Code
   requires the plugin to live in a real subdirectory — `"source": "."`
   in marketplace.json is rejected as "unsupported".
 - **Skills** — `skills/<skill>/SKILL.md` for the 9 core orchestration
@@ -143,10 +152,14 @@ below are relative to `orchestration/` unless noted):
   `webapp-testing`, `skill-review-standard`, `remote-agent-host`). The
   conductor invokes them via the `Skill` tool; the harness auto-discovers
   them by scanning `skills/<name>/SKILL.md` (no manifest list needed).
-- **Codex-side skill bodies** — `codex-skills/<skill>/SKILL.md` for the
-  dual-install pattern. Currently only `react-native-mobile` ships a
-  Codex-side body; the routing matrix at `docs/09-routing-matrix.md`
-  decides which side of a dual-install skill gets a given step.
+- **Host and portable skill bodies** — `codex-skills/<skill>/SKILL.md` contains
+  the four Codex-host orchestration skills (`conductor`, `persistent-plans`,
+  `writing-plans`, `codex-dispatch`). `external-skills/<skill>/SKILL.md`
+  contains the exact 13 work skills copied to both Codex and Grok. Claude loads
+  its host and work skills directly from `skills/`. The active routing profile
+  decides which host owns orchestration and which model lanes execute each
+  scenario. With no project `.orchestration/routing.json`, the shipped
+  `codex-primary` preset is effective; a Fable switch is always explicit.
 - **External wrappers** — `scripts/run-codex-impl.sh` and
   `scripts/run-grok-impl.sh` (IMPLEMENT-direction), plus
   `scripts/run-codex-verify.sh` and `scripts/run-grok-verify.sh`
@@ -178,6 +191,9 @@ below are relative to `orchestration/` unless noted):
   remains active until an explicit safe protocol transition clears it; no role
   may bypass an active writer, divergence, CAS, changed-snapshot, restore, or
   recovery-required refusal with raw SSH, rsync, or tmux commands.
+  In particular, unrelated dirty work on the Mini is preserved: deployment or
+  host switching never resets, cleans, checks out, overwrites, or raw-rsyncs the
+  worktree; use guarded inspect/wait/reclaim and release ownership last.
 - **Hooks** — six event registrations explicitly supersede the prior
   exactly-two-read-only-hooks design. `SessionStart` and `PostCompact` run the
   bounded context handlers `session-start.sh` and `post-compact.sh`. `Stop`,

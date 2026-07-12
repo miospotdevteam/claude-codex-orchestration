@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: run-codex-impl.sh --plan-id <id> --step-id <id> --root-dir <absolute-path> [--skill <name>]
+Usage: run-codex-impl.sh --plan-id <id> --step-id <id> --root-dir <absolute-path> [--scenario <planning|exploration|implementation|design|bulk|review>] [--skill <name>]
 USAGE
 }
 
@@ -17,6 +17,7 @@ plan_id=""
 step_id=""
 root_dir=""
 skill=""
+scenario="implementation"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +41,11 @@ while [[ $# -gt 0 ]]; do
       skill="$2"
       shift 2
       ;;
+    --scenario)
+      [[ $# -ge 2 ]] || die_usage "missing value for --scenario"
+      scenario="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -57,6 +63,20 @@ case "$step_id" in */* | *..*) die_usage "--step-id must be a plain identifier (
 [[ -n "$root_dir" ]] || die_usage "--root-dir is required"
 [[ "$root_dir" = /* ]] || die_usage "--root-dir must be an absolute path"
 [[ -d "$root_dir" ]] || die_usage "--root-dir does not exist: $root_dir"
+case "$scenario" in
+  planning|design)
+    reasoning_effort="xhigh"
+    ;;
+  exploration|implementation|review)
+    reasoning_effort="high"
+    ;;
+  bulk)
+    reasoning_effort="medium"
+    ;;
+  *)
+    die_usage "invalid --scenario: $scenario"
+    ;;
+esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 parser="$script_dir/parse-contract.sh"
@@ -125,6 +145,7 @@ set +e
 codex exec \
   -C "$root_dir" \
   -s workspace-write \
+  -c "model_reasoning_effort=\"$reasoning_effort\"" \
   --skip-git-repo-check \
   -o "$last_message_file" \
   - \

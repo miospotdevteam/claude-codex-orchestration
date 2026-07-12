@@ -11,6 +11,10 @@ Turn a completed discovery into the draft plan files on disk —
 approval. The plan is a contract, not a script — once approved it does
 not change. `progress.json` carries every deviation.
 
+This body is the `fable-primary` planner. Before planning, the routing helper
+must report `fable-primary`, the policy gate must report `allow`, and the host
+session must be Fable xhigh. The Codex host uses the separate Codex-native body.
+
 ## When this fires
 
 - Discovery (Explore / brainstorming) is complete and the user wants
@@ -45,18 +49,15 @@ The protocol (it rests on a measured result: independent drafts +
 convergence beat both every solo plan and a sequential relay):
 
 1. Write one planning brief to `<plan-dir>/panel/brief.md`.
-2. Send the **identical brief, in parallel, independently** to Codex
+2. In `fable-primary`, send the **identical brief, in parallel,
+   independently** to Codex
    (`${CLAUDE_PLUGIN_ROOT}/scripts/run-codex-impl.sh`, synthetic step id
    `panel-codex`, deliverable `panel/codex.plan.md`), Grok
    (`${CLAUDE_PLUGIN_ROOT}/scripts/run-grok-impl.sh`,
-   `panel/grok.plan.md`; on wrapper exit 4, continue as a two-model
-   panel), and a Claude planner (`Agent`, model Fable whenever
-   available, otherwise Opus — the strongest model drafts the plan;
-   Opus is the implementation tier — writing `panel/claude.plan.md`).
+   `panel/grok.plan.md`), and a Fable planner (`Agent(model: "fable")`,
+   writing `panel/claude.plan.md`).
    No panelist ever sees another's draft.
-3. Dispatch one Claude convergence sub-agent (same rule: Fable
-   whenever available, otherwise Opus) that reads the brief + drafts
-   and returns the converged
+3. The host Fable conductor reads the bounded drafts and returns the converged
    plan: a definite decision wherever drafts disagree (one-line
    reason), redundancy cut, complementary strengths kept.
 4. Use the converged plan as the source for step 1 of the flow below.
@@ -70,7 +71,8 @@ convergence beat both every solo plan and a sequential relay):
 Three files under `.temp/plan-mode/active/<planId>/`:
 
 - **`plan.json`** — schema in `${CLAUDE_PLUGIN_ROOT}/schemas/plan.schema.json`. Required
-  fields: planId, title, createdAt, createdBy, frozen, context,
+  fields: planId, title, createdAt, createdBy,
+  `routingProfile: "fable-primary"`, frozen, context,
   steps. Approval fields (approvedAt, approvedVia) are optional until
   approval lands.
 - **`progress.json`** — schema in `${CLAUDE_PLUGIN_ROOT}/schemas/progress.schema.json`.
@@ -116,8 +118,8 @@ Enforce these rules before flipping `frozen: true`:
    correctness bug. If two steps share a file but are otherwise
    independent, order them with a dep rather than letting them race.
 
-If a step would naturally split across two owners (a Claude-only
-skill on one half and a Codex implementation on the other), produce
+If a step would naturally split across two owners (a Fable-preferred
+design half and a Codex implementation half), produce
 two sequential steps linked by `dependsOn` rather than forcing one
 step into a single owner.
 
@@ -133,11 +135,12 @@ Default routing, in short form:
   both lanes, or an explicit author choice. Grok and Codex share the
   identical wrapper contract, so a step routes to whichever lane has
   capacity; `codex-dispatch` owns both lanes. **Grok is preferred over
-  a Claude (Opus) sub-agent for any implementation step that does not
-  need Claude-side taste or a Claude-only skill** — quota economics:
+  a Fable sub-agent for any implementation step that does not
+  need the active profile's taste owner** — quota economics:
   the Grok lane is the measured slack resource while the Claude and
   Codex quotas are the binding constraints.
-- **`claude-impl`**: steps whose `skill` is in the Claude-only set
+- **`claude-impl`**: in `fable-primary`, steps whose `skill` is in the
+  Fable-preferred set
   (`frontend-design`, `svg-art`, `immersive-frontend`,
   `brainstorming`, `writing-plans`, `doc-coauthoring`), or where the
   artifact's shape for human readers is the point (taste-led work).
@@ -148,7 +151,7 @@ Default routing, in short form:
   model).
 
 If a step's owner is `claude-impl` for any reason other than a
-Claude-only skill, write a one-line `routingJustification` in the
+Fable-preferred skill, write a one-line `routingJustification` in the
 step description so the conductor can audit it later. A `claude-impl`
 step without justification is a planning bug.
 

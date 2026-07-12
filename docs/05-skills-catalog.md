@@ -136,20 +136,16 @@ the catalog stays at nine.)
 **Triggers**
 - A plan step with `owner: codex-impl` or `owner: grok-impl` is on the
   frontier.
-- A step's executor needs verification — per the dual mandate in
-  `docs/09-routing-matrix.md`: at least one cross-family verifier, and
-  Grok always among the verifiers when its lane is available
-  (`run-grok-verify.sh` alone for `codex-impl`; BOTH
-  `run-codex-verify.sh` and `run-grok-verify.sh` for `grok-impl` /
-  `claude-impl`, `done` requiring both PASS; `run-codex-verify.sh` as
-  the degraded fallback when the Grok lane is down).
+- A step's executor needs verification. `codex-primary` always requires final
+  PASS verdicts from Codex and Grok; `fable-primary` always requires final PASS
+  verdicts from Codex, Grok, and Fable. The requirement is independent of the
+  implementation owner and missing lanes block completion.
 - The conductor needs an out-of-band Codex or Grok check (rare).
 
 **Anti-triggers**
-- Implementing a step whose `owner` is `claude-impl` or `manual` —
-  verifying finished `claude-impl` work still fires this skill (both
-  `run-codex-verify.sh` and `run-grok-verify.sh` per the dual-verify
-  policy).
+- Implementing a step whose `owner` is `claude-impl` or `manual` — the skill
+  still fires for the Codex and Grok portions of the active profile's review
+  gate after implementation finishes.
 - Tasks that don't go through the plan system (free-form
   conversation).
 
@@ -163,9 +159,8 @@ the catalog stays at nine.)
   and `step.files`.
 - Parse the contract block out of stdout. Reject and retry once if
   the block is missing.
-- On Grok exit 4 (`grok` not on PATH): fall verification back to
-  `run-codex-verify.sh` and record the deviation; flip a `grok-impl`
-  step `blocked` with reason `grok-unavailable`.
+- On Grok exit 4 (`grok` not on PATH), block the step with reason
+  `grok-unavailable`; never weaken the active profile's required verifier set.
 - Write the parsed verdict, findings, and files-touched into
   `progress.json`.
 - Never read raw Codex or Grok stream output or treat unparsed text as
@@ -295,14 +290,14 @@ auto-discovers them by scanning `skills/<name>/SKILL.md` — no list in
 
 | Skill | One-line | Routing |
 |---|---|---|
-| `doc-coauthoring` | Collaborative authoring of RFCs, ADRs, runbooks, API docs, and other prose artifacts | Claude-only (Claude-only skill set in the routing matrix) |
-| `frontend-design` | Distinctive production-grade frontend interfaces — landing pages, dashboards, design-system work | Claude-only |
-| `svg-art` | Hand-coded SVG artwork — patterns, illustrations, decorative backgrounds, filter effects | Claude-only |
-| `immersive-frontend` | Award-winning WebGL / Three.js / scroll-driven 3D experiences | Claude-only |
-| `mcp-builder` | Building production-quality MCP servers that expose APIs/databases/services as LLM tools | Codex-default with Claude-side design |
-| `react-native-mobile` | Premium native-feeling React Native mobile apps; dual-installable (Claude for UI/UX, Codex for code-heavy) | Conditional — see RN-mobile Routing Directive in `docs/09-routing-matrix.md` |
-| `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Codex-default with Claude design for test plans |
-| `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Claude-only (meta) |
+| `doc-coauthoring` | Collaborative authoring of RFCs, ADRs, runbooks, API docs, and other prose artifacts | Portable; active profile selects the model lane |
+| `frontend-design` | Distinctive production-grade frontend interfaces — landing pages, dashboards, design-system work | Portable; Fable taste lane in `fable-primary`, Sol taste lane in `codex-primary` |
+| `svg-art` | Hand-coded SVG artwork — patterns, illustrations, decorative backgrounds, filter effects | Portable; active profile selects the model lane |
+| `immersive-frontend` | Award-winning WebGL / Three.js / scroll-driven 3D experiences | Portable; active profile selects the model lane |
+| `mcp-builder` | Building production-quality MCP servers that expose APIs/databases/services as LLM tools | Portable; active profile selects design and implementation lanes |
+| `react-native-mobile` | Premium native-feeling React Native mobile apps | Portable; active profile's design-taste route handles UI/UX and frontier route handles code-heavy work |
+| `webapp-testing` | End-to-end webapp testing with Playwright; visual regression and accessibility passes | Portable; active profile selects test planning and implementation lanes |
+| `skill-review-standard` | Post-creation quality gate for skills — structural validation, with/without test, trigger overlap | Portable meta-skill; active profile selects the reviewer lanes |
 | `remote-agent-host` | Guarded natural-language start, continue, wait, inspect, reveal, interrupt, kill, and reclaim lifecycle for supported Mac Mini sessions | Claude-only (host orchestration) |
 
 ### `remote-agent-host` lifecycle contract
@@ -384,17 +379,18 @@ ownership nor substitutes for reclaim. The skill never improvises raw tmux or
 transport commands, never edits user Claude settings, and uses Computer Use
 only for exceptional explicit interaction after a wake—not as a polling loop.
 
-### Codex-side skill bodies (`codex-skills/`)
+### Codex host and portable skill bodies
 
-For the dual-install pattern (currently `react-native-mobile`), Codex
-also gets its own copy of the skill body at
-`codex-skills/<name>/SKILL.md`. The routing matrix at
-`docs/09-routing-matrix.md` decides which side gets which step:
-UI/UX/animation work goes to Claude; data-flow / native modules /
-code-heavy work goes to Codex. The two SKILL.md files keep the same
-wording about the split so both sides see the same rule.
+`codex-skills/` contains exactly the four canonical Codex-host orchestration
+bodies: `conductor`, `persistent-plans`, `writing-plans`, and
+`codex-dispatch`. Codex plugin ingestion requires a conventional `skills/`
+directory, so `codex-plugin/skills/` exposes four small entrypoints that load
+those canonical bodies from the parent package. The entrypoints are the plugin
+discovery surface; `codex-skills/` remains the single source of behavioral
+truth.
 
-`codex-skills/` is loaded by `codex exec` separately from the Claude
-Code plugin manifest; it is not discovered by the Claude Code harness
-at all. The wrappers and the user read these bodies directly from the
-`codex-skills/` tree.
+`external-skills/` contains the exact 13 portable work-skill packages copied
+identically into `~/.codex/skills` and `~/.grok/skills` by `install.sh`. It
+includes the external-lane React Native body; UI/UX taste routes through the
+active profile's design owner, while code-heavy work routes through the
+frontier. Claude continues to discover its own bodies from `skills/`.

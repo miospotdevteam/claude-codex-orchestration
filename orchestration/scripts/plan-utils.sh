@@ -88,9 +88,17 @@ valid_executor() {
 
 valid_lane() {
   case "$1" in
-    codex | grok) return 0 ;;
+    codex | grok | claude) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Routing profile from plan.json. Empty string identifies a legacy plan.
+routing_profile_from_plan() {
+  local plan_dir=$1
+  local plan_file="$plan_dir/plan.json"
+  [[ -f "$plan_file" ]] || die "missing plan.json in $plan_dir"
+  jq -r '.routingProfile // empty' "$plan_file"
 }
 
 # Owner from plan.json for a step id. Empty string if missing.
@@ -279,23 +287,26 @@ check_done_gate() {
   local step_id=$2
   local degraded=$3
 
-  local owner progress_file
+  local owner profile progress_file
   progress_file="$plan_dir/progress.json"
   owner=$(step_owner_from_plan "$plan_dir" "$step_id")
   [[ -n "$owner" ]] || die "unknown step id in plan.json: $step_id"
+  profile=$(routing_profile_from_plan "$plan_dir")
 
-  local codex_v grok_v top_v has_lane
+  local codex_v grok_v claude_v top_v has_lane
   codex_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.codex.verdict // empty' "$progress_file")
   grok_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.grok.verdict // empty' "$progress_file")
+  claude_v=$(jq -r --arg id "$step_id" '.steps[$id].verdicts.claude.verdict // empty' "$progress_file")
   top_v=$(jq -r --arg id "$step_id" '.steps[$id].verdict // empty' "$progress_file")
   has_lane=false
   if [[ -n "$codex_v" || -n "$grok_v" ]]; then
     has_lane=true
   fi
 
-  local codex_pass=false grok_pass=false top_pass=false any_pass=false
+  local codex_pass=false grok_pass=false claude_pass=false top_pass=false any_pass=false
   [[ "$codex_v" == "PASS" ]] && codex_pass=true
   [[ "$grok_v" == "PASS" ]] && grok_pass=true
+  [[ "$claude_v" == "PASS" ]] && claude_pass=true
   [[ "$top_v" == "PASS" ]] && top_pass=true
   # any_pass gates --degraded: it requires a real per-lane PASS. The
   # legacy top-level verdict never satisfies a degraded completion —
@@ -306,6 +317,30 @@ check_done_gate() {
   fi
 
   gate_use_degraded=false
+
+  # Profile plans use an implementation-owner-independent all-pass gate.
+  # Unlike the compatibility path below, they never permit degraded
+  # completion or a legacy top-level verdict substitute.
+  if [[ -n "$profile" ]]; then
+    [[ -z "$degraded" ]] ||
+      die "cannot mark step '$step_id' done: routing profile '$profile' does not permit --degraded completion"
+    case "$profile" in
+      codex-primary)
+        if [[ "$codex_pass" != true || "$grok_pass" != true ]]; then
+          die "cannot mark step '$step_id' done: codex-primary requires PASS in verdicts.codex and verdicts.grok; got codex='${codex_v:-none}' grok='${grok_v:-none}'"
+        fi
+        ;;
+      fable-primary)
+        if [[ "$codex_pass" != true || "$grok_pass" != true || "$claude_pass" != true ]]; then
+          die "cannot mark step '$step_id' done: fable-primary requires PASS in verdicts.codex, verdicts.grok, and verdicts.claude; got codex='${codex_v:-none}' grok='${grok_v:-none}' claude='${claude_v:-none}'"
+        fi
+        ;;
+      *)
+        die "cannot mark step '$step_id' done: invalid routingProfile '$profile'"
+        ;;
+    esac
+    return 0
+  fi
 
   case "$owner" in
     codex-impl)
@@ -402,7 +437,7 @@ cmd_record_verdict() {
   lane=""
   if [[ $# -eq 7 ]]; then
     lane=$7
-    valid_lane "$lane" || die "invalid lane: $lane (expected codex or grok)"
+    valid_lane "$lane" || die "invalid lane: $lane (expected codex, grok, or claude)"
   fi
   valid_verdict "$verdict" || die "invalid verdict: $verdict"
   require_file_json "$plan_dir/progress.json"

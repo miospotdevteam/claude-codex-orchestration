@@ -2,7 +2,6 @@
 name: brainstorming
 description: >-
   Collaborative dialogue to turn a vague design question into a concrete proposal before any code is written. Use whenever the user is unsure how to approach something, when multiple plausible designs have non-obvious tradeoffs, when a new feature's data model is unclear, or pre-discovery when the conductor isn't sure what to explore. Trigger phrases: "how should we approach X?", "what's the best way to …?", "I'm torn between A and B", "should we …?". The skill asks one question at a time, surfaces tradeoffs honestly, offers a recommendation, and converges on a single approach before handing off to `writing-plans`. Do NOT use for implementation planning of an already-decided design, debugging (use `systematic-debugging`), refactoring of code whose target shape is clear (use `refactoring`), or pure codebase questions ("where is X defined?" — use `Explore`).
-allowed-tools: Read, Edit, Write, Bash, Grep, Glob, Agent, AskUserQuestion
 ---
 
 # brainstorming
@@ -40,8 +39,9 @@ simultaneously. Ask one, react to the answer, ask the next.
 ### Multiple choice where it fits
 
 If the question has a small set of plausible answers, offer them as
-options with the tradeoffs spelled out (`AskUserQuestion` is good for
-this). Open-ended questions are for genuinely open spaces.
+options with the tradeoffs spelled out. Use the host's structured input
+control when one is available; otherwise present the choices concisely in
+conversation. Open-ended questions are for genuinely open spaces.
 
 A question like "should this be a queue or a stream?" is a multiple
 choice question — present 2-4 options with their tradeoffs. A
@@ -87,9 +87,9 @@ A brainstorming session has a shape:
   implementation. If a code sketch helps illustrate an option, it's a
   pseudocode block in chat, not a file write.
 - **Discovery sweeps.** If the conversation needs facts from the
-  codebase ("how big is the auth module?"), dispatch `Explore` and
-  feed the answer back into the dialogue. Don't pause brainstorming
-  to grep.
+  codebase ("how big is the auth module?"), dispatch a read-only
+  exploration worker and feed its bounded answer back into the dialogue.
+  Don't pause brainstorming to run a wide search in the host context.
 - **Premature plans.** Don't draft `plan.json` here — that's
   `writing-plans`. The exit artifact is the design summary, period.
 
@@ -110,7 +110,7 @@ The user's confirmation is the signal for `writing-plans` to fire.
 - `engineering-discipline` — applies once code starts being written.
   During brainstorming, the relevant discipline is honest tradeoff
   presentation, not type safety.
-- `Explore` (sub-agent) — dispatched mid-brainstorm when the
+- A read-only exploration worker — dispatched mid-brainstorm when the
   conversation hits a factual question about the codebase.
 
 ## Failure surface

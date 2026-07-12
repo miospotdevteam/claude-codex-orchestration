@@ -188,6 +188,7 @@ grok \
   --prompt-file "$PROMPT_FILE" \
   --cwd "$ROOT_DIR" \
   -m grok-4.5 \
+  --reasoning-effort high \
   --max-turns 80 \
   --deny 'Write' \
   --deny 'Edit' \

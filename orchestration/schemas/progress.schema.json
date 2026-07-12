@@ -142,7 +142,7 @@
           "type": "string"
         },
         "verdicts": {
-          "description": "Per-lane verifier records (codex / grok). Optional; dual-mandate done-gating reads these.",
+          "description": "Per-lane verifier records (codex / grok / claude). Profile-aware all-pass done-gating reads these.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -150,6 +150,9 @@
               "$ref": "#/$defs/laneVerdict"
             },
             "grok": {
+              "$ref": "#/$defs/laneVerdict"
+            },
+            "claude": {
               "$ref": "#/$defs/laneVerdict"
             }
           }
