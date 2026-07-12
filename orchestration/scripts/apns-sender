@@ -1,0 +1,1119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Mini APNs push sender over the durable per-device outbox (nativeIosCorrection).
+# Push is notification ONLY — never workflow authority. openssl + curl --http2 only.
+#
+# JWT secret policy (choice b): hold the bearer JWT in MEMORY for the process
+# lifetime only. Re-mint per process when the in-memory TTL expires (20–60 min).
+# NEVER write the plaintext bearer to disk (no jwt.cache). Encrypted .p8 and
+# device tokens remain 0600 on disk via wrap.key; the JWT is not a durable secret.
+#
+# Residual at-least-once window (honest): a crash AFTER APNs returns HTTP 200 and
+# BEFORE mark_delivered can cause a later drain to re-POST the same event. We
+# mitigate with a stable apns-collapse-id (device|class|entity|seq) so APNs
+# collapses display of the duplicate notification. The outbox event is never
+# erased on delivery failure; re-POST is notification-only (no workflow authority).
+# Exactly-once delivery is not claimed across that crash window — collapse is the
+# user-visible mitigation; delivered markers close the window on the happy path.
+umask 077
+
+readonly VERSION=1
+readonly JWT_MIN_TTL=1200   # 20 minutes
+readonly JWT_MAX_TTL=3600   # 60 minutes
+readonly JWT_DEFAULT_TTL=2400  # 40 minutes (within 20–60)
+readonly LOG_MAX_BYTES=32768
+readonly DEFAULT_CLASSES='needs-input awaiting-approval failed-recovery completed released mirror-done mirror-failed chat-question'
+# chat-reply-completed is intentionally absent → C3 default-off
+
+# Temp files registered for trap-guaranteed cleanup (EXIT/INT/TERM).
+# The decrypted .p8 is NEVER written to disk (decrypt→sign via process-sub fifo).
+# JWT + device-token URL never land on disk (curl --config <(printf ...)).
+# ECDSA DER / raw R||S signature material stays in pipes/memory only (no
+# apns.sig.* / apns.raw.* temps under TMPDIR). Response capture temps only.
+#
+# CRITICAL: register_temp must run in the shell that owns the EXIT/TERM trap —
+# never only inside a command-substitution subshell ($(...)). Bash resets traps
+# in that subshell, so APNS_TEMP_FILES becomes subshell-local and group SIGTERM
+# strands secrets in TMPDIR. Any function that mktemp/register_temp MUST be
+# called directly (not via x=$(f)); results use globals / printf -v slots below.
+APNS_TEMP_FILES=()
+# Result slots for direct (non-command-sub) calls — bash-3.2 safe (no nameref).
+APNS_JWT_OUT=
+APNS_POST_RESULT=
+APNS_SIG_B64_OUT=
+# In-process JWT cache (never persisted). Cleared on process exit.
+APNS_JWT_MEM=
+APNS_JWT_IAT=
+APNS_JWT_MATERIAL=
+
+register_temp() {
+  local f=$1
+  APNS_TEMP_FILES+=("$f")
+  chmod 600 "$f" 2>/dev/null || true
+}
+
+cleanup_temps() {
+  local f
+  for f in "${APNS_TEMP_FILES[@]:-}"; do
+    [[ -n $f ]] || continue
+    # Best-effort wipe of small secret temps before unlink.
+    if [[ -f $f ]]; then
+      : >"$f" 2>/dev/null || true
+    fi
+    rm -f -- "$f" 2>/dev/null || true
+  done
+  APNS_TEMP_FILES=()
+}
+
+# EXIT cleans only. Signal traps must exit so we do not resume after INT/TERM
+# (a bare trap 'cleanup_temps' on TERM would swallow the signal and continue).
+on_signal() {
+  local sig=${1:-TERM}
+  cleanup_temps
+  trap - EXIT
+  case "$sig" in
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+    HUP) exit 129 ;;
+    *) exit 1 ;;
+  esac
+}
+
+trap 'cleanup_temps' EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+usage() {
+  printf '%s\n' \
+    'usage: apns-sender version|once|run|install-key|set-device-token|install-launchagent|help' \
+    '  install-key --p8 PATH --key-id KID --team-id TEAM' \
+    '  set-device-token --device-id ID --token TOKEN' \
+    '  install-launchagent [--plugin-root PATH] [--dest PATH] [--load]' \
+    '      substitute @PLUGIN_ROOT@/@STATE_HOME@ into the LaunchAgent plist template' \
+    '  once   — one drain cycle over every registered device outbox' \
+    '  run    — LaunchAgent loop (bounded sleep between drains)' >&2
+  exit 64
+}
+
+die() {
+  log_line "error: $*"
+  printf 'apns-sender: %s\n' "$*" >&2
+  exit 1
+}
+
+state_home() {
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}"
+}
+
+apns_root() {
+  printf '%s/orchestration/apns\n' "$(state_home)"
+}
+
+registry_root() {
+  printf '%s/orchestration/workflows\n' "$(state_home)"
+}
+
+outbox_root() {
+  printf '%s/outbox\n' "$(registry_root)"
+}
+
+# Bound a single log file to LOG_MAX_BYTES (keep the newest half).
+# Copy-truncate (rewrite same inode) — never `mv` a new inode into place.
+# launchd holds an open FD to StandardOutPath/StandardErrorPath; `mv` leaves
+# that FD on the unlinked inode which then grows unbounded.
+bound_log_file() {
+  local path=$1
+  [[ -f $path ]] || return 0
+  local sz half tmp
+  sz=$(wc -c <"$path" 2>/dev/null | tr -d ' ' || printf 0)
+  if [[ ${sz:-0} -gt $LOG_MAX_BYTES ]]; then
+    half=$((LOG_MAX_BYTES / 2))
+    tmp="${path}.bound.tmp.$$"
+    if tail -c "$half" "$path" >"$tmp" 2>/dev/null; then
+      # Truncate-in-place then rewrite: same inode for open descriptors.
+      cat "$tmp" >"$path" 2>/dev/null || {
+        # Fallback: truncate then append
+        : >"$path"
+        cat "$tmp" >>"$path" 2>/dev/null || true
+      }
+    else
+      : >"$path"
+    fi
+    rm -f -- "$tmp"
+    chmod 600 "$path" 2>/dev/null || true
+  fi
+}
+
+# Rotate LaunchAgent StandardOut/StandardError logs (size cap — no unbounded growth).
+bound_launchd_logs() {
+  local root logs
+  root=$(apns_root)
+  logs=$root/logs
+  [[ -d $logs ]] || return 0
+  bound_log_file "$logs/apns-sender.launchd.out.log"
+  bound_log_file "$logs/apns-sender.launchd.err.log"
+  bound_log_file "$logs/apns-sender.log"
+}
+
+ensure_apns_dirs() {
+  local root
+  root=$(apns_root)
+  mkdir -p -m 700 -- "$root" "$root/logs"
+  chmod 700 "$root" "$root/logs" 2>/dev/null || true
+  [[ -f $root/wrap.key ]] || {
+    # Hex passphrase (single line) — openssl pass:file reads the first line only
+    # and binary wrap keys are unreliable across enc/dec.
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand -hex 32 >"$root/wrap.key"
+    else
+      head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$root/wrap.key"
+      printf '\n' >>"$root/wrap.key"
+    fi
+    chmod 600 "$root/wrap.key"
+  }
+  [[ -f $root/journal.ndjson ]] || { : >"$root/journal.ndjson"; chmod 600 "$root/journal.ndjson"; }
+  [[ -f $root/logs/apns-sender.log ]] || { : >"$root/logs/apns-sender.log"; chmod 600 "$root/logs/apns-sender.log"; }
+  # Ensure launchd log paths exist so rotation has a target.
+  [[ -f $root/logs/apns-sender.launchd.out.log ]] || { : >"$root/logs/apns-sender.launchd.out.log"; chmod 600 "$root/logs/apns-sender.launchd.out.log"; }
+  [[ -f $root/logs/apns-sender.launchd.err.log ]] || { : >"$root/logs/apns-sender.launchd.err.log"; chmod 600 "$root/logs/apns-sender.launchd.err.log"; }
+  bound_launchd_logs
+}
+
+log_line() {
+  local root msg ts trimmed
+  root=$(apns_root)
+  ensure_apns_dirs
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+  msg=$*
+  # Never log PEM material or long hex tokens.
+  case "$msg" in
+    *'BEGIN PRIVATE'*|*'BEGIN EC PRIVATE'*) msg='[redacted-pem]' ;;
+  esac
+  trimmed=${msg:0:512}
+  printf '%s %s\n' "$ts" "$trimmed" >>"$root/logs/apns-sender.log"
+  bound_log_file "$root/logs/apns-sender.log"
+  bound_launchd_logs
+}
+
+journal_event() {
+  local root
+  root=$(apns_root)
+  ensure_apns_dirs
+  local payload
+  payload=$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson body "$1" \
+    '{ts:$ts} + $body' 2>/dev/null || printf '%s\n' "$1")
+  printf '%s\n' "$payload" >>"$root/journal.ndjson"
+  chmod 600 "$root/journal.ndjson"
+  # Bound journal
+  local lines
+  lines=$(wc -l <"$root/journal.ndjson" | tr -d ' ')
+  if (( lines > 256 )); then
+    tail -n 128 "$root/journal.ndjson" >"$root/journal.ndjson.tmp" \
+      && mv -f "$root/journal.ndjson.tmp" "$root/journal.ndjson"
+    chmod 600 "$root/journal.ndjson"
+  fi
+}
+
+encrypt_file() {
+  local src=$1 dest=$2
+  local root pass
+  root=$(apns_root)
+  ensure_apns_dirs
+  pass=$root/wrap.key
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:$pass" -in "$src" -out "$dest"
+  chmod 600 "$dest"
+}
+
+# Encrypt stdin bytes to dest (avoids writing plaintext secrets to a temp file).
+encrypt_stdin() {
+  local dest=$1
+  local root pass
+  root=$(apns_root)
+  ensure_apns_dirs
+  pass=$root/wrap.key
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:$pass" -out "$dest"
+  chmod 600 "$dest"
+}
+
+# Decrypt encrypted file to stdout (prefer in-memory over plaintext temp files).
+decrypt_to_stdout() {
+  local src=$1
+  local root pass
+  root=$(apns_root)
+  pass=$root/wrap.key
+  openssl enc -d -aes-256-cbc -pbkdf2 -pass "file:$pass" -in "$src" 2>/dev/null
+}
+
+b64url_encode() {
+  openssl base64 -e -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+}
+
+b64url_decode() {
+  local s=$1 pad
+  s=${s//-/+}
+  s=${s//_/\/}
+  pad=$(( (4 - ${#s} % 4) % 4 ))
+  printf '%s%s' "$s" "$(printf '%*s' "$pad" '' | tr ' ' '=')" | openssl base64 -d -A 2>/dev/null
+}
+
+# Convert ECDSA DER (hex) to raw R||S base64url for ES256 JWT.
+# Pipe/memory only — no apns.sig.* / apns.raw.* files under TMPDIR.
+# Result in APNS_SIG_B64_OUT.
+der_hex_to_raw_b64url() {
+  local hex=$1
+  local i=0
+  APNS_SIG_B64_OUT=
+  hex=$(printf '%s' "$hex" | tr -d ' \n' | tr 'A-F' 'a-f')
+  [[ ${hex:0:2} == 30 ]] || return 1
+  i=2
+  local seq_len=$((16#${hex:i:2}))
+  i=$((i + 2))
+  # long-form length (unlikely for ES256)
+  if (( seq_len > 127 )); then
+    local nlen=$((seq_len - 128))
+    i=$((i + nlen * 2))
+  fi
+  # INTEGER r
+  [[ ${hex:i:2} == 02 ]] || return 1
+  i=$((i + 2))
+  local lr=$((16#${hex:i:2}))
+  i=$((i + 2))
+  local r_hex=${hex:i:lr*2}
+  i=$((i + lr * 2))
+  # INTEGER s
+  [[ ${hex:i:2} == 02 ]] || return 1
+  i=$((i + 2))
+  local ls=$((16#${hex:i:2}))
+  i=$((i + 2))
+  local s_hex=${hex:i:ls*2}
+  # Strip one leading 00 high-bit pad (DER INTEGER), then left-pad to 32 bytes.
+  if (( ${#r_hex} > 64 )) && [[ ${r_hex:0:2} == 00 ]]; then
+    r_hex=${r_hex:2}
+  fi
+  if (( ${#s_hex} > 64 )) && [[ ${s_hex:0:2} == 00 ]]; then
+    s_hex=${s_hex:2}
+  fi
+  while (( ${#r_hex} < 64 )); do r_hex=0$r_hex; done
+  while (( ${#s_hex} < 64 )); do s_hex=0$s_hex; done
+  r_hex=${r_hex: -64}
+  s_hex=${s_hex: -64}
+  local raw_hex=${r_hex}${s_hex}
+  # Hex → binary via pipe only (no TMPDIR file), then base64url.
+  if command -v xxd >/dev/null 2>&1; then
+    APNS_SIG_B64_OUT=$(printf '%s' "$raw_hex" | xxd -r -p | b64url_encode)
+  else
+    APNS_SIG_B64_OUT=$(
+      local pair hx=$raw_hex
+      while [[ -n $hx ]]; do
+        pair=${hx:0:2}
+        hx=${hx:2}
+        printf "\\x$pair"
+      done | b64url_encode
+    )
+  fi
+  [[ -n $APNS_SIG_B64_OUT ]] || return 1
+  return 0
+}
+
+# Digest of key material + Key ID + Team ID — binds in-memory JWT so age alone
+# is insufficient (invalidate on key / kid / team change within a long-lived run).
+jwt_material_digest() {
+  local root kid team p8_enc dig
+  root=$(apns_root)
+  kid=${APNS_KEY_ID:-}
+  team=${APNS_TEAM_ID:-}
+  p8_enc=$root/AuthKey.p8.enc
+  dig=$(
+    {
+      printf 'kid=%s\n' "$kid"
+      printf 'team=%s\n' "$team"
+      if [[ -f $p8_enc ]]; then
+        openssl dgst -sha256 -binary "$p8_enc" 2>/dev/null || cat "$p8_enc"
+      fi
+    } | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+  )
+  printf '%s\n' "${dig:-}"
+}
+
+# Clamp JWT TTL into the Apple-allowed 20–60 minute refresh window.
+jwt_ttl_clamped() {
+  local ttl=${APNS_JWT_TTL:-$JWT_DEFAULT_TTL}
+  if (( ttl < JWT_MIN_TTL )); then ttl=$JWT_MIN_TTL; fi
+  if (( ttl > JWT_MAX_TTL )); then ttl=$JWT_MAX_TTL; fi
+  printf '%s\n' "$ttl"
+}
+
+# Mint ES256 JWT. Sign via pipes only (no DER/raw temps on disk).
+# Result in APNS_JWT_OUT; also updates in-memory cache slots (never disk).
+mint_jwt() {
+  local root kid team p8_enc iat hdr claims sig_input material der_hex
+  APNS_JWT_OUT=
+  root=$(apns_root)
+  kid=${APNS_KEY_ID:-}
+  team=${APNS_TEAM_ID:-}
+  [[ -n $kid && -n $team ]] || die 'APNS_KEY_ID and APNS_TEAM_ID are required'
+  p8_enc=$root/AuthKey.p8.enc
+  [[ -f $p8_enc ]] || die 'APNs .p8 key not installed (run install-key)'
+  # NEVER write the decrypted .p8 to disk.
+  # decrypt | sign: key via process-substitution fifo (/dev/fd/N only).
+  # Signature DER lands only in the pipe → hex (memory), never TMPDIR.
+  iat=$(date +%s)
+  hdr=$(printf '%s' "{\"alg\":\"ES256\",\"kid\":\"$kid\"}" | b64url_encode)
+  claims=$(printf '%s' "{\"iss\":\"$team\",\"iat\":$iat}" | b64url_encode)
+  sig_input="$hdr.$claims"
+  der_hex=$(
+    printf '%s' "$sig_input" \
+      | openssl dgst -sha256 -sign <(decrypt_to_stdout "$p8_enc") -binary 2>/dev/null \
+      | od -An -tx1 -v | tr -d ' \n' | tr 'A-F' 'a-f'
+  )
+  [[ -n $der_hex ]] || die 'openssl ES256 sign failed (decrypt or sign)'
+  if ! der_hex_to_raw_b64url "$der_hex"; then
+    die 'ECDSA signature conversion failed'
+  fi
+  material=$(jwt_material_digest)
+  APNS_JWT_OUT="$sig_input.$APNS_SIG_B64_OUT"
+  # In-memory only — NEVER write the plaintext bearer JWT to disk.
+  APNS_JWT_MEM=$APNS_JWT_OUT
+  APNS_JWT_IAT=$iat
+  APNS_JWT_MATERIAL=$material
+  # Best-effort: remove any legacy plaintext jwt.cache from older builds.
+  rm -f -- "$root/jwt.cache" 2>/dev/null || true
+}
+
+# In-memory JWT still fresh and bound to current key material?
+jwt_mem_ok() {
+  local now age ttl material
+  [[ -n ${APNS_JWT_MEM:-} && -n ${APNS_JWT_IAT:-} && ${APNS_JWT_IAT} =~ ^[0-9]+$ ]] || return 1
+  [[ -n ${APNS_JWT_MATERIAL:-} ]] || return 1
+  material=$(jwt_material_digest)
+  [[ $APNS_JWT_MATERIAL == "$material" ]] || return 1
+  now=$(date +%s)
+  age=$((now - APNS_JWT_IAT))
+  ttl=$(jwt_ttl_clamped)
+  (( age >= 0 && age < ttl ))
+}
+
+# Load JWT into APNS_JWT_OUT. MUST be called directly (not jwt=$(get_jwt)).
+get_jwt() {
+  APNS_JWT_OUT=
+  if jwt_mem_ok; then
+    APNS_JWT_OUT=$APNS_JWT_MEM
+    [[ -n $APNS_JWT_OUT ]] || return 1
+    return 0
+  fi
+  mint_jwt
+}
+
+registry_bin() {
+  if [[ -n ${WORKFLOW_REGISTRY:-} && -x ${WORKFLOW_REGISTRY:-} ]]; then
+    printf '%s\n' "$WORKFLOW_REGISTRY"
+    return
+  fi
+  local self dir cand
+  self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+  cand=$self/workflow-registry
+  [[ -x $cand ]] || die 'workflow-registry not found'
+  printf '%s\n' "$cand"
+}
+
+run_registry() {
+  local bin
+  bin=$(registry_bin)
+  env \
+    HOME="${HOME:?}" \
+    XDG_STATE_HOME="$(state_home)" \
+    PATH="${PATH:-/usr/bin:/bin}" \
+    WORKFLOW_REGISTRY_TEST="${WORKFLOW_REGISTRY_TEST:-}" \
+    REMOTE_AGENT_ROOT_ORCHESTRATION="${REMOTE_AGENT_ROOT_ORCHESTRATION:-}" \
+    REMOTE_AGENT_ROOT_MIOSPOT="${REMOTE_AGENT_ROOT_MIOSPOT:-}" \
+    "$bin" "$@"
+}
+
+cmd_install_key() {
+  local p8= kid= team= arg
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --p8) (( $# )) || die 'missing --p8'; p8=$1; shift ;;
+      --key-id) (( $# )) || die 'missing --key-id'; kid=$1; shift ;;
+      --team-id) (( $# )) || die 'missing --team-id'; team=$1; shift ;;
+      *) die "unknown install-key option: $arg" ;;
+    esac
+  done
+  [[ -n $p8 && -f $p8 ]] || die 'install-key requires --p8 PATH'
+  [[ -n $kid && -n $team ]] || die 'install-key requires --key-id and --team-id'
+  ensure_apns_dirs
+  local root dest
+  root=$(apns_root)
+  dest=$root/AuthKey.p8.enc
+  encrypt_file "$p8" "$dest"
+  # Persist ids (not secret)
+  jq -cn --arg kid "$kid" --arg team "$team" '{keyId:$kid,teamId:$team}' >"$root/key-meta.json"
+  chmod 600 "$root/key-meta.json"
+  # Export for subsequent runs if env unset — stored meta is authoritative fallback
+  printf '%s\n' '{"ok":true,"status":"installed"}'
+  log_line "installed encrypted .p8 key id=$kid"
+}
+
+cmd_set_device_token() {
+  local device= token= arg
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || die 'missing --device-id'; device=$1; shift ;;
+      --token) (( $# )) || die 'missing --token'; token=$1; shift ;;
+      *) die "unknown set-device-token option: $arg" ;;
+    esac
+  done
+  [[ -n $device && -n $token ]] || die 'set-device-token requires --device-id and --token'
+  local device_dir
+  device_dir="$(outbox_root)/$device"
+  [[ -d $device_dir ]] || die "device not registered: $device"
+  ensure_apns_dirs
+  local enc
+  enc=$device_dir/apns-token.enc
+  # Encrypt from stdin — no plaintext token temp file.
+  printf '%s' "$token" | encrypt_stdin "$enc"
+  chmod 600 "$enc"
+  printf '%s\n' '{"ok":true,"status":"token-stored"}'
+  log_line "stored encrypted apns token for device=$device"
+}
+
+read_device_token() {
+  local device_dir=$1
+  local enc
+  enc=$device_dir/apns-token.enc
+  [[ -f $enc ]] || return 1
+  decrypt_to_stdout "$enc" || return 1
+}
+
+read_device_credential() {
+  local device_dir=$1
+  [[ -f $device_dir/credential ]] || return 1
+  head -n 1 "$device_dir/credential"
+}
+
+# C3 prefs: chat-reply-completed default-off; per-chat override wins.
+class_enabled() {
+  local device_dir=$1 class=$2 entity_id=$3
+  local prefs=$device_dir/prefs.json
+  if [[ -f $prefs ]]; then
+    # per-chat override for chat-reply-completed
+    if [[ $class == chat-reply-completed ]]; then
+      local chat_val
+      chat_val=$(jq -r --arg c "$entity_id" '
+        if (.chats // {}) | has($c) then
+          .chats[$c]["chat-reply-completed"] // empty
+        else empty end
+      ' "$prefs" 2>/dev/null || true)
+      if [[ $chat_val == true ]]; then return 0; fi
+      if [[ $chat_val == false ]]; then return 1; fi
+    fi
+    local class_val
+    class_val=$(jq -r --arg cl "$class" '
+      if (.classes // {}) | has($cl) then .classes[$cl] | tostring else empty end
+    ' "$prefs" 2>/dev/null || true)
+    if [[ $class_val == true ]]; then return 0; fi
+    if [[ $class_val == false ]]; then return 1; fi
+  fi
+  # Defaults
+  if [[ $class == chat-reply-completed ]]; then
+    return 1
+  fi
+  case " $DEFAULT_CLASSES " in
+    *" $class "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+host_for_build() {
+  case "$1" in
+    sandbox) printf 'https://api.sandbox.push.apple.com\n' ;;
+    production) printf 'https://api.push.apple.com\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+build_payload() {
+  local class=$1 entity_id=$2 badge=$3
+  # Notification only: class + opaque reference + badge. No authority fields.
+  jq -cn \
+    --arg class "$class" \
+    --arg entityId "$entity_id" \
+    --argjson badge "$badge" \
+    '{
+      aps: {
+        alert: { title: $class, body: $entityId },
+        badge: $badge,
+        "content-available": 1
+      },
+      class: $class,
+      entityId: $entityId
+    }'
+}
+
+# Stable apns-collapse-id (≤64 bytes) for one logical outbox event.
+# Collapses user-visible duplicates across the residual POST-200→mark_delivered window.
+stable_collapse_id() {
+  local device=$1 class=$2 entity=$3 seq=$4
+  local dig
+  dig=$(printf 'apns-collapse|%s|%s|%s|%s' "$device" "$class" "$entity" "$seq" \
+    | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+  # Prefix keeps it human-attributable in logs; total length stays well under 64.
+  printf 'o-%s\n' "${dig:0:40}"
+}
+
+# POST one APNs notification. MUST be called directly (not result=$(post_apns)).
+# Result in APNS_POST_RESULT ("<code> <reason>").
+# Secrets (JWT bearer + device-token URL) never touch disk: curl --config uses
+# process-substitution fifo only. Payload via process-sub too. Only non-secret
+# response captures are registered parent temps.
+# Optional 6th arg: apns-collapse-id (stable per event; mitigates residual re-POST window).
+post_apns() {
+  local host=$1 token=$2 payload=$3 jwt=$4 topic=$5 collapse_id=${6:-}
+  local url resp_file hdr_file code reason curl_st
+  APNS_POST_RESULT=
+  url="$host/3/device/$token"
+  resp_file=$(mktemp "${TMPDIR:-/tmp}/apns.resp.XXXXXX")
+  hdr_file=$(mktemp "${TMPDIR:-/tmp}/apns.hdr.XXXXXX")
+  register_temp "$resp_file"
+  register_temp "$hdr_file"
+
+  local curl_bin=${APNS_CURL:-curl}
+  set +e
+  # --config <(...) : JWT + device token URL only in a pipe/fifo, never TMPDIR.
+  # --data-binary @<(...) : payload likewise never on disk.
+  # Capture http_code on stdout into a variable (no secret content).
+  code=$("$curl_bin" --http2 -sS \
+    -o "$resp_file" \
+    -D "$hdr_file" \
+    -w '%{http_code}' \
+    -X POST \
+    --config <(
+      printf 'url = "%s"\n' "$url"
+      printf 'header = "authorization: bearer %s"\n' "$jwt"
+      printf 'header = "apns-topic: %s"\n' "$topic"
+      printf 'header = "apns-push-type: alert"\n'
+      printf 'header = "apns-priority: 10"\n'
+      printf 'header = "content-type: application/json"\n'
+      if [[ -n $collapse_id ]]; then
+        printf 'header = "apns-collapse-id: %s"\n' "$collapse_id"
+      fi
+    ) \
+    --data-binary @<(printf '%s' "$payload") \
+    2>/dev/null)
+  curl_st=$?
+  set -e
+  code=$(printf '%s' "$code" | tr -d ' \n')
+  reason=$(jq -r '.reason // empty' "$resp_file" 2>/dev/null || true)
+  rm -f -- "$resp_file" "$hdr_file"
+  if [[ $curl_st -ne 0 && -z $code ]]; then
+    APNS_POST_RESULT='curl-error'
+    return 2
+  fi
+  APNS_POST_RESULT="${code:-0} ${reason:-}"
+  if [[ $code == 200 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Stable requestId for outbox-ack: derived from event identity (device+class+entity+seq).
+# Never includes PID — replay dedupe requires stability across processes.
+stable_ack_request_id() {
+  local device=$1 class=$2 entity=$3 seq=$4
+  local dig
+  dig=$(printf '%s|%s|%s|%s' "$device" "$class" "$entity" "$seq" \
+    | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+  printf 'req-apns-ack-%s\n' "${dig:0:32}"
+}
+
+# Stable auto-revoke requestId (device-scoped, no PID).
+stable_revoke_request_id() {
+  local device=$1
+  local dig
+  dig=$(printf 'apns-auto-revoke|%s' "$device" \
+    | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+  printf 'req-apns-rev-%s\n' "${dig:0:32}"
+}
+
+auto_revoke_device() {
+  local device=$1 reason=$2
+  local req out st
+  req=$(stable_revoke_request_id "$device")
+  set +e
+  out=$(run_registry device-revoke --device-id "$device" --request-id "$req" 2>&1)
+  st=$?
+  set -e
+  if [[ $st -ne 0 ]]; then
+    # Never journal success when revoke failed — endpoint must stay retryable.
+    journal_event "$(jq -cn \
+      --arg deviceId "$device" \
+      --arg reason "$reason" \
+      --argjson status "$st" \
+      --arg detail "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" \
+      '{event:"auto-revoke-failed",deviceId:$deviceId,reason:$reason,status:$status,detail:$detail,source:"apns-410"}')"
+    log_line "auto-revoke FAILED device=$device status=$st reason=$reason"
+    return 1
+  fi
+  journal_event "$(jq -cn --arg deviceId "$device" --arg reason "$reason" --arg requestId "$req" \
+    '{event:"auto-revoke",deviceId:$deviceId,reason:$reason,requestId:$requestId,source:"apns-410"}')"
+  log_line "auto-revoke device=$device reason=$reason"
+  return 0
+}
+
+# Ack with stable requestId; check result; fail closed / one retry on error.
+outbox_ack_event() {
+  local device=$1 credential=$2 class=$3 entity=$4 seq=$5
+  local ack_id out st attempt
+  ack_id=$(stable_ack_request_id "$device" "$class" "$entity" "$seq")
+  for attempt in 1 2; do
+    set +e
+    out=$(run_registry outbox-ack \
+      --device-id "$device" \
+      --credential "$credential" \
+      --request-id "$ack_id" \
+      --seq "$seq" 2>&1)
+    st=$?
+    set -e
+    if [[ $st -eq 0 ]]; then
+      return 0
+    fi
+    log_line "outbox-ack failed device=$device seq=$seq attempt=$attempt status=$st"
+    (( attempt < 2 )) && sleep 0.05
+  done
+  journal_event "$(jq -cn \
+    --arg deviceId "$device" \
+    --argjson seq "$seq" \
+    --arg requestId "$ack_id" \
+    --argjson status "$st" \
+    '{event:"outbox-ack-failed",deviceId:$deviceId,seq:$seq,requestId:$requestId,status:$status}')"
+  return 1
+}
+
+# Durable DELIVERED marker: event identity → apns status. Recorded on HTTP 200
+# BEFORE/atomically-with outbox-ack so a failed ack never causes a re-POST.
+delivered_dir() {
+  local device_dir=$1
+  printf '%s/delivered\n' "$device_dir"
+}
+
+delivered_marker_path() {
+  local device_dir=$1 seq=$2
+  printf '%s/%s.json\n' "$(delivered_dir "$device_dir")" "$seq"
+}
+
+is_marked_delivered() {
+  local device_dir=$1 seq=$2
+  local path
+  path=$(delivered_marker_path "$device_dir" "$seq")
+  [[ -f $path ]]
+}
+
+# Atomic write of delivered marker (tmp + mv within same dir).
+mark_delivered() {
+  local device_dir=$1 seq=$2 class=$3 entity=$4 status=${5:-200} apns_id=${6:-}
+  local dir path tmp
+  dir=$(delivered_dir "$device_dir")
+  mkdir -p -m 700 -- "$dir"
+  path=$(delivered_marker_path "$device_dir" "$seq")
+  tmp=$path.tmp.$$
+  jq -cn \
+    --argjson seq "$seq" \
+    --arg class "$class" \
+    --arg entityId "$entity" \
+    --argjson status "$status" \
+    --arg apnsId "$apns_id" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{seq:$seq,class:$class,entityId:$entityId,status:$status,apnsId:$apnsId,deliveredAt:$ts}' \
+    >"$tmp"
+  mv -f "$tmp" "$path"
+  chmod 600 "$path"
+}
+
+clear_delivered_marker() {
+  local device_dir=$1 seq=$2
+  local path
+  path=$(delivered_marker_path "$device_dir" "$seq")
+  rm -f -- "$path" 2>/dev/null || true
+}
+
+# Bound delivered/ so markers whose seq fell out of feed retention (and can never
+# be acked) do not accumulate without limit. Drop orphans first; then hard-cap
+# ONLY acked/settled markers. NEVER evict a marker for an still-unacked event —
+# that would re-POST on the next drain (exactly-once break).
+readonly DELIVERED_MAX=256
+
+reconcile_delivered_markers() {
+  local device_dir=$1
+  local dir notif_root path seq base count retained acked_file acked_list
+  dir=$(delivered_dir "$device_dir")
+  [[ -d $dir ]] || return 0
+  notif_root="$(registry_root)/notifications"
+  acked_file=$device_dir/acked.json
+  acked_list='[]'
+  if [[ -f $acked_file ]]; then
+    acked_list=$(jq -c . "$acked_file" 2>/dev/null || printf '[]')
+  fi
+
+  # Build set of seqs still retained in the notification feed (space-delimited).
+  retained=' '
+  if [[ -d $notif_root ]]; then
+    while IFS= read -r path; do
+      [[ -f $path ]] || continue
+      seq=$(jq -r '.seq // empty' "$path" 2>/dev/null || true)
+      [[ -n $seq && $seq =~ ^[0-9]+$ ]] || continue
+      retained+="$seq "
+    done < <(find "$notif_root" -type f -name '*.json' -print 2>/dev/null || true)
+  fi
+
+  for path in "$dir"/*.json; do
+    [[ -f $path ]] || continue
+    base=$(basename "$path" .json)
+    if [[ ! $base =~ ^[0-9]+$ ]]; then
+      rm -f -- "$path" 2>/dev/null || true
+      continue
+    fi
+    # Seq no longer in feed → can never be re-fetched / re-POSTed; drop marker.
+    case "$retained" in
+      *" $base "*) ;;
+      *) rm -f -- "$path" 2>/dev/null || true ;;
+    esac
+  done
+
+  # Hard cap: trim ONLY acked/settled markers (oldest numeric names first).
+  # Unacked markers are protected — evicting them causes a duplicate APNs POST.
+  count=$(find "$dir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  if (( count > DELIVERED_MAX )); then
+    while IFS= read -r path && (( count > DELIVERED_MAX )); do
+      [[ -f $path ]] || continue
+      base=$(basename "$path" .json)
+      [[ $base =~ ^[0-9]+$ ]] || continue
+      # Only drop if this seq is already acked (settled) in the durable ledger.
+      if jq -e --argjson seq "$base" 'index($seq) != null' <<<"$acked_list" >/dev/null 2>&1; then
+        rm -f -- "$path" 2>/dev/null || true
+        count=$((count - 1))
+      fi
+    done < <(find "$dir" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | LC_ALL=C sort)
+  fi
+
+  # If still over cap with only unacked markers remaining: refuse to evict; alarm.
+  count=$(find "$dir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  if (( count > DELIVERED_MAX )); then
+    log_line "delivered-marker-overflow device=$(basename "$device_dir") count=$count cap=$DELIVERED_MAX (refusing to evict unacked markers)"
+    journal_event "$(jq -cn \
+      --arg deviceId "$(basename "$device_dir")" \
+      --argjson count "$count" \
+      --argjson cap "$DELIVERED_MAX" \
+      '{event:"delivered-marker-overflow",deviceId:$deviceId,count:$count,cap:$cap,action:"refuse-evict-unacked"}')"
+  fi
+}
+
+process_device() {
+  local device_dir=$1
+  local device meta build revoked credential token jwt topic host
+  device=$(basename "$device_dir")
+  meta=$device_dir/meta.json
+  [[ -f $meta ]] || return 0
+  revoked=$(jq -r '.revoked // false' "$meta")
+  if [[ $revoked == true ]]; then
+    return 0
+  fi
+
+  # Always reconcile delivered/ (even with no pending sends) so orphans cannot grow.
+  reconcile_delivered_markers "$device_dir"
+
+  build=$(jq -r '.buildType // empty' "$meta")
+  host=$(host_for_build "$build") || {
+    log_line "skip device=$device unknown buildType"
+    return 0
+  }
+  token=$(read_device_token "$device_dir" || true)
+  [[ -n ${token:-} ]] || {
+    # Phone devices without a token are not APNs-capable yet.
+    # Still ran reconcile above (no secrets path for token-less).
+    return 0
+  }
+  credential=$(read_device_credential "$device_dir" || true)
+  [[ -n ${credential:-} ]] || {
+    log_line "skip device=$device missing credential"
+    return 0
+  }
+
+  local fetch_json
+  set +e
+  fetch_json=$(run_registry outbox-fetch --device-id "$device" --credential "$credential" --cursor 0 2>/dev/null)
+  local fetch_st=$?
+  set -e
+  if [[ $fetch_st -ne 0 ]]; then
+    log_line "outbox-fetch failed device=$device"
+    return 0
+  fi
+
+  local records count badge
+  records=$(jq -c '.records // []' <<<"$fetch_json")
+  count=$(jq 'length' <<<"$records")
+  # Even with zero records, reconcile already ran; done.
+  (( count > 0 )) || return 0
+
+  topic=${APNS_TOPIC:-com.orchestration.minirelay}
+
+  # Build list of records that pass prefs. Already-delivered events still need
+  # ack retry but must never re-enter the POST path (end-to-end idempotency).
+  local class entity seq send_count=0
+  local -a to_send_class=() to_send_entity=() to_send_seq=()
+  local -a retry_class=() retry_entity=() retry_seq=()
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    class=$(jq -r '.class // empty' <<<"$row")
+    entity=$(jq -r '.entityId // empty' <<<"$row")
+    seq=$(jq -r '.seq // empty' <<<"$row")
+    [[ -n $class && -n $entity && -n $seq ]] || continue
+    if is_marked_delivered "$device_dir" "$seq"; then
+      retry_class+=("$class")
+      retry_entity+=("$entity")
+      retry_seq+=("$seq")
+      continue
+    fi
+    if class_enabled "$device_dir" "$class" "$entity"; then
+      to_send_class+=("$class")
+      to_send_entity+=("$entity")
+      to_send_seq+=("$seq")
+      send_count=$((send_count + 1))
+    fi
+  done < <(jq -c '.[]' <<<"$records")
+
+  # Retry acks for events already POSTed successfully (marker present).
+  local ri retry_n=${#retry_seq[@]}
+  for (( ri = 0; ri < retry_n; ri++ )); do
+    class=${retry_class[$ri]}
+    entity=${retry_entity[$ri]}
+    seq=${retry_seq[$ri]}
+    if outbox_ack_event "$device" "$credential" "$class" "$entity" "$seq"; then
+      clear_delivered_marker "$device_dir" "$seq"
+      log_line "ack-retry-ok device=$device seq=$seq"
+    else
+      log_line "ack-retry-pending device=$device seq=$seq"
+    fi
+  done
+
+  (( send_count > 0 )) || return 0
+  badge=$send_count
+
+  # Direct call — never jwt=$(get_jwt) (mint registers temps under parent trap).
+  get_jwt || return 0
+  jwt=$APNS_JWT_OUT
+  [[ -n $jwt ]] || return 0
+
+  local i result code reason payload post_st collapse_id
+  for (( i = 0; i < send_count; i++ )); do
+    class=${to_send_class[$i]}
+    entity=${to_send_entity[$i]}
+    seq=${to_send_seq[$i]}
+    # Re-check marker (race / concurrent drain)
+    if is_marked_delivered "$device_dir" "$seq"; then
+      if outbox_ack_event "$device" "$credential" "$class" "$entity" "$seq"; then
+        clear_delivered_marker "$device_dir" "$seq"
+      fi
+      continue
+    fi
+    payload=$(build_payload "$class" "$entity" "$badge")
+    # Stable collapse-id: residual crash window (POST-200 before mark_delivered)
+    # may re-POST; APNs collapses display of the duplicate. See header comment.
+    collapse_id=$(stable_collapse_id "$device" "$class" "$entity" "$seq")
+    # Direct call — never result=$(post_apns) (temps must share parent trap;
+    # secrets never hit disk via process-sub curl config).
+    set +e
+    post_apns "$host" "$token" "$payload" "$jwt" "$topic" "$collapse_id"
+    post_st=$?
+    set -e
+    result=$APNS_POST_RESULT
+    code=${result%% *}
+    reason=${result#* }
+    reason=${reason//$'\n'/}
+
+    if [[ $post_st -eq 0 && $code == 200 ]]; then
+      # END-TO-END idempotency: durable DELIVERED marker BEFORE ack. A failed
+      # ack must retry the marker path only — never re-POST to APNs.
+      # Residual window: crash between HTTP 200 and this mark_delivered may still
+      # re-POST once; apns-collapse-id mitigates user-visible duplicates.
+      mark_delivered "$device_dir" "$seq" "$class" "$entity" 200 ""
+      if outbox_ack_event "$device" "$credential" "$class" "$entity" "$seq"; then
+        clear_delivered_marker "$device_dir" "$seq"
+        log_line "delivered device=$device seq=$seq class=$class"
+      else
+        log_line "delivered-but-ack-failed device=$device seq=$seq class=$class (marker retained; no re-POST)"
+      fi
+      continue
+    fi
+
+    # G4: 410 / Unregistered → auto-revoke; retain outbox events (no ack).
+    if [[ $code == 410 || $reason == Unregistered || $reason == "410 Unregistered" ]]; then
+      set +e
+      run_registry outbox-mark-failed \
+        --device-id "$device" --seq "$seq" --reason apns-unregistered >/dev/null 2>&1
+      set -e
+      # Check revoke result — never journal success on failure (endpoint must not stay ACTIVE silently).
+      if ! auto_revoke_device "$device" "410/${reason:-Unregistered}"; then
+        log_line "auto-revoke incomplete device=$device; will retry next cycle"
+      fi
+      return 0
+    fi
+
+    # Delivery failure: mark failed, do not erase, do not ack.
+    set +e
+    run_registry outbox-mark-failed \
+      --device-id "$device" --seq "$seq" --reason "apns-http-${code:-err}" >/dev/null 2>&1
+    set -e
+    log_line "delivery-failed device=$device seq=$seq code=${code:-?} reason=${reason:-none}"
+  done
+}
+
+drain_once() {
+  ensure_apns_dirs
+  # Load key meta into env if unset
+  local root meta
+  root=$(apns_root)
+  meta=$root/key-meta.json
+  if [[ -f $meta ]]; then
+    if [[ -z ${APNS_KEY_ID:-} ]]; then
+      APNS_KEY_ID=$(jq -r '.keyId // empty' "$meta")
+      export APNS_KEY_ID
+    fi
+    if [[ -z ${APNS_TEAM_ID:-} ]]; then
+      APNS_TEAM_ID=$(jq -r '.teamId // empty' "$meta")
+      export APNS_TEAM_ID
+    fi
+  fi
+
+  local ob d
+  ob=$(outbox_root)
+  [[ -d $ob ]] || {
+    log_line 'no outbox root; nothing to drain'
+    printf '%s\n' '{"ok":true,"status":"idle"}'
+    return 0
+  }
+  # Require encrypted .p8
+  if [[ ! -f $root/AuthKey.p8.enc ]]; then
+    log_line 'no .p8 installed; idle'
+    printf '%s\n' '{"ok":true,"status":"idle-no-key"}'
+    return 0
+  fi
+
+  while IFS= read -r d; do
+    [[ -d $d ]] || continue
+    process_device "$d" || log_line "process_device error dir=$d"
+  done < <(find "$ob" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print | LC_ALL=C sort)
+
+  printf '%s\n' '{"ok":true,"status":"drained"}'
+}
+
+cmd_run() {
+  local interval=${APNS_POLL_SECONDS:-5}
+  [[ $interval =~ ^[0-9]+$ ]] || interval=5
+  (( interval >= 1 )) || interval=5
+  log_line "run loop starting interval=${interval}s"
+  while true; do
+    bound_launchd_logs
+    drain_once >/dev/null || log_line 'drain_once failed'
+    bound_launchd_logs
+    sleep "$interval"
+  done
+}
+
+cmd_version() {
+  printf 'apns-sender %s\n' "$VERSION"
+}
+
+# Resolve the tracked LaunchAgent template path (never pre-expanded at rest).
+plist_template_path() {
+  if [[ -n ${APNS_PLIST_TEMPLATE:-} && -f ${APNS_PLIST_TEMPLATE:-} ]]; then
+    printf '%s\n' "$APNS_PLIST_TEMPLATE"
+    return 0
+  fi
+  local self dir cand
+  self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+  cand=$self/../templates/mini-relay/com.orchestration.apns-sender.plist
+  if [[ -f $cand ]]; then
+    cd "$(dirname "$cand")" && printf '%s\n' "$(pwd -P)/$(basename "$cand")"
+    return 0
+  fi
+  return 1
+}
+
+# Substitute @PLUGIN_ROOT@ / @STATE_HOME@ and write a loadable LaunchAgent plist.
+# The tracked template keeps placeholders; this is the only install path this
+# step owns. Without install-launchagent the agent is NOT installed.
+cmd_install_launchagent() {
+  local plugin_root= dest= do_load=0 arg state
+  state=$(state_home)
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --plugin-root) (( $# )) || die 'missing --plugin-root'; plugin_root=$1; shift ;;
+      --dest) (( $# )) || die 'missing --dest'; dest=$1; shift ;;
+      --load) do_load=1 ;;
+      --state-home) (( $# )) || die 'missing --state-home'; state=$1; shift ;;
+      *) die "unknown install-launchagent option: $arg" ;;
+    esac
+  done
+  if [[ -z $plugin_root ]]; then
+    plugin_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+  fi
+  if [[ -z $dest ]]; then
+    dest="${HOME:?HOME is required}/Library/LaunchAgents/com.orchestration.apns-sender.plist"
+  fi
+  local tmpl
+  tmpl=$(plist_template_path) || die 'LaunchAgent template not found (templates/mini-relay/com.orchestration.apns-sender.plist)'
+  mkdir -p -m 700 -- "$(dirname "$dest")"
+  # Escape sed replacement carefully — paths only.
+  local pr_esc st_esc
+  pr_esc=$(printf '%s' "$plugin_root" | sed -e 's/[\\/&]/\\&/g')
+  st_esc=$(printf '%s' "$state" | sed -e 's/[\\/&]/\\&/g')
+  sed \
+    -e "s/@PLUGIN_ROOT@/${pr_esc}/g" \
+    -e "s/@STATE_HOME@/${st_esc}/g" \
+    "$tmpl" >"$dest"
+  chmod 644 "$dest"
+  # Refuse to leave unresolved placeholders in the installed copy.
+  if grep -Eq '@PLUGIN_ROOT@|@STATE_HOME@' "$dest"; then
+    rm -f -- "$dest"
+    die 'install-launchagent left unresolved placeholders'
+  fi
+  ensure_apns_dirs
+  if [[ $do_load -eq 1 ]]; then
+    if command -v launchctl >/dev/null 2>&1; then
+      # Best-effort unload prior, then load (GUI session LaunchAgent).
+      launchctl bootout "gui/$(id -u)" "$dest" 2>/dev/null || \
+        launchctl unload "$dest" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$dest" 2>/dev/null || \
+        launchctl load "$dest" 2>/dev/null || \
+        log_line "launchctl load failed for $dest (manual load required)"
+    else
+      log_line 'launchctl not available; wrote plist only'
+    fi
+  fi
+  log_line "installed LaunchAgent plist dest=$dest load=$do_load"
+  jq -cn --arg dest "$dest" --argjson load "$do_load" \
+    '{ok:true,status:"launchagent-installed",dest:$dest,loaded:$load}'
+}
+
+main() {
+  local op=${1:-}
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$op" in
+    version|--version) cmd_version ;;
+    help|-h|--help) usage ;;
+    install-key) cmd_install_key "$@" ;;
+    set-device-token) cmd_set_device_token "$@" ;;
+    install-launchagent) cmd_install_launchagent "$@" ;;
+    once|drain) drain_once ;;
+    run) cmd_run ;;
+    '') usage ;;
+    *) die "unknown operation: $op" ;;
+  esac
+}
+
+main "$@"

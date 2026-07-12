@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""workflow-gateway — phone-facing loopback HTTP adapter over workflow-registry.
+
+Informed by docs/12-phone-control-surface.md.
+
+A single-file Python 3 standard-library daemon that binds 127.0.0.1 only
+(tailnet exposure happens exclusively through Tailscale Serve) and relays a
+closed workflow-family route table onto the Mini-resident workflow-registry.
+Every handler exec's the registry with validated fixed atoms — never
+shell-interpolated request text.  Prompt bytes travel request body -> 0600
+spool file -> registry stdin and are deleted immediately; they never appear
+in argv, in the audit log, or in any response.  The gateway never
+orchestrates: no frontier logic, no lane dispatch, no client-held wait loop —
+one bounded registry exec per request, refusals relayed as bounded
+machine-readable JSON.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import socketserver
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlsplit
+
+IDENTITY_HEADER = "Tailscale-User-Login"
+MAX_PROMPT_BYTES = 64 * 1024
+MAX_REGISTRY_OUTPUT_BYTES = 4096
+MAX_RESPONSE_BYTES = 8192
+MAX_STATIC_BYTES = 1024 * 1024
+WAIT_CAP_SECONDS = 55
+DEFAULT_EXEC_TIMEOUT_SECONDS = 70
+
+ATOM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+WORKFLOW_RE = re.compile(r"^wf-[a-z0-9][a-z0-9-]{0,47}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$")
+CURSOR_RE = re.compile(r"^jrn-[A-Za-z0-9._-]{1,64}:[0-9]{1,18}$")
+NUMBER_RE = re.compile(r"^[0-9]{1,18}$")
+PROJECTS = ("miospot", "orchestration")
+
+# Guarded single-op mutations: route action -> registry operation.
+WORKFLOW_ACTIONS = {
+    "interrupt": "interrupt",
+    "kill": "kill",
+    "release": "release",
+    "reveal": "reveal",
+    "sync": "request-mirror-sync",
+}
+
+STATIC_WHITELIST = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "/icon-192.png": ("icon-192.png", "image/png"),
+    "/icon-512.png": ("icon-512.png", "image/png"),
+}
+
+SECURITY_HEADERS = (
+    ("Cache-Control", "no-store"),
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    ),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+)
+
+# Registry refusal codes -> HTTP status.  Anything unknown falls back to the
+# registry exit-code table, then to 502.  Held locks and refused transitions
+# are conflicts, never gateway errors.
+ERROR_STATUS = {
+    "usage": 400,
+    "invalid-argument": 400,
+    "invalid-workflow": 400,
+    "invalid-project": 400,
+    "invalid-cursor": 400,
+    "claude-only": 400,
+    "not-found": 404,
+    "invalid-checkout": 404,
+    "invalid-plan": 404,
+    "busy": 409,
+    "mutex-held": 409,
+    "queue-full": 409,
+    "active-workflow": 409,
+    "id-collision": 409,
+    "digest-mismatch": 409,
+    "digest-conflict": 409,
+    "stale-ack": 409,
+    "missing-latch": 409,
+    "invalid-latch": 409,
+    "invalid-transition": 409,
+    "invalid-state": 409,
+    "protocol-refusal": 409,
+    "diagnostic-held": 409,
+    "mirror-pending": 409,
+    "root-mismatch": 409,
+    "output-too-large": 502,
+    "missing-dependency": 502,
+}
+EXIT_STATUS = {64: 400, 65: 409, 66: 404, 69: 502, 70: 502, 73: 409, 75: 409}
+
+_AUDIT_LOCK = threading.Lock()
+
+
+class RouteRefusal(Exception):
+    """A bounded, machine-readable refusal decided by the gateway itself."""
+
+    def __init__(self, status, error, message):
+        super().__init__(message)
+        self.status = status
+        self.error = error
+        self.message = message
+
+
+def state_home():
+    return os.environ.get(
+        "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
+    )
+
+
+def load_config():
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    registry = os.environ.get(
+        "WORKFLOW_GATEWAY_REGISTRY", os.path.join(script_dir, "workflow-registry")
+    )
+    gateway_state = os.path.join(state_home(), "orchestration", "gateway")
+    raw_timeout = os.environ.get("WORKFLOW_GATEWAY_EXEC_TIMEOUT", "")
+    try:
+        exec_timeout = int(raw_timeout)
+    except ValueError:
+        exec_timeout = DEFAULT_EXEC_TIMEOUT_SECONDS
+    if exec_timeout <= 0:
+        exec_timeout = DEFAULT_EXEC_TIMEOUT_SECONDS
+    serve_host = os.environ.get("WORKFLOW_GATEWAY_SERVE_HOST", "").strip().lower()
+    allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+    if serve_host:
+        allowed_hosts.add(serve_host)
+    return {
+        "registry": registry,
+        "allowlist": os.environ.get(
+            "WORKFLOW_GATEWAY_ALLOWLIST", os.path.join(gateway_state, "allowlist")
+        ),
+        "audit_log": os.environ.get(
+            "WORKFLOW_GATEWAY_AUDIT_LOG", os.path.join(gateway_state, "audit.log")
+        ),
+        "static_dir": os.environ.get("WORKFLOW_GATEWAY_STATIC_DIR", ""),
+        "allowed_hosts": allowed_hosts,
+        "exec_timeout": exec_timeout,
+    }
+
+
+CONFIG = load_config()
+
+
+def read_allowlist():
+    """Return the set of allowed logins, or None when the file is unusable.
+
+    Fail closed: a missing, non-regular, other-owned, or group/other-readable
+    allowlist authorizes nobody.
+    """
+    path = CONFIG["allowlist"]
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if info.st_uid != os.getuid():
+        return None
+    if info.st_mode & 0o077:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    logins = {line.strip() for line in lines if line.strip()}
+    return logins or None
+
+
+def audit(entry):
+    """Append one labels-only JSON line; never block a request on failure."""
+    line = json.dumps(entry, separators=(",", ":"), sort_keys=True)
+    try:
+        directory = os.path.dirname(CONFIG["audit_log"])
+        if directory:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        with _AUDIT_LOCK:
+            fd = os.open(
+                CONFIG["audit_log"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, line.encode("utf-8") + b"\n")
+            finally:
+                os.close(fd)
+    except OSError:
+        pass
+
+
+def require_one(query, name, pattern, error="invalid-argument"):
+    values = query.get(name, [])
+    if len(values) != 1 or not pattern.match(values[0]):
+        raise RouteRefusal(400, error, "invalid or missing %s" % name)
+    return values[0]
+
+
+def optional_one(query, name, pattern):
+    values = query.get(name, [])
+    if not values:
+        return None
+    if len(values) != 1 or not pattern.match(values[0]):
+        raise RouteRefusal(400, "invalid-argument", "invalid %s" % name)
+    return values[0]
+
+
+def reject_unknown_params(query, allowed):
+    for key in query:
+        if key not in allowed:
+            raise RouteRefusal(400, "invalid-argument", "unknown parameter")
+
+
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup at bind time.
+
+    The stock server_bind calls socket.getfqdn(), a name lookup that can
+    block startup for tens of seconds on a host without working DNS.  A
+    loopback-only daemon has a fixed name; nothing may delay the bind.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "workflow-gateway"
+    sys_version = ""
+    _allowed_methods = {"GET"}
+
+    # ----- plumbing ---------------------------------------------------------
+
+    def log_message(self, fmt, *args):  # noqa: ARG002 - silence default logging
+        return
+
+    def respond(self, status, body_bytes, content_type="application/json"):
+        if len(body_bytes) > MAX_RESPONSE_BYTES and content_type == "application/json":
+            status = 502
+            body_bytes = (
+                b'{"ok":false,"error":"response-too-large",'
+                b'"message":"gateway response exceeded its bound"}'
+            )
+        self._response_status = status
+        self.close_connection = True
+        self.send_response(status)
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body_bytes)))
+        if status == 405:
+            self.send_header("Allow", ", ".join(sorted(self._allowed_methods)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body_bytes)
+
+    def respond_error(self, status, error, message):
+        payload = {"ok": False, "error": error, "message": message[:256]}
+        self.respond(status, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        return error
+
+    def send_error(self, code, message=None, explain=None):  # noqa: ARG002
+        """Replace the stdlib HTML error page on every server-raised error.
+
+        Requests that never reach a do_* handler — unsupported methods such
+        as OPTIONS or TRACE (501), malformed request lines (400/414/505) —
+        are answered by the http.server machinery through send_error.  Route
+        them through respond_error so every response the gateway ever emits
+        carries the full security header set and a bounded JSON body.  The
+        stdlib message can reflect client-supplied bytes (the method name),
+        so it is discarded in favor of fixed refusal text.
+        """
+        if code == 501:
+            self.respond_error(code, "not-implemented", "method has no handler on this gateway")
+        else:
+            self.respond_error(code, "bad-request", "request could not be parsed")
+
+    # ----- identity and browser-boundary checks -----------------------------
+
+    def check_identity(self):
+        values = self.headers.get_all(IDENTITY_HEADER) or []
+        if len(values) != 1:
+            raise RouteRefusal(403, "forbidden", "identity header must appear exactly once")
+        login = values[0].strip()
+        allowlist = read_allowlist()
+        if allowlist is None or login not in allowlist:
+            raise RouteRefusal(403, "forbidden", "identity is not allowlisted")
+        return login
+
+    @staticmethod
+    def _hostname_of(netloc):
+        if netloc.startswith("["):
+            return netloc.partition("]")[0].lstrip("[").lower()
+        return netloc.partition(":")[0].lower()
+
+    def check_host(self):
+        values = self.headers.get_all("Host") or []
+        if len(values) != 1:
+            raise RouteRefusal(403, "forbidden", "Host header must appear exactly once")
+        if self._hostname_of(values[0].strip()) not in CONFIG["allowed_hosts"]:
+            raise RouteRefusal(403, "forbidden", "Host is not this gateway")
+
+    def check_origin(self):
+        values = self.headers.get_all("Origin") or []
+        if not values:
+            return
+        if len(values) != 1:
+            raise RouteRefusal(403, "forbidden", "Origin header must appear exactly once")
+        origin_host = (urlsplit(values[0].strip()).hostname or "").lower()
+        if origin_host not in CONFIG["allowed_hosts"]:
+            raise RouteRefusal(403, "forbidden", "cross-origin mutation refused")
+
+    # ----- registry relay ---------------------------------------------------
+
+    def exec_registry(self, argv, stdin_fd=None):
+        """Run one bounded registry exec and relay its envelope."""
+        command = [CONFIG["registry"]] + argv
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL if stdin_fd is None else stdin_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=CONFIG["exec_timeout"],
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RouteRefusal(504, "registry-timeout", "registry exec exceeded the gateway bound")
+        except OSError:
+            raise RouteRefusal(502, "registry-unavailable", "registry could not be executed")
+        stdout = completed.stdout
+        if len(stdout) > MAX_REGISTRY_OUTPUT_BYTES + 512:
+            raise RouteRefusal(502, "registry-protocol", "registry output exceeded its bound")
+        try:
+            envelope = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise RouteRefusal(502, "registry-protocol", "registry emitted an unparseable response")
+        if not isinstance(envelope, dict) or "ok" not in envelope:
+            raise RouteRefusal(502, "registry-protocol", "registry emitted an unparseable response")
+        if envelope.get("ok") is True:
+            status = 200
+        else:
+            error_code = envelope.get("error")
+            status = ERROR_STATUS.get(error_code) or EXIT_STATUS.get(completed.returncode, 502)
+        body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+        self.respond(status, body)
+        return None if status == 200 else str(envelope.get("error", "refused"))
+
+    # ----- prompt spool -----------------------------------------------------
+
+    def read_prompt_body(self):
+        if self.headers.get_all("Transfer-Encoding"):
+            raise RouteRefusal(411, "invalid-argument", "chunked prompt bodies are refused")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1 or not lengths[0].strip().isdigit():
+            raise RouteRefusal(411, "invalid-argument", "Content-Length is required")
+        length = int(lengths[0])
+        if length > MAX_PROMPT_BYTES:
+            raise RouteRefusal(413, "payload-too-large", "prompt exceeds the 64 KiB bound")
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            raise RouteRefusal(400, "invalid-argument", "request body was truncated")
+        return body
+
+    def relay_send_with_prompt(self, workflow_id, request_id, ack_event):
+        body = self.read_prompt_body()
+        digest = hashlib.sha256(body).hexdigest()
+        argv = ["send", workflow_id, "--request-id", request_id, "--payload-sha256", digest]
+        if ack_event is not None:
+            argv += ["--ack-event", ack_event]
+        # Anonymous spool: unlink immediately after creation, before any byte
+        # is written, so the prompt is never reachable by path and cannot
+        # survive a SIGTERM/SIGKILL mid-exec.  The open descriptor keeps the
+        # bytes alive exactly until the registry exec consumes them; no
+        # cleanup code is ever relied upon.
+        fd, spool_path = tempfile.mkstemp(prefix="workflow-gateway-send.")
+        try:
+            os.unlink(spool_path)
+            os.write(fd, body)
+            os.lseek(fd, 0, os.SEEK_SET)
+            return self.exec_registry(argv, stdin_fd=fd)
+        finally:
+            os.close(fd)
+
+    # ----- routing ----------------------------------------------------------
+
+    def handle_request(self):
+        self._allowed_methods = {"GET"}
+        split = urlsplit(self.path)
+        try:
+            segments = [unquote(segment) for segment in split.path.split("/") if segment]
+        except ValueError:
+            segments = None
+        labels = {"method": self.command, "route": "invalid"}
+        try:
+            if segments is None or any("/" in s or "\x00" in s for s in segments):
+                raise RouteRefusal(404, "not-found", "no such route")
+            login = self.check_identity()
+            labels["login"] = login
+            self.check_host()
+            try:
+                query = parse_qs(split.query, keep_blank_values=True) if split.query else {}
+            except ValueError:
+                raise RouteRefusal(400, "invalid-argument", "unparseable query string")
+            if len(segments) >= 2 and segments[0] == "api" and segments[1] == "v1":
+                error = self.dispatch_api(segments[2:], query, labels)
+            else:
+                error = self.dispatch_static(segments, labels)
+            labels["error"] = error
+        except RouteRefusal as refusal:
+            labels["error"] = self.respond_error(refusal.status, refusal.error, refusal.message)
+        except Exception:  # noqa: BLE001 - never leak internals to the wire
+            labels["error"] = self.respond_error(500, "internal", "unexpected gateway failure")
+        labels["status"] = getattr(self, "_response_status", None)
+        audit(labels)
+
+    def require_method(self, wanted):
+        self._allowed_methods = {wanted}
+        if self.command != wanted:
+            raise RouteRefusal(405, "method-not-allowed", "method is not allowed on this route")
+
+    def mutation_preamble(self, query, allowed_params):
+        self.check_origin()
+        reject_unknown_params(query, allowed_params)
+        return require_one(query, "requestId", ATOM_RE)
+
+    def dispatch_api(self, rest, query, labels):
+        """The closed API surface.  Every branch is one registry exec."""
+        if rest and rest[0] == "workflows":
+            if len(rest) == 1:
+                labels["route"] = "workflows"
+                self.require_method("GET")
+                reject_unknown_params(query, set())
+                return self.exec_registry(["list"])
+            if len(rest) == 2 and rest[1] == "start":
+                labels["route"] = "workflows/start"
+                self.require_method("POST")
+                request_id = self.mutation_preamble(query, {"requestId", "project", "planId"})
+                project = require_one(query, "project", ATOM_RE)
+                if project not in PROJECTS:
+                    raise RouteRefusal(400, "invalid-argument", "project is outside the closed set")
+                plan_id = require_one(query, "planId", ATOM_RE)
+                labels.update(requestId=request_id, project=project, planId=plan_id)
+                return self.exec_registry(
+                    ["start-conductor", project, plan_id, "--request-id", request_id]
+                )
+            workflow_id = rest[1]
+            if not WORKFLOW_RE.match(workflow_id):
+                raise RouteRefusal(400, "invalid-argument", "invalid workflowId")
+            labels["workflowId"] = workflow_id
+            if len(rest) == 2:
+                labels["route"] = "workflows/{wf}"
+                self.require_method("GET")
+                reject_unknown_params(query, set())
+                return self.exec_registry(["inspect", workflow_id])
+            if len(rest) == 3:
+                action = rest[2]
+                labels["route"] = "workflows/{wf}/" + action
+                if action == "wait":
+                    self.require_method("GET")
+                    reject_unknown_params(query, {"cursor", "timeout"})
+                    cursor = require_one(query, "cursor", CURSOR_RE)
+                    raw_timeout = optional_one(query, "timeout", NUMBER_RE)
+                    timeout = min(
+                        int(raw_timeout) if raw_timeout is not None else WAIT_CAP_SECONDS,
+                        WAIT_CAP_SECONDS,
+                    )
+                    return self.exec_registry(
+                        ["wait", workflow_id, "--cursor", cursor, "--timeout", str(timeout)]
+                    )
+                if action == "send":
+                    self.require_method("POST")
+                    request_id = self.mutation_preamble(query, {"requestId", "ackEvent"})
+                    ack_event = optional_one(query, "ackEvent", NUMBER_RE)
+                    labels["requestId"] = request_id
+                    return self.relay_send_with_prompt(workflow_id, request_id, ack_event)
+                if action == "cancel-pending":
+                    self.require_method("POST")
+                    request_id = self.mutation_preamble(query, {"requestId"})
+                    labels["requestId"] = request_id
+                    return self.exec_registry(
+                        ["send", workflow_id, "--request-id", request_id, "--cancel-pending"]
+                    )
+                if action in WORKFLOW_ACTIONS:
+                    operation = WORKFLOW_ACTIONS[action]
+                    self.require_method("POST")
+                    request_id = self.mutation_preamble(query, {"requestId"})
+                    labels["requestId"] = request_id
+                    return self.exec_registry(
+                        [operation, workflow_id, "--request-id", request_id]
+                    )
+            raise RouteRefusal(404, "not-found", "no such route")
+        if len(rest) == 3 and rest[0] == "mirror-jobs" and rest[2] == "cancel":
+            job_id = rest[1]
+            if not ATOM_RE.match(job_id):
+                raise RouteRefusal(400, "invalid-argument", "invalid jobId")
+            labels["route"] = "mirror-jobs/{job}/cancel"
+            labels["jobId"] = job_id
+            self.require_method("POST")
+            request_id = self.mutation_preamble(query, {"requestId"})
+            labels["requestId"] = request_id
+            return self.exec_registry(["mirror-cancel", job_id, "--request-id", request_id])
+        raise RouteRefusal(404, "not-found", "no such route")
+
+    def dispatch_static(self, segments, labels):
+        """Serve the explicit app-shell whitelist; 404 everything else."""
+        self.require_method("GET")
+        path_key = "/" + "/".join(segments)
+        labels["route"] = "static"
+        entry = STATIC_WHITELIST.get(path_key)
+        static_dir = CONFIG["static_dir"]
+        if entry is None or not static_dir:
+            raise RouteRefusal(404, "not-found", "no such route")
+        filename, content_type = entry
+        root = os.path.realpath(static_dir)
+        file_path = os.path.join(root, filename)
+        if (
+            os.path.islink(file_path)
+            or not os.path.isfile(file_path)
+            or not os.path.realpath(file_path).startswith(root + os.sep)
+        ):
+            raise RouteRefusal(404, "not-found", "no such route")
+        if os.path.getsize(file_path) > MAX_STATIC_BYTES:
+            raise RouteRefusal(404, "not-found", "no such route")
+        with open(file_path, "rb") as handle:
+            body = handle.read()
+        self.respond(200, body, content_type=content_type)
+        return None
+
+    def do_GET(self):
+        self.handle_request()
+
+    def do_POST(self):
+        self.handle_request()
+
+    def do_HEAD(self):
+        self.handle_request()
+
+    def do_DELETE(self):
+        self.handle_request()
+
+    def do_PUT(self):
+        self.handle_request()
+
+    def do_PATCH(self):
+        self.handle_request()
+
+
+def main(argv=None):
+    if sys.version_info < (3, 9):
+        print(
+            json.dumps({"ok": False, "error": "interpreter", "message": "python >= 3.9 required"}),
+            flush=True,
+        )
+        return 78
+    parser = argparse.ArgumentParser(prog="workflow-gateway", add_help=True)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("WORKFLOW_GATEWAY_PORT", "8484")),
+        help="loopback port to bind (0 chooses an ephemeral port)",
+    )
+    args = parser.parse_args(argv)
+    registry = CONFIG["registry"]
+    if not (os.path.isabs(registry) and os.path.isfile(registry) and os.access(registry, os.X_OK)):
+        print(
+            json.dumps(
+                {"ok": False, "error": "registry-missing", "message": "registry binary not found"}
+            ),
+            flush=True,
+        )
+        return 78
+
+    server = LoopbackHTTPServer(("127.0.0.1", args.port), GatewayHandler)
+    server.daemon_threads = True
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "event": "listening",
+                "host": "127.0.0.1",
+                "port": server.server_address[1],
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

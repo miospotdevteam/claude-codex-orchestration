@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "probedAt": "2026-07-12T00:03:19Z",
+  "canonicalCheckout": "/Users/robertobortolaso/Projects/orchestration",
+  "capabilityFloor": {
+    "bashDeniedMeansNoReadOnlyShell": true,
+    "note": "Bash is denied in every read-only mechanism; read-only chats have no shell."
+  },
+  "agents": {
+    "claude": {
+      "agent": "claude",
+      "status": "probed",
+      "skipReason": null,
+      "readOnly": {
+        "mechanism": "cli-permission",
+        "cliFlags": [
+          "--permission-mode",
+          "dontAsk",
+          "--tools",
+          "Write,Read"
+        ],
+        "flagAccepted": true,
+        "writeBlocked": true,
+        "available": true
+      },
+      "permissionSignal": {
+        "name": "permission_prompt",
+        "source": "stream-json Write tool_use + tool_result is_error (permission denial); notificationHook N/A (no-settings-edit)",
+        "probed": true,
+        "match": {
+          "stream": "stream-json",
+          "require": [
+            "Write tool_use",
+            "tool_result.is_error permission denial"
+          ],
+          "contentSubstring": "requested permissions|permission|denied",
+          "requireWriteAttempt": true,
+          "notificationHook": "not-applicable",
+          "notificationHookReason": "no-settings-edit invariant"
+        }
+      },
+      "evidence": {
+        "writeBlock": {
+          "rc": 0,
+          "flagAccepted": true,
+          "writeBlocked": true,
+          "scratch": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/claude-scratch.by3Z7X",
+          "detail": {
+            "attempted": true,
+            "denied": true,
+            "markerAbsent": true,
+            "flagPositiveEvidence": true,
+            "cwd": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/claude-scratch.by3Z7X"
+          }
+        },
+        "permissionSignal": {
+          "rc": 0,
+          "found": true,
+          "name": "permission_prompt",
+          "detail": {
+            "writeAttempt": true,
+            "toolResultPermissionPrompt": true,
+            "notificationHook": "not-applicable",
+            "notificationHookReason": "no-settings-edit invariant"
+          }
+        }
+      }
+    },
+    "codex": {
+      "agent": "codex",
+      "status": "probed",
+      "skipReason": null,
+      "readOnly": {
+        "mechanism": "cli-sandbox-refusal",
+        "cliFlags": [
+          "-s",
+          "read-only"
+        ],
+        "flagAccepted": true,
+        "writeBlocked": true,
+        "available": true
+      },
+      "permissionSignal": {
+        "name": "sandbox-refusal",
+        "source": "codex -s read-only CLI stderr (sandbox speaking, not model); JSON approval-request not required (option D)",
+        "probed": true,
+        "match": {
+          "stream": "stderr",
+          "require": [
+            "writing is blocked by read-only sandbox",
+            "patch rejected"
+          ],
+          "jsonApprovalRequest": "not-required",
+          "note": "sandbox refusal on stderr is the mechanical signal (option D)"
+        }
+      },
+      "evidence": {
+        "writeBlock": {
+          "rc": 0,
+          "flagAccepted": true,
+          "writeBlocked": true,
+          "scratch": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/codex-scratch.VfXl8E",
+          "detail": {
+            "attempted": true,
+            "denied": true,
+            "markerAbsent": true,
+            "flagPositiveEvidence": true
+          }
+        },
+        "permissionSignal": {
+          "rc": 0,
+          "found": true,
+          "name": "sandbox-refusal",
+          "detail": {
+            "sandboxRefusalObserved": true,
+            "jsonEventObserved": false,
+            "jsonApprovalRequestRequired": false,
+            "stderrProseSandbox": true,
+            "approvalPathObserved": true,
+            "observedStreamTypes": "item.completed,thread.started,turn.completed,turn.started",
+            "reusedWriteBlock": true,
+            "definitiveFinding": "sandbox refusal observed on CLI stderr under -s read-only (option D; sandbox speaking). jsonEventObserved=false reusedWriteBlock=true"
+          }
+        }
+      }
+    },
+    "grok": {
+      "agent": "grok",
+      "status": "probed",
+      "skipReason": null,
+      "readOnly": {
+        "mechanism": "disposable-checkout-copy",
+        "cliFlags": [
+          "--deny",
+          "Write",
+          "--deny",
+          "Edit",
+          "--deny",
+          "Bash"
+        ],
+        "flagAccepted": true,
+        "writeBlocked": true,
+        "available": true,
+        "cliFlagEnforcement": "unproven, defence-in-depth only"
+      },
+      "permissionSignal": {
+        "name": "typed-tool-events-absent",
+        "source": "control probe: streaming-json omits typed tool events even on successful write (justifies disposable-checkout-copy); hang signal not replayable",
+        "probed": false,
+        "match": {
+          "stream": "streaming-json",
+          "requireTypedWriteToolEvent": true,
+          "requirePolicyDenial": true,
+          "rejectAlone": [
+            "text",
+            "thought",
+            "assistant narration",
+            "unrelated tool",
+            "tool_result-only"
+          ],
+          "justifiesMechanism": "disposable-checkout-copy"
+        }
+      },
+      "evidence": {
+        "writeBlock": {
+          "rc": 0,
+          "flagAccepted": true,
+          "writeBlocked": true,
+          "scratch": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/grok-scratch.KjmpJC",
+          "detail": {
+            "attempted": false,
+            "denied": false,
+            "typedToolAttempt": false,
+            "markerAbsent": true,
+            "flagPositiveEvidence": true,
+            "observedStreamTypes": "end,text,thought",
+            "controlWrote": true,
+            "controlHasToolEvent": false,
+            "controlStreamTypes": "end,text,thought",
+            "definitiveFinding": "streaming-json omits typed tool events even when file-write succeeds under --always-approve (controlWrote=true, controlStreamTypes=end,text,thought); denied path only emits end,text,thought and markerAbsent=true — CLI-flag path untrusted; disposable-checkout-copy is the read-only mechanism",
+            "cliFlagPath": {
+              "trusted": false,
+              "writeBlocked": false,
+              "controlWrote": true,
+              "controlHasToolEvent": false,
+              "controlStreamTypes": "end,text,thought",
+              "note": "CLI --deny flags are defence-in-depth only; not the enforcement guarantee"
+            },
+            "disposableCopy": {
+              "writeInCopySucceeded": true,
+              "canonicalUntouched": true,
+              "realGrokWriteInCopy": true,
+              "cleanedUp": true,
+              "writer": "grok",
+              "copySource": "canonical-checkout",
+              "copyPath": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/disposable-copy.rlNbcj",
+              "canonicalCheckout": "/Users/robertobortolaso/Projects/orchestration",
+              "proofCanonicalPath": "/var/folders/7q/fx8j0hms5kb6hf5nbprpbv580000gn/T/tmp.ln0yBcLjSi/proof-canonical.R0RuX1",
+              "proofScope": "private-worktree-of-HEAD",
+              "marker": "PROBE_WRITE_ME.txt",
+              "trackedFileCount": 252,
+              "copyFailed": false,
+              "grokMissing": false,
+              "mechanism": "disposable-checkout-copy",
+              "canonicalProofMethod": "canonical-state-byte-identity",
+              "canonicalDiffSummary": null,
+              "error": null,
+              "proved": true
+            }
+          }
+        },
+        "permissionSignal": {
+          "rc": 0,
+          "found": false,
+          "name": "typed-tool-events-absent",
+          "detail": {
+            "typedToolAttempt": false,
+            "policyDenialObserved": false,
+            "signalFound": false,
+            "observedStreamTypes": "end,text,thought",
+            "definitiveFinding": "no write-named tool_call and/or no typed policy-denial event (observed=end,text,thought); streaming-json surface does not expose tool/permission events for responder replay when only thought/text/end are present"
+          }
+        }
+      }
+    }
+  }
+}

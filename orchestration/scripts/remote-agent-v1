@@ -17,8 +17,11 @@ valid_session() {
   case ${1:-} in
     remote-agent--miospot--claude|remote-agent--miospot--codex|remote-agent--miospot--grok|\
     remote-agent--orchestration--claude|remote-agent--orchestration--codex|remote-agent--orchestration--grok) return 0 ;;
-    *) return 1 ;;
   esac
+  # Chat writer atoms: closed project, literal chat slot, strict chatid of
+  # lowercase alphanumerics joined by single hyphens (1-63 bytes, anchored,
+  # so separators, whitespace, globs, and traversal never form a session).
+  [[ ${1:-} =~ ^remote-agent--(miospot|orchestration)--chat--[a-z0-9](-?[a-z0-9]){0,31}$ ]]
 }
 valid_relative_path() {
   case ${1:-} in ''|/*|../*|*/../*|*/..|..|*//*|*[$'\n\r']*) return 1 ;; *) return 0 ;; esac

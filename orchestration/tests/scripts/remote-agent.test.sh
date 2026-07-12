@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Behavior contract for scripts/remote-agent.sh. This test intentionally carries
-# a little more fixture machinery than the other shell suites: PATH, HOME, state,
-# the SSH transport, agent-supervisor, tmux, Git, hashing, and file transfer are
-# all private to each case. A missing helper is checked only after the fixture
-# proves that its fake transport works.
+# RED contract for scripts/remote-agent.sh after the desktop helper becomes a
+# stateless relay.  The Mini registry owns every workflow decision; this file
+# deliberately refuses to preserve the old client-side conductor/sync engine.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REMOTE_AGENT="$SCRIPT_DIR/../../scripts/remote-agent.sh"
-REAL_BASH=$(command -v bash)
-
 PASS_COUNT=0
 FAIL_COUNT=0
 SUITE=$(mktemp -d)
@@ -19,1176 +15,622 @@ trap 'rm -rf "$SUITE"' EXIT
 
 pass() { printf 'PASS %s\n' "$1"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { printf 'FAIL %s: %s\n' "$1" "$2"; FAIL_COUNT=$((FAIL_COUNT + 1)); }
-
 assert_contains() { grep -Fq -- "$2" "$1"; }
 assert_lacks() { ! grep -Fq -- "$2" "$1"; }
-assert_count() { [[ $(grep -Fc -- "$2" "$1" || true) -eq $3 ]]; }
-
-write_mock() {
-  local name=$1
-  cat >"$FAKE_BIN/$name"
-  chmod +x "$FAKE_BIN/$name"
-}
-
-seed_checkout() {
-  local root=$1 marker=${2:-}
-  mkdir -p "$root/.temp/plan-mode/active/selected"
-  printf 'tracked\n' >"$root/README.md"
-  printf 'untracked\n' >"$root/notes.txt"
-  if [[ -n $marker ]]; then
-    printf '%s\n' "$marker" >"$root/$marker-only.txt"
-  fi
-  printf '{}\n' >"$root/.temp/plan-mode/active/selected/plan.json"
-  printf '{}\n' >"$root/.temp/plan-mode/active/selected/progress.json"
-  printf '# plan\n' >"$root/.temp/plan-mode/active/selected/masterPlan.md"
-}
+assert_count() { [[ $(grep -Fc -- "$2" "$1" 2>/dev/null || true) -eq $3 ]]; }
 
 setup_case() {
   local name=$1
   CASE="$SUITE/$name"
-  TEST_HOME="$CASE/home"
-  TEST_STATE="$CASE/state"
-  LOCAL_ROOT="$CASE/local-project"
-  DECOY_ROOT="$CASE/decoy orchestration checkout"
-  REMOTE_ROOT="$CASE/remote-project"
-  REMOTE_HOME="$CASE/remote-home"
-  REMOTE_STATE="$CASE/remote-state"
-  REMOTE_BIN="$CASE/remote-bin"
+  HOME_DIR="$CASE/home"
+  STATE_DIR="$CASE/state"
+  CHECKOUT="$CASE/orchestration"
   FAKE_BIN="$CASE/bin"
-  COMMAND_LOG="$CASE/commands.log"
-  GIT_REF_LOG="$CASE/git-ref-operations.log"
-  GIT_STATUS_FILE="$CASE/git-status.nul"
+  SSH_LOG="$CASE/ssh.log"
   SSH_STDIN="$CASE/ssh.stdin"
   STDOUT="$CASE/stdout"
   STDERR="$CASE/stderr"
-  mkdir -p "$TEST_HOME" "$TEST_STATE" "$LOCAL_ROOT" "$DECOY_ROOT" "$REMOTE_ROOT" "$REMOTE_HOME" "$REMOTE_STATE" "$REMOTE_BIN" "$FAKE_BIN"
-  : >"$COMMAND_LOG"
-  : >"$GIT_REF_LOG"
-  : >"$GIT_STATUS_FILE"
+  MINI_STATE="$CASE/mini-state"
+  mkdir -p "$HOME_DIR" "$STATE_DIR" "$CHECKOUT" "$FAKE_BIN" "$MINI_STATE"
+  : >"$SSH_LOG"
   : >"$SSH_STDIN"
   : >"$STDOUT"
   : >"$STDERR"
+  printf 'mini-authority-sentinel\n' >"$MINI_STATE/authority"
+  printf '.env.local\n' >"$CHECKOUT/.gitignore"
+  printf 'tracked\n' >"$CHECKOUT/README.md"
+  printf 'ignored seed\n' >"$CHECKOUT/.env.local"
+  git -C "$CHECKOUT" init -q
+  git -C "$CHECKOUT" add .gitignore README.md
+  git -C "$CHECKOUT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
 
-  write_mock ssh <<'MOCK'
+  cat >"$FAKE_BIN/ssh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-: "${COMMAND_LOG:?}" "${SSH_STDIN:?}"
+: "${SSH_LOG:?}" "${SSH_STDIN:?}" "${MINI_STATE:?}"
 host=${1:-}
 shift || true
 remote_command=$*
-parsed_argv="${REMOTE_STATE:-${TMPDIR:-/tmp}}/fake-ssh-argv.$$.nul"
+parsed=$(mktemp "${TMPDIR:-/tmp}/relay-argv.XXXXXX")
 /bin/sh -c "set -- $remote_command
-printf '%s\\0' \"\$@\"" >"$parsed_argv"
-remote_arguments=()
-while IFS= read -r -d '' argument; do
-  remote_arguments+=("$argument")
-done <"$parsed_argv"
-rm -f "$parsed_argv"
-set -- "$host" "${remote_arguments[@]}"
-printf 'ssh' >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
+printf '%s\\0' \"\$@\"" >"$parsed"
+argv=()
+while IFS= read -r -d '' argument; do argv+=("$argument"); done <"$parsed"
+rm -f "$parsed"
+
+{
+  printf 'CALL\nARG\t%s\n' "$host"
+  for argument in "${argv[@]}"; do printf 'ARG\t%s\n' "$argument"; done
+  printf 'END\n'
+} >>"$SSH_LOG"
 cat >>"$SSH_STDIN"
 
-if [[ "${SUPERVISOR_STRICT:-0}" == 1 ]]; then
-  if [[ " $* " == *' agent-supervisor launch '* ]]; then
-    printf 'agent-supervisor: unsupported command launch\n' >&2
-    exit 64
+request_id=
+for ((i=0; i<${#argv[@]}; i++)); do
+  if [[ ${argv[$i]} == --request-id && $((i + 1)) -lt ${#argv[@]} ]]; then
+    request_id=${argv[$((i + 1))]}
   fi
-  if [[ " $* " == *' mini-agent '* ]]; then
-    printf 'mini-agent: command not found\n' >&2
-    exit 127
-  fi
+done
+
+# A read-only list is the only operation used by the client-close proof.  Any
+# additional Mini-side operation makes the fixture state observably different,
+# so a relay that tries to clean up remotely when its local client disappears
+# cannot pass by construction.
+operation=${argv[1]:-}
+if [[ $operation != list ]]; then
+  printf '%s\n' "$operation" >>"$MINI_STATE/transport-mutations"
 fi
 
-if [[ " $* " == *' agent-supervisor capture '* ]]; then
-  printf '%s\n' "${REMOTE_CAPTURE_OUTPUT:-bounded-capture}"
-  exit 0
-fi
-
-if [[ " $* " == *' agent-supervisor wait '* ]]; then
-  if [[ -n ${REMOTE_WAIT_OUTPUT:-} ]]; then
-    printf '%s\n' "$REMOTE_WAIT_OUTPUT"
-  else
-    printf '%s\n' '{"epoch":"epoch-1","cursor":1,"session":"remote-agent--miospot--claude","wake":"event","scope":"main","kind":"completed"}'
-  fi
-  exit 0
-fi
-
-if [[ " $* " == *' agent-supervisor start '* && -n ${REMOTE_SUPERVISOR_START_OUTPUT:-} ]]; then
-  printf '%s\n' "$REMOTE_SUPERVISOR_START_OUTPUT"
-  exit 0
-fi
-
-if [[ " $* " == *' agent-supervisor start '* && ${REMOTE_SUPERVISOR_START_FAIL:-0} -ne 0 ]]; then
-  printf 'agent-supervisor: injected start failure\n' >&2
-  exit "$REMOTE_SUPERVISOR_START_FAIL"
-fi
-
-if [[ " $* " == *' agent-supervisor status '* ]]; then
-  if [[ -n ${REMOTE_SUPERVISOR_STATUS_OUTPUT:-} ]]; then
-    printf '%s\n' "$REMOTE_SUPERVISOR_STATUS_OUTPUT"
-  elif [[ ${REMOTE_SCENARIO:-equal} == live-writer ]]; then
-    printf '%s\n' '{"session":"running","name":"remote-agent--miospot--claude","epoch":"epoch-1","cursor":0,"bootstrapCursor":"epoch-1:0"}'
-  else
-    printf '%s\n' '{"session":"absent","name":"remote-agent--miospot--claude"}'
-  fi
-  exit 0
-fi
-
-if [[ ${2:-} == remote-agent-v1 && ${3:-} == stage ]]; then
-  printf '{"stagePath":"%s/orchestration/remote-agent/projects/%s/stage"}\n' "$REMOTE_STATE" "$5"
-  exit 0
-fi
-
-case "${REMOTE_SCENARIO:-equal}" in
-  fixture-self-test) printf 'fixture-ok\n' ;;
-  no-session) printf '{"relation":"equal","writer":"none","generation":7}\n' ;;
-  live-writer) printf '{"relation":"equal","writer":"live","generation":7}\n' ;;
-  provisional-writer) printf '{"relation":"equal","writer":"provisional","lease":"provisional","generation":7}\n' ;;
-  equal-quiescent) printf '{"relation":"equal","writer":"quiescent","generation":7}\n' ;;
-  local-only-quiescent) printf '{"relation":"local-only","writer":"quiescent","generation":7}\n' ;;
-  unknown-writer) printf '{"relation":"equal","writer":"unexpected","generation":7}\n' ;;
-  local-only) printf '{"relation":"local-only","generation":7}\n' ;;
-  remote-only)
-    printf '{"relation":"remote-only","generation":7,"remoteBranch":"%s","remoteHead":"%s"}\n' \
-      "${REMOTE_GIT_BRANCH:-mini-work}" "${REMOTE_GIT_HEAD:-fedcba9876543210fedcba9876543210fedcba98}"
+case ${SSH_MODE:-success} in
+  success)
+    printf '{"ok":true,"requestId":"%s","status":"ok"}\n' "$request_id"
     ;;
-  diverged) printf '{"relation":"diverged","paths":["left.txt","right.txt"]}\n' ;;
-  post-mismatch) printf '{"relation":"mismatch","paths":["tampered.txt"],"generation":7}\n' ;;
-  lock-held) printf '{"mutex":"held","owner":"other-client:4321"}\n' ;;
-  cas-lost) printf '{"cas":"lost","expected":7,"actual":8}\n' ;;
-  apply-fails-restored) printf '{"apply":"failed","restore":"verified","generation":7}\n' ;;
-  apply-fails-recovery) printf '{"apply":"failed","restore":"failed","recoveryRequired":true,"generation":7}\n' ;;
-  apply-command-fails-restored)
-    if [[ " $* " == *' apply-exact '* ]]; then
-      printf '{"apply":"failed","restore":"verified","generation":7}\n'
-      exit 42
-    fi
-    printf '{"relation":"local-only","generation":7}\n'
+  queued)
+    printf '{"ok":true,"requestId":"%s","status":"queued"}\n' "$request_id"
     ;;
-  plan-mutated) printf '{"planSnapshot":"changed","path":"progress.json"}\n' ;;
-  *) printf '{"relation":"equal","writer":"none","generation":7}\n' ;;
-esac
-MOCK
-
-  write_mock rsync <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'rsync' >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
-[[ "${RSYNC_FAIL:-0}" == 0 ]]
-MOCK
-
-  for command in git tmux agent-supervisor mini-agent scp tar shasum sha256sum security; do
-    cat >"$FAKE_BIN/$command" <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-name=${0##*/}
-printf '%s cwd=<%s>' "$name" "$PWD" >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
-case "$name $*" in
-  'git rev-parse --show-toplevel')
-    [[ $PWD != "${MOCK_GIT_FAIL_ROOT:-}" ]] || exit 128
-    printf '%s\n' "${MOCK_GIT_TOPLEVEL_OVERRIDE:-$PWD}"
+  diagnostic-held)
+    printf '%s\n' '{"ok":true,"workflows":[{"project":"miospot","phase":"diagnostic-held"}]}'
     ;;
-  'git rev-parse --abbrev-ref HEAD') printf '%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
-  'git rev-parse HEAD') printf '%s\n' "${MOCK_GIT_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
-  'git symbolic-ref --quiet --short HEAD') printf '%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
-  'git symbolic-ref --quiet HEAD') printf 'refs/heads/%s\n' "${MOCK_GIT_BRANCH:-main}" ;;
-  'git status --porcelain=v1 -z') cat "$MOCK_GIT_STATUS_FILE" ;;
-  'git merge-base --is-ancestor '*) [[ ${MOCK_GIT_ANCESTOR:-1} == 1 ]] || exit 1 ;;
-  'git bundle create '*) : >"${3:?bundle destination}" ;;
-  'git bundle list-heads '*) printf '%s refs/heads/%s\n' "$REMOTE_GIT_HEAD" "$REMOTE_GIT_BRANCH" ;;
-  'git bundle verify '*) ;;
-  'git ls-files -z')
-    printf 'README.md\0src/app.ts\0'
-    case $PWD in
-      "${MOCK_MIOSPOT_ROOT:-/nonexistent}") printf 'miospot-only.txt\0' ;;
-      "${MOCK_ORCHESTRATION_ROOT:-/nonexistent}") printf 'orchestration-only.txt\0' ;;
-      "${MOCK_DECOY_ROOT:-/nonexistent}") printf 'decoy-only.txt\0' ;;
-    esac
-    [[ -z ${MOCK_SAFE_PATH:-} ]] || printf '%s\0' "$MOCK_SAFE_PATH"
+  queue-full)
+    printf '%s\n' '{"ok":false,"error":"queue-full","message":"one message is already pending"}'
+    exit 75
     ;;
-  'git ls-files --others --exclude-standard -z') printf 'notes.txt\0' ;;
-  'git check-ignore '*) [[ "${MOCK_IGNORED:-}" == *"${*: -1}"* ]] ;;
-  'shasum '*|'sha256sum '*)
-    case $PWD in
-      "${MOCK_MIOSPOT_ROOT:-/nonexistent}") digest=1111111111111111111111111111111111111111111111111111111111111111 ;;
-      "${MOCK_ORCHESTRATION_ROOT:-/nonexistent}") digest=2222222222222222222222222222222222222222222222222222222222222222 ;;
-      "${MOCK_DECOY_ROOT:-/nonexistent}") digest=3333333333333333333333333333333333333333333333333333333333333333 ;;
-      *) digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
-    esac
-    printf '%s  -\n' "$digest"
+  stale-ack)
+    printf '%s\n' '{"ok":false,"error":"stale-ack","message":"a newer input event is pending"}'
+    exit 65
     ;;
-esac
-
-case "$name ${1:-}" in
-  'git update-ref'|'git reset'|'git fetch'|'git checkout'|'git switch')
-    printf 'git' >>"$GIT_REF_LOG"
-    for argument in "$@"; do printf ' <%q>' "$argument" >>"$GIT_REF_LOG"; done
-    printf '\n' >>"$GIT_REF_LOG"
+  mini-offline)
+    printf 'ssh: connect to host fixture-mini: Connection refused\n' >&2
+    exit 255
     ;;
-  'git symbolic-ref')
-    if [[ ${2:-} != --quiet ]]; then
-      printf 'git' >>"$GIT_REF_LOG"
-      for argument in "$@"; do printf ' <%q>' "$argument" >>"$GIT_REF_LOG"; done
-      printf '\n' >>"$GIT_REF_LOG"
-    fi
+  *)
+    printf '%s\n' '{"ok":false,"error":"fixture-mode"}'
+    exit 70
     ;;
 esac
 MOCK
-    chmod +x "$FAKE_BIN/$command"
-  done
-
-  seed_checkout "$LOCAL_ROOT" miospot
-  seed_checkout "$DECOY_ROOT" decoy
+  chmod +x "$FAKE_BIN/ssh"
 }
 
 run_helper() {
-  local scenario=$1
-  local caller_root mapped_miospot_root mapped_orchestration_root
+  local mode=$1
   shift
-  caller_root=${CALLER_ROOT_OVERRIDE:-$LOCAL_ROOT}
-  mapped_miospot_root=${LOCAL_MIOSPOT_ROOT_OVERRIDE-$LOCAL_ROOT}
-  mapped_orchestration_root=${LOCAL_ORCHESTRATION_ROOT_OVERRIDE-$LOCAL_ROOT}
+  : >"$SSH_LOG"
+  : >"$SSH_STDIN"
+  : >"$STDOUT"
+  : >"$STDERR"
   set +e
-  (cd "$caller_root" && env -i \
-    HOME="$TEST_HOME" \
-    XDG_STATE_HOME="$TEST_STATE" \
+  env -i \
+    HOME="$HOME_DIR" \
+    XDG_STATE_HOME="$STATE_DIR" \
     PATH="$FAKE_BIN:/usr/bin:/bin" \
-    COMMAND_LOG="$COMMAND_LOG" \
-    GIT_REF_LOG="$GIT_REF_LOG" \
-    MOCK_GIT_STATUS_FILE="$GIT_STATUS_FILE" \
+    REMOTE_AGENT_HOST=fixture-mini \
+    LOCAL_MIOSPOT_ROOT="$CHECKOUT" \
+    LOCAL_ORCHESTRATION_ROOT="$CHECKOUT" \
+    SSH_LOG="$SSH_LOG" \
     SSH_STDIN="$SSH_STDIN" \
-    LOCAL_ROOT="${GENERIC_LOCAL_ROOT_OVERRIDE:-}" \
-    LOCAL_MIOSPOT_ROOT="$mapped_miospot_root" \
-    LOCAL_ORCHESTRATION_ROOT="$mapped_orchestration_root" \
-    MOCK_MIOSPOT_ROOT="$mapped_miospot_root" \
-    MOCK_ORCHESTRATION_ROOT="$mapped_orchestration_root" \
-    MOCK_DECOY_ROOT="$DECOY_ROOT" \
-    MOCK_GIT_FAIL_ROOT="${MOCK_GIT_FAIL_ROOT:-}" \
-    MOCK_GIT_TOPLEVEL_OVERRIDE="${MOCK_GIT_TOPLEVEL_OVERRIDE:-}" \
-    MOCK_GIT_BRANCH="${MOCK_GIT_BRANCH:-main}" \
-    MOCK_GIT_HEAD="${MOCK_GIT_HEAD:-0123456789abcdef0123456789abcdef01234567}" \
-    MOCK_GIT_ANCESTOR="${MOCK_GIT_ANCESTOR:-1}" \
-    REMOTE_ROOT="$REMOTE_ROOT" \
-    REMOTE_SCENARIO="$scenario" \
-    REMOTE_GIT_BRANCH="${REMOTE_GIT_BRANCH:-mini-work}" \
-    REMOTE_GIT_HEAD="${REMOTE_GIT_HEAD:-fedcba9876543210fedcba9876543210fedcba98}" \
-    REMOTE_AGENT_HOST="${REMOTE_AGENT_HOST_OVERRIDE:-fixture-mini}" \
-    MOCK_IGNORED="${MOCK_IGNORED:-}" \
-    MOCK_SAFE_PATH="${MOCK_SAFE_PATH:-}" \
-    RSYNC_FAIL="${RSYNC_FAIL:-0}" \
-    SUPERVISOR_STRICT="${SUPERVISOR_STRICT:-0}" \
-    REMOTE_CAPTURE_OUTPUT="${REMOTE_CAPTURE_OUTPUT:-}" \
-    REMOTE_WAIT_OUTPUT="${REMOTE_WAIT_OUTPUT:-}" \
-    REMOTE_SUPERVISOR_START_OUTPUT="${REMOTE_SUPERVISOR_START_OUTPUT:-}" \
-    REMOTE_SUPERVISOR_START_FAIL="${REMOTE_SUPERVISOR_START_FAIL:-0}" \
-    REMOTE_SUPERVISOR_STATUS_OUTPUT="${REMOTE_SUPERVISOR_STATUS_OUTPUT:-}" \
-    REMOTE_HOME="$REMOTE_HOME" \
-    REMOTE_STATE="$REMOTE_STATE" \
-    REMOTE_BIN="$REMOTE_BIN" \
-    REAL_PROTOCOL="$SCRIPT_DIR/../../scripts/remote-agent-v1" \
-    REAL_SUPERVISOR="$SCRIPT_DIR/../../scripts/agent-supervisor" \
-    "$REAL_BASH" "$REMOTE_AGENT" "$@" >"$STDOUT" 2>"$STDERR")
+    MINI_STATE="$MINI_STATE" \
+    SSH_MODE="$mode" \
+    "$REMOTE_AGENT" "$@" >"$STDOUT" 2>"$STDERR"
   STATUS=$?
   set -e
 }
 
-expect_success() {
-  local scenario=$1
-  shift
-  run_helper "$scenario" "$@"
-  [[ $STATUS -eq 0 ]]
+combined_output() { cat "$STDOUT" "$STDERR"; }
+
+registry_request_id() {
+  awk '$0 == "ARG\t--request-id" { getline; sub(/^ARG\t/, ""); print; exit }' "$SSH_LOG"
 }
 
-expect_failure() {
-  local scenario=$1
-  shift
-  run_helper "$scenario" "$@"
-  [[ $STATUS -ne 0 ]]
+assert_one_registry_op() {
+  local operation=$1
+  assert_count "$SSH_LOG" 'CALL' 1 || return 1
+  awk -F $'\t' '$1 == "ARG" && $2 ~ /(^|\/)workflow-registry$/ { found=1 } END { exit !found }' \
+    "$SSH_LOG" || return 1
+  assert_count "$SSH_LOG" $'ARG\t'"$operation" 1 || return 1
+  assert_lacks "$SSH_LOG" 'remote-agent-v1' || return 1
+  assert_lacks "$SSH_LOG" 'agent-supervisor' || return 1
+  assert_lacks "$SSH_LOG" 'run-codex-' || return 1
+  assert_lacks "$SSH_LOG" 'run-grok-'
+}
+
+test_registry_op_anchor_matches_tab_delimited_log() {
+  cat >"$SSH_LOG" <<'EOF'
+CALL
+ARG	/opt/orchestration/workflow-registry
+ARG	list
+END
+EOF
+  assert_one_registry_op list
+}
+
+assert_mutating_outcome() {
+  local request_id
+  request_id=$(registry_request_id)
+  [[ -n $request_id ]] || return 1
+  combined_output | grep -Fq -- "$request_id"
 }
 
 run_test() {
   local name=$1
   shift
   setup_case "test-$((PASS_COUNT + FAIL_COUNT + 1))"
-  if "$@"; then pass "$name"; else fail "$name" "status=$STATUS stdout=$(tr '\n' ' ' <"$STDOUT" 2>/dev/null || true) stderr=$(tr '\n' ' ' <"$STDERR" 2>/dev/null || true)"; fi
+  STATUS=0
+  if "$@"; then
+    pass "$name"
+  else
+    fail "$name" "status=$STATUS stdout=$(tr '\n' ' ' <"$STDOUT" 2>/dev/null || true) stderr=$(tr '\n' ' ' <"$STDERR" 2>/dev/null || true)"
+  fi
 }
 
-# The fixture self-test runs before the RED gate. It uses a non-production host
-# and demonstrates that command capture/stdin capture are functional.
-setup_case fixture-self-test
-REMOTE_SCENARIO=fixture-self-test COMMAND_LOG="$COMMAND_LOG" SSH_STDIN="$SSH_STDIN" \
-  "$FAKE_BIN/ssh" fixture-mini fixture-probe >"$STDOUT"
-if [[ $(<"$STDOUT") != fixture-ok ]] || ! assert_contains "$COMMAND_LOG" '<fixture-mini>'; then
-  fail 'hermetic fixture self-test' 'fake ssh did not execute correctly'
-  printf '%d tests passed, %d tests failed\n' "$PASS_COUNT" "$FAIL_COUNT"
-  exit 1
-fi
-pass 'hermetic fixture self-test'
-
-if [[ ! -x "$REMOTE_AGENT" ]]; then
-  fail 'remote-agent helper exists' "missing executable: $REMOTE_AGENT"
-  printf '%d tests passed, %d tests failed\n' "$PASS_COUNT" "$FAIL_COUNT"
-  exit 1
-fi
-
-test_validation() {
-  expect_failure equal || return 1
-  assert_contains "$STDERR" 'usage' || return 1
-  expect_failure equal dance miospot claude || return 1
-  expect_failure equal start other-project claude || return 1
-  expect_failure equal start miospot other-harness
-}
-
-test_closed_mapping_and_host_precedence() {
-  expect_success equal --host cli-mini status miospot || return 1
-  assert_contains "$COMMAND_LOG" '<cli-mini>' || return 1
-  : >"$COMMAND_LOG"
-  printf 'config-mini\n' >"$TEST_STATE/orchestration-remote-host"
-  REMOTE_AGENT_HOST_OVERRIDE=env-mini run_helper equal status miospot
+test_read_verb_maps_once() {
+  local verb=$1 operation=$2
+  shift 2
+  run_helper success "$verb" "$@"
   [[ $STATUS -eq 0 ]] || return 1
-  assert_contains "$COMMAND_LOG" '<env-mini>' || return 1
-  assert_lacks "$COMMAND_LOG" 'livingroom-mini'
+  assert_one_registry_op "$operation"
 }
 
-test_project_mapping_ignores_decoy_git_cwd() {
-  local miospot_root="$CASE/MioSpot checkout with spaces"
-  local orchestration_root="$CASE/orchestration checkout with spaces"
-  local escaped_miospot_root escaped_orchestration_root
-  seed_checkout "$miospot_root" miospot
-  seed_checkout "$orchestration_root" orchestration
-  printf -v escaped_miospot_root '%q' "$miospot_root/"
-  printf -v escaped_orchestration_root '%q' "$orchestration_root/"
-
-  CALLER_ROOT_OVERRIDE="$DECOY_ROOT" \
-    LOCAL_MIOSPOT_ROOT_OVERRIDE="$miospot_root" \
-    LOCAL_ORCHESTRATION_ROOT_OVERRIDE="$orchestration_root" \
-    GENERIC_LOCAL_ROOT_OVERRIDE="$DECOY_ROOT" \
-    expect_success local-only start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$miospot_root> <rev-parse> <--show-toplevel>" || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$miospot_root> <ls-files> <-z>" || return 1
-  assert_contains "$COMMAND_LOG" "sha256sum cwd=<$miospot_root>" || return 1
-  assert_contains "$COMMAND_LOG" '<miospot-only.txt>' || return 1
-  assert_contains "$COMMAND_LOG" '1111111111111111111111111111111111111111111111111111111111111111' || return 1
-  assert_contains "$COMMAND_LOG" "<$escaped_miospot_root>" || return 1
-  assert_lacks "$COMMAND_LOG" "cwd=<$DECOY_ROOT>" || return 1
-  assert_lacks "$COMMAND_LOG" "<$DECOY_ROOT/>" || return 1
-
-  : >"$COMMAND_LOG"
-  CALLER_ROOT_OVERRIDE="$miospot_root" \
-    LOCAL_MIOSPOT_ROOT_OVERRIDE="$miospot_root" \
-    LOCAL_ORCHESTRATION_ROOT_OVERRIDE="$orchestration_root" \
-    GENERIC_LOCAL_ROOT_OVERRIDE="$miospot_root" \
-    expect_success local-only start orchestration grok || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$orchestration_root> <rev-parse> <--show-toplevel>" || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$orchestration_root> <ls-files> <-z>" || return 1
-  assert_contains "$COMMAND_LOG" "sha256sum cwd=<$orchestration_root>" || return 1
-  assert_contains "$COMMAND_LOG" '<orchestration-only.txt>' || return 1
-  assert_contains "$COMMAND_LOG" '2222222222222222222222222222222222222222222222222222222222222222' || return 1
-  assert_contains "$COMMAND_LOG" "<$escaped_orchestration_root>" || return 1
-  assert_lacks "$COMMAND_LOG" "cwd=<$miospot_root>" || return 1
-  assert_lacks "$COMMAND_LOG" "<$miospot_root/>"
+test_mutating_verb_maps_once() {
+  local verb=$1 operation=$2
+  shift 2
+  run_helper success "$verb" "$@"
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op "$operation" || return 1
+  assert_mutating_outcome
 }
 
-test_project_mapping_defaults_and_rejects_invalid_roots() {
-  local default_miospot="$TEST_HOME/Projects/miospot"
-  local default_orchestration="$TEST_HOME/Projects/orchestration"
-  local valid_root="$CASE/valid checkout"
-  local symlink_root="$CASE/symlink checkout"
-  local non_git_root="$CASE/non Git checkout"
-  local git_parent="$CASE/parent checkout"
-  local nested_root="$git_parent/nested"
-  seed_checkout "$default_miospot" miospot
-  seed_checkout "$default_orchestration" orchestration
-  seed_checkout "$valid_root" miospot
-  seed_checkout "$non_git_root" miospot
-  seed_checkout "$nested_root" miospot
-  ln -s "$valid_root" "$symlink_root"
-
-  LOCAL_MIOSPOT_ROOT_OVERRIDE='' CALLER_ROOT_OVERRIDE="$DECOY_ROOT" \
-    expect_success equal status miospot claude || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$default_miospot> <rev-parse> <--show-toplevel>" || return 1
-  : >"$COMMAND_LOG"
-  LOCAL_ORCHESTRATION_ROOT_OVERRIDE='' CALLER_ROOT_OVERRIDE="$DECOY_ROOT" \
-    expect_success equal status orchestration claude || return 1
-  assert_contains "$COMMAND_LOG" "git cwd=<$default_orchestration> <rev-parse> <--show-toplevel>" || return 1
-
-  : >"$COMMAND_LOG"
-  LOCAL_MIOSPOT_ROOT_OVERRIDE="$symlink_root" expect_failure equal status miospot claude || return 1
-  assert_contains "$STDERR" 'real directory' || return 1
-  assert_lacks "$COMMAND_LOG" 'ssh' || return 1
-
-  : >"$COMMAND_LOG"
-  LOCAL_MIOSPOT_ROOT_OVERRIDE="$non_git_root" MOCK_GIT_FAIL_ROOT="$non_git_root" \
-    expect_failure equal status miospot claude || return 1
-  assert_contains "$STDERR" 'Git worktree' || return 1
-  assert_lacks "$COMMAND_LOG" 'ssh' || return 1
-
-  : >"$COMMAND_LOG"
-  LOCAL_MIOSPOT_ROOT_OVERRIDE="$nested_root" MOCK_GIT_TOPLEVEL_OVERRIDE="$git_parent" \
-    expect_failure equal status miospot claude || return 1
-  assert_contains "$STDERR" 'Git toplevel' || return 1
-  assert_lacks "$COMMAND_LOG" 'ssh'
+test_sync_cancel_maps_to_mirror_cancel() {
+  run_helper success sync wf-miospot-20260711T151201Z-9f3c --cancel job-17
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op mirror-cancel || return 1
+  assert_mutating_outcome
 }
 
-test_relative_prompt_file_is_independent_of_mapped_root() {
-  local miospot_root="$CASE/mapped checkout"
-  local prompt_name='prompt outside mapped checkout.txt'
-  local secret='MAPPED-ROOT-PROMPT-STDIN-CANARY'
-  seed_checkout "$miospot_root" miospot
-  printf '%s\n' "$secret" >"$DECOY_ROOT/$prompt_name"
-
-  CALLER_ROOT_OVERRIDE="$DECOY_ROOT" LOCAL_MIOSPOT_ROOT_OVERRIDE="$miospot_root" \
-    expect_success equal start miospot claude --prompt-file "$prompt_name" || return 1
-  assert_contains "$SSH_STDIN" "$secret" || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
-  assert_lacks "$STDOUT" "$secret" || return 1
-  assert_lacks "$STDERR" "$secret"
+test_request_id_reuse_is_exact() {
+  local wanted=req-relay-retry-0001 actual
+  printf 'retry payload\n' >"$CASE/prompt"
+  run_helper success send wf-miospot-20260711T151201Z-9f3c \
+    --prompt-file "$CASE/prompt" --request-id "$wanted"
+  [[ $STATUS -eq 0 ]] || return 1
+  actual=$(registry_request_id)
+  [[ $actual == "$wanted" ]] || return 1
+  assert_contains "$STDOUT" "$wanted"
 }
 
-test_hostile_argv_is_data() {
-  local marker="$CASE/PWNED"
-  expect_failure equal --host 'mini; touch PWNED' start '../miospot' "claude\$(touch PWNED)" || return 1
-  [[ ! -e "$marker" ]] || return 1
-  assert_lacks "$COMMAND_LOG" 'touch PWNED'
-}
-
-test_exact_sessions() {
-  expect_success equal status miospot || return 1
-  assert_contains "$COMMAND_LOG" 'remote-agent--miospot--claude' || return 1
-  assert_lacks "$COMMAND_LOG" 'persistence-demo'
-}
-
-test_inspect_captures_without_sync() {
-  expect_success live-writer inspect miospot claude || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <capture> <remote-agent--miospot--claude>' || return 1
-  assert_lacks "$COMMAND_LOG" '<remote-agent-v1> <capture>' || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync'
-}
-
-test_inspect_capture_is_visible() {
-  REMOTE_CAPTURE_OUTPUT='VISIBLE-CAPTURE-LINE' expect_success live-writer inspect miospot claude || return 1
-  assert_contains "$STDOUT" 'VISIBLE-CAPTURE-LINE' || return 1
-  [[ $(wc -l <"$STDOUT" | tr -d ' ') -le 40 ]] || return 1
-  [[ $(wc -c <"$STDOUT" | tr -d ' ') -le 4096 ]]
-}
-
-test_continue_captures_before_send() {
-  printf 'continue after checking state\n' >"$CASE/prompt"
-  expect_success live-writer continue miospot claude --prompt-file "$CASE/prompt" || return 1
-  local capture_line send_line
-  capture_line=$(grep -n 'capture' "$COMMAND_LOG" | head -1 | cut -d: -f1)
-  send_line=$(grep -n 'send' "$COMMAND_LOG" | head -1 | cut -d: -f1)
-  [[ -n "$capture_line" && -n "$send_line" && $capture_line -lt $send_line ]] || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync'
-}
-
-test_wait_requires_a_bounded_cursor_and_timeout() {
-  expect_failure equal wait miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" '<agent-supervisor> <wait>' || return 1
-  expect_failure equal wait miospot claude --cursor 'epoch-1:0;touch-pwned' --timeout 30 || return 1
-  assert_lacks "$COMMAND_LOG" 'touch-pwned' || return 1
-  expect_failure equal wait miospot claude --cursor epoch-1:0 --timeout 0 || return 1
-  expect_failure equal wait miospot claude --cursor epoch-1:0 --timeout 301 || return 1
-  expect_failure equal wait miospot claude --cursor epoch-1:0 --timeout not-a-number
-}
-
-test_wait_delegates_exact_sessions_for_every_harness() {
-  local harness session
-  for harness in claude codex grok; do
-    session="remote-agent--orchestration--$harness"
-    : >"$COMMAND_LOG"
-    REMOTE_WAIT_OUTPUT="{\"epoch\":\"epoch-7\",\"cursor\":42,\"session\":\"$session\",\"wake\":\"timeout\"}" \
-      expect_success equal wait orchestration "$harness" --cursor epoch-7:41 --timeout 30 || return 1
-    assert_contains "$COMMAND_LOG" "<agent-supervisor> <wait> <$session> <epoch-7:41> <30>" || return 1
-    assert_count "$COMMAND_LOG" '<agent-supervisor> <wait>' 1 || return 1
-    assert_lacks "$COMMAND_LOG" '<remote-agent-v1>' || return 1
-    assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-    assert_lacks "$COMMAND_LOG" 'git <' || return 1
-    assert_contains "$STDOUT" '"wake":"timeout"' || return 1
-    assert_contains "$STDOUT" "\"session\":\"$session\"" || return 1
-  done
-}
-
-test_wait_surfaces_timeout_exit_and_event_wakes() {
-  local wake payload
-  for wake in timeout exit event; do
-    case $wake in
-      timeout) payload='{"epoch":"epoch-8","cursor":8,"session":"remote-agent--miospot--claude","wake":"timeout"}' ;;
-      exit) payload='{"epoch":"epoch-8","cursor":9,"session":"remote-agent--miospot--claude","wake":"exit"}' ;;
-      event) payload='{"epoch":"epoch-8","cursor":10,"session":"remote-agent--miospot--claude","wake":"event","scope":"subagent","kind":"completed"}' ;;
-    esac
-    : >"$COMMAND_LOG"
-    REMOTE_WAIT_OUTPUT="$payload" expect_success equal wait miospot claude --cursor epoch-8:7 --timeout 1 || return 1
-    assert_contains "$STDOUT" "\"wake\":\"$wake\"" || return 1
-    assert_contains "$STDOUT" '"epoch":"epoch-8"' || return 1
-    assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-    assert_lacks "$COMMAND_LOG" 'lease-' || return 1
-    if [[ $wake == exit ]]; then
-      assert_contains "$COMMAND_LOG" '<remote-agent-v1> <mutex-acquire>' || return 1
-      assert_contains "$COMMAND_LOG" '<agent-supervisor> <status> <remote-agent--miospot--claude>' || return 1
-      assert_contains "$COMMAND_LOG" '<remote-agent-v1> <quiescent> <remote-agent--miospot--claude> <authority-root-v1>' || return 1
-      assert_contains "$COMMAND_LOG" '<remote-agent-v1> <mutex-release>' || return 1
-    else
-      assert_lacks "$COMMAND_LOG" 'mutex-' || return 1
-      assert_lacks "$COMMAND_LOG" '<quiescent>' || return 1
-    fi
-  done
-}
-
-test_wait_exit_recheck_refuses_a_restarted_session() {
-  local session=remote-agent--miospot--claude
-  REMOTE_WAIT_OUTPUT="{\"epoch\":\"epoch-8\",\"cursor\":9,\"session\":\"$session\",\"wake\":\"exit\"}" \
-    REMOTE_SUPERVISOR_STATUS_OUTPUT="{\"session\":\"running\",\"name\":\"$session\",\"epoch\":\"epoch-9\",\"cursor\":0,\"bootstrapCursor\":\"epoch-9:0\"}" \
-    expect_failure equal wait miospot claude --cursor epoch-8:7 --timeout 1 || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <status>' || return 1
-  assert_lacks "$COMMAND_LOG" '<quiescent>' || return 1
-  assert_contains "$COMMAND_LOG" '<remote-agent-v1> <mutex-release>'
-}
-
-test_wait_preserves_monotonic_restart_aware_cursors() {
-  REMOTE_WAIT_OUTPUT='{"epoch":"epoch-12","cursor":100,"session":"remote-agent--miospot--claude","wake":"event","scope":"main","kind":"completed"}' \
-    expect_success equal wait miospot claude --cursor epoch-12:99 --timeout 20 || return 1
-  assert_contains "$STDOUT" '"cursor":100' || return 1
-  : >"$COMMAND_LOG"
-  REMOTE_WAIT_OUTPUT='{"epoch":"epoch-12","cursor":101,"session":"remote-agent--miospot--claude","wake":"event","scope":"main","kind":"failed"}' \
-    expect_success equal wait miospot claude --cursor epoch-12:100 --timeout 20 || return 1
-  assert_contains "$COMMAND_LOG" '<epoch-12:100>' || return 1
-  assert_contains "$STDOUT" '"cursor":101' || return 1
-  : >"$COMMAND_LOG"
-  REMOTE_WAIT_OUTPUT='{"epoch":"epoch-13","cursor":0,"session":"remote-agent--miospot--claude","wake":"timeout"}' \
-    expect_success equal wait miospot claude --cursor epoch-12:101 --timeout 20 || return 1
-  assert_contains "$COMMAND_LOG" '<epoch-12:101>' || return 1
-  assert_contains "$STDOUT" '"epoch":"epoch-13"'
-}
-
-test_start_and_status_expose_direct_wait_bootstrap_without_leakage() {
-  local session=remote-agent--miospot--claude
-  local bootstrap_file=$CASE/bootstrap.json bootstrap canary='PANE-EVENT-CANARY-8013'
-  REMOTE_SUPERVISOR_START_OUTPUT="{\"session\":\"running\",\"name\":\"$session\",\"epoch\":\"epoch-start-1\",\"cursor\":7,\"bootstrapCursor\":\"epoch-start-1:7\"}" \
-    REMOTE_CAPTURE_OUTPUT="$canary" expect_success equal start miospot claude || return 1
-  cp "$STDOUT" "$bootstrap_file"
-  bootstrap=$(sed -n 's/.*"bootstrapCursor":"\([^"]*\)".*/\1/p' "$bootstrap_file")
-  [[ $bootstrap == epoch-start-1:7 ]] || return 1
-  [[ $(wc -l <"$bootstrap_file" | tr -d ' ') -eq 1 ]] || return 1
-  [[ $(wc -c <"$bootstrap_file" | tr -d ' ') -le 4096 ]] || return 1
-  assert_lacks "$bootstrap_file" "$canary" || return 1
-  assert_lacks "$bootstrap_file" '"authority"' || return 1
-  assert_lacks "$bootstrap_file" '"scope"' || return 1
-  assert_lacks "$bootstrap_file" '"kind"' || return 1
-
-  : >"$COMMAND_LOG"
-  REMOTE_WAIT_OUTPUT="{\"epoch\":\"epoch-start-1\",\"cursor\":7,\"session\":\"$session\",\"wake\":\"timeout\"}" \
-    expect_success equal wait miospot claude --cursor "$bootstrap" --timeout 1 || return 1
-  assert_contains "$COMMAND_LOG" "<agent-supervisor> <wait> <$session> <$bootstrap> <1>" || return 1
-  assert_lacks "$COMMAND_LOG" '<remote-agent-v1>' || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-
-  REMOTE_SUPERVISOR_STATUS_OUTPUT="{\"session\":\"running\",\"name\":\"$session\",\"epoch\":\"epoch-restart-2\",\"cursor\":7,\"bootstrapCursor\":\"epoch-restart-2:7\"}" \
-    REMOTE_CAPTURE_OUTPUT="$canary" expect_success live-writer status miospot claude || return 1
-  [[ $(wc -l <"$STDOUT" | tr -d ' ') -eq 1 ]] || return 1
-  assert_contains "$STDOUT" '{"authority":{"relation":"equal","writer":"live","generation":7},"supervisor":{"session":"running"' || return 1
-  assert_contains "$STDOUT" '"bootstrapCursor":"epoch-restart-2:7"' || return 1
-  assert_lacks "$STDOUT" "$canary" || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync'
-}
-
-test_wait_capture_is_visible_bounded_and_not_persisted_locally() {
-  local capture=$CASE/wake-output
-  {
-    printf '%s\n' '{"epoch":"epoch-4","cursor":5,"session":"remote-agent--miospot--claude","wake":"event","scope":"main","kind":"completed"}'
-    for index in $(seq 81 120); do printf 'wake-capture-%03d zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n' "$index"; done
-  } >"$capture"
-  REMOTE_WAIT_OUTPUT="$(<"$capture")" expect_success equal wait miospot claude --cursor epoch-4:4 --timeout 20 || return 1
-  [[ $(wc -l <"$STDOUT" | tr -d ' ') -le 41 ]] || return 1
-  [[ $(wc -c <"$STDOUT" | tr -d ' ') -le 4096 ]] || return 1
-  assert_contains "$STDOUT" 'wake-capture-120' || return 1
-  assert_lacks "$COMMAND_LOG" 'wake-capture-' || return 1
-  ! grep -R -Fq -- 'wake-capture-120' "$TEST_HOME" "$TEST_STATE"
-}
-
-test_reveal_delegates_exact_terminal_attachment_without_mutation() {
-  local harness session secret='REVEAL-PROMPT-CANARY-8842'
-  printf '%s\n' "$secret" >"$CASE/prompt"
-  for harness in claude codex grok; do
-    session="remote-agent--miospot--$harness"
-    : >"$COMMAND_LOG"
-    expect_success equal reveal miospot "$harness" || return 1
-    assert_contains "$COMMAND_LOG" "<agent-supervisor> <reveal> <$session>" || return 1
-    assert_count "$COMMAND_LOG" '<agent-supervisor> <reveal>' 1 || return 1
-    assert_lacks "$COMMAND_LOG" "$secret" || return 1
-    assert_lacks "$STDOUT" "$secret" || return 1
-    assert_lacks "$STDERR" "$secret" || return 1
-    assert_lacks "$COMMAND_LOG" '<remote-agent-v1>' || return 1
-    assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-    assert_lacks "$COMMAND_LOG" '<start>' || return 1
-    assert_lacks "$COMMAND_LOG" '<send>' || return 1
-    assert_lacks "$COMMAND_LOG" '<kill>' || return 1
-    assert_lacks "$COMMAND_LOG" '<interrupt>' || return 1
-    assert_lacks "$COMMAND_LOG" 'new-session' || return 1
-    assert_lacks "$COMMAND_LOG" 'respawn-pane' || return 1
-    assert_lacks "$COMMAND_LOG" 'kill-pane' || return 1
-  done
-  : >"$COMMAND_LOG"
-  expect_failure equal reveal miospot claude --prompt-file "$CASE/prompt" || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
-  assert_lacks "$COMMAND_LOG" '<agent-supervisor> <reveal>'
-}
-
-test_prompt_is_bounded_and_redacted() {
-  local secret='CANARY-secret-42'
-  printf '%s\n' "$secret" >"$CASE/prompt"
-  expect_success live-writer send miospot claude --prompt-file "$CASE/prompt" || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
-  assert_lacks "$STDOUT" "$secret" || return 1
-  assert_lacks "$STDERR" "$secret" || return 1
-  assert_contains "$SSH_STDIN" "$secret" || return 1
-  : >"$COMMAND_LOG"
-  printf '%65537s' '' >"$CASE/oversized-prompt"
-  expect_failure live-writer send miospot claude --prompt-file "$CASE/oversized-prompt" || return 1
-  assert_lacks "$COMMAND_LOG" 'ssh'
-}
-
-test_control_lifecycle() {
-  expect_success live-writer interrupt miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'interrupt' || return 1
-  : >"$COMMAND_LOG"
-  expect_success live-writer kill miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'kill' || return 1
-  assert_contains "$COMMAND_LOG" 'quiescent'
-}
-
-test_start_local_only_transfer() {
-  expect_success local-only start miospot codex || return 1
-  assert_contains "$COMMAND_LOG" 'mutex-acquire' || return 1
-  assert_contains "$COMMAND_LOG" 'stage' || return 1
-  assert_contains "$COMMAND_LOG" 'restore-journal' || return 1
-  assert_contains "$COMMAND_LOG" 'lease-commit' || return 1
-  [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]] || return 1
-  assert_lacks "$COMMAND_LOG" "$REMOTE_ROOT/.remote-agent-stage/" || return 1
-  assert_contains "$COMMAND_LOG" 'remote-agent--miospot--codex'
-  local apply_line baseline_line provisional_line
-  apply_line=$(grep -n 'apply-exact' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  baseline_line=$(grep -n 'post-sync-verify' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  provisional_line=$(grep -n 'lease-provisional' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  [[ -n $apply_line && -n $baseline_line && -n $provisional_line ]] || return 1
-  [[ $apply_line -lt $baseline_line && $baseline_line -lt $provisional_line ]]
-}
-
-test_start_accepts_optional_prompt() {
-  local secret='START-PROMPT-CANARY'
-  printf '%s\n' "$secret" >"$CASE/prompt"
-  expect_success equal start miospot claude --prompt-file "$CASE/prompt" || return 1
-  local commit_line send_line
-  commit_line=$(grep -n 'lease-commit' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  send_line=$(grep -n 'agent-supervisor.*send' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  [[ -n "$commit_line" && -n "$send_line" && $commit_line -lt $send_line ]] || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
-  assert_contains "$SSH_STDIN" "$secret"
-}
-
-test_supervisor_rejects_legacy_launch_verb() {
-  SUPERVISOR_STRICT=1 expect_success equal start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <start>' || return 1
-  assert_lacks "$COMMAND_LOG" '<agent-supervisor> <launch>'
-}
-
-test_codex_uses_shared_supervisor() {
-  SUPERVISOR_STRICT=1 expect_success equal start miospot codex || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <start>' || return 1
-  assert_lacks "$COMMAND_LOG" 'mini-agent'
-}
-
-test_start_forwards_yolo_exactly() {
-  expect_success equal start orchestration grok || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <start> <remote-agent--orchestration--grok> <grok>' || return 1
-  assert_contains "$COMMAND_LOG" '<project-root-v1:orchestration>' || return 1
-  assert_count "$COMMAND_LOG" '<--yolo>' 1
-}
-
-test_failed_supervisor_start_aborts_provisional_lease() {
-  REMOTE_SUPERVISOR_START_FAIL=47 run_helper equal start miospot claude
-  [[ $STATUS -eq 47 ]] || return 1
-  local provisional_line start_line abort_line release_line
-  provisional_line=$(grep -n 'lease-provisional' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  start_line=$(grep -n 'agent-supervisor.*start' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  abort_line=$(grep -n 'lease-abort' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  release_line=$(grep -n 'mutex-release' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  [[ -n $provisional_line && -n $start_line && -n $abort_line && -n $release_line ]] || return 1
-  [[ $provisional_line -lt $start_line && $start_line -lt $abort_line && $abort_line -lt $release_line ]] || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit'
-}
-
-test_supervisor_prompt_transport_is_stdin_only() {
-  local secret='HELPER-STDIN-ONLY-CANARY'
-  printf '%s\n' "$secret" >"$CASE/prompt"
-  expect_success live-writer send miospot grok --prompt-file "$CASE/prompt" || return 1
-  assert_contains "$COMMAND_LOG" '<agent-supervisor> <send> <remote-agent--miospot--grok>' || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
-  assert_lacks "$STDOUT" "$secret" || return 1
-  assert_lacks "$STDERR" "$secret" || return 1
-  assert_contains "$SSH_STDIN" "$secret"
-}
-
-test_start_refuses_live_writer_and_divergence() {
-  expect_failure live-writer start miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-  : >"$COMMAND_LOG"
-  expect_failure diverged start miospot claude || return 1
-  assert_contains "$STDERR" 'left.txt' || return 1
-  assert_contains "$STDERR" 'right.txt'
-}
-
-test_first_contact_rules() {
-  expect_success equal start orchestration grok || return 1
-  assert_contains "$COMMAND_LOG" 'adopt' || return 1
-  : >"$COMMAND_LOG"
-  expect_failure live-writer start orchestration grok || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit'
-}
-
-test_snapshot_is_strong_and_nul_safe() {
-  expect_success equal status miospot || return 1
-  assert_contains "$COMMAND_LOG" 'rev-parse' || return 1
-  assert_contains "$COMMAND_LOG" 'ls-files' || return 1
-  assert_contains "$COMMAND_LOG" 'sha256' || return 1
-  assert_contains "$COMMAND_LOG" 'manifest-nul' || return 1
-  assert_lacks "$COMMAND_LOG" '--ignore-times'
-}
-
-test_divergence_matrix() {
-  expect_success equal start miospot claude || return 1
-  : >"$COMMAND_LOG"
-  expect_success local-only start miospot claude || return 1
-  : >"$COMMAND_LOG"
-  expect_failure remote-only start miospot claude || return 1
-  : >"$COMMAND_LOG"
-  expect_failure diverged reclaim miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-release'
-}
-
-test_remote_lease_mutex_and_cas() {
-  expect_failure lock-held start miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" 'mutex-break' || return 1
-  : >"$COMMAND_LOG"
-  expect_failure cas-lost start miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit' || return 1
-  assert_contains "$COMMAND_LOG" '<fixture-mini>'
-}
-
-test_writer_records_fail_closed_without_stale_inference() {
-  expect_failure provisional-writer start miospot claude || return 1
-  assert_contains "$STDERR" 'active' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-provisional' || return 1
-  : >"$COMMAND_LOG"
-  expect_failure equal-quiescent start miospot claude || return 1
-  assert_contains "$STDERR" 'safe reclaim' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-provisional' || return 1
-  : >"$COMMAND_LOG"
-  expect_failure unknown-writer start miospot claude || return 1
-  assert_contains "$STDERR" 'unrecognized active' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-provisional' || return 1
-  assert_lacks "$REMOTE_AGENT" 'heartbeat' || return 1
-  assert_lacks "$REMOTE_AGENT" 'kill -0'
-}
-
-test_transfer_universe_and_deletions() {
-  expect_success local-only start miospot claude --active-plan selected || return 1
-  assert_contains "$COMMAND_LOG" 'README.md' || return 1
-  assert_contains "$COMMAND_LOG" 'notes.txt' || return 1
-  assert_contains "$COMMAND_LOG" 'plan.json' || return 1
-  assert_contains "$COMMAND_LOG" 'progress.json' || return 1
-  assert_contains "$COMMAND_LOG" 'masterPlan.md' || return 1
-  assert_contains "$COMMAND_LOG" 'deletion-inventory' || return 1
-  for excluded in '.git' 'node_modules' '.env' 'logs' 'panel' 'stdout'; do
-    assert_lacks "$COMMAND_LOG" "$excluded" || return 1
-  done
-}
-
-test_ignored_paths_need_exact_consent() {
-  MOCK_IGNORED='.env.local' expect_failure local-only start miospot claude --include-ignored '.env*' || return 1
-  : >"$COMMAND_LOG"
-  MOCK_IGNORED='.env.local' expect_success local-only start miospot claude --include-ignored '.env.local' --approve-ignored '.env.local' || return 1
-  assert_contains "$COMMAND_LOG" '.env.local'
-}
-
-test_active_plan_is_bounded_and_stable() {
-  expect_failure plan-mutated start orchestration claude --active-plan selected || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit' || return 1
-  assert_lacks "$COMMAND_LOG" 'resolved' || return 1
-  assert_lacks "$COMMAND_LOG" 'raw-output'
-}
-
-test_private_staging_and_restore_journal() {
-  expect_success local-only start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'umask 077' || return 1
-  assert_contains "$COMMAND_LOG" 'stage-verify' || return 1
-  assert_contains "$COMMAND_LOG" 'restore-journal' || return 1
-  assert_contains "$COMMAND_LOG" 'mode=0600' || return 1
-  assert_contains "$COMMAND_LOG" 'apply-exact'
-}
-
-test_network_staging_failure_stops_before_apply() {
-  RSYNC_FAIL=1 expect_failure local-only start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'rsync' || return 1
-  assert_lacks "$COMMAND_LOG" 'stage-verify' || return 1
-  assert_lacks "$COMMAND_LOG" 'apply-exact' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-provisional' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit' || return 1
-  assert_lacks "$COMMAND_LOG" 'recovery-required' || return 1
-  assert_contains "$COMMAND_LOG" 'mutex-release'
-}
-
-test_failed_apply_restores_before_state_change() {
-  expect_failure apply-fails-restored start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'restore-verify' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit' || return 1
-  assert_contains "$STDERR" 'restored'
-}
-
-test_nonzero_apply_status_restores_before_state_change() {
-  expect_failure apply-command-fails-restored start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'restore-verify' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit' || return 1
-  assert_contains "$STDERR" 'restored'
-}
-
-test_failed_restore_preserves_recovery_evidence() {
-  expect_failure apply-fails-recovery start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" 'recovery-required' || return 1
-  assert_lacks "$COMMAND_LOG" 'mutex-release' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-commit'
-}
-
-test_reclaim_remote_only_release_last() {
-  expect_success remote-only reclaim miospot claude || return 1
-  local verify_line release_line
-  assert_contains "$COMMAND_LOG" '<generation-check> <miospot> <7>' || return 1
-  assert_lacks "$COMMAND_LOG" '<common-state-cas>' || return 1
-  verify_line=$(grep -n 'post-sync-verify' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  release_line=$(grep -n 'lease-release' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  [[ -n "$verify_line" && -n "$release_line" && $verify_line -lt $release_line ]]
-}
-
-test_outbound_handoff_requests_bundle_and_exact_git_alignment() {
-  MOCK_GIT_BRANCH=feature/handoff
-  MOCK_GIT_HEAD=1111111111111111111111111111111111111111
-  printf ' M README.md\0?? notes.txt\0' >"$GIT_STATUS_FILE"
-  expect_success local-only start miospot claude || return 1
-  assert_contains "$COMMAND_LOG" '<bundle> <create>' || return 1
-  assert_contains "$COMMAND_LOG" '<git-align> <miospot> <feature/handoff> <1111111111111111111111111111111111111111>' || return 1
-  assert_contains "$COMMAND_LOG" '<status> <--porcelain=v1> <-z>'
-}
-
-test_reclaim_fast_forwards_branch_and_resets_index_mixed() {
-  local mini_head=fedcba9876543210fedcba9876543210fedcba98
-  MOCK_GIT_BRANCH=main
-  MOCK_GIT_HEAD=0123456789abcdef0123456789abcdef01234567
-  REMOTE_GIT_BRANCH=main
-  REMOTE_GIT_HEAD=$mini_head
-  expect_success remote-only reclaim miospot claude || return 1
-  assert_contains "$COMMAND_LOG" "<populate-inbound> <miospot> <main> <$mini_head>" || return 1
-  assert_contains "$COMMAND_LOG" "<merge-base> <--is-ancestor> <0123456789abcdef0123456789abcdef01234567> <$mini_head>" || return 1
-  assert_contains "$GIT_REF_LOG" "<update-ref> <refs/heads/main> <$mini_head>" || return 1
-  assert_contains "$GIT_REF_LOG" "<reset> <--mixed> <$mini_head>"
-}
-
-test_reclaim_refuses_non_fast_forward_without_ref_mutation() {
-  MOCK_GIT_ANCESTOR=0 run_helper remote-only reclaim miospot claude
+test_failed_mutation_prints_pre_send_request_id() {
+  printf 'queued input\n' >"$CASE/prompt"
+  run_helper queue-full send wf-miospot-20260711T151201Z-9f3c --prompt-file "$CASE/prompt"
   [[ $STATUS -ne 0 ]] || return 1
-  assert_contains "$STDERR" 'fast-forward' || return 1
-  [[ ! -s $GIT_REF_LOG ]]
+  assert_one_registry_op send || return 1
+  assert_contains "$STDOUT" 'queue-full' || assert_contains "$STDERR" 'queue-full' || return 1
+  assert_mutating_outcome || return 1
+  (( $(combined_output | wc -c | tr -d ' ') <= 4096 ))
 }
 
-test_refusal_paths_never_mutate_git_refs_or_index() {
-  expect_failure diverged start miospot claude || return 1
-  [[ ! -s $GIT_REF_LOG ]] || return 1
-  : >"$GIT_REF_LOG"
-  expect_failure cas-lost start miospot claude || return 1
-  [[ ! -s $GIT_REF_LOG ]] || return 1
-  : >"$GIT_REF_LOG"
-  expect_failure apply-fails-recovery start miospot claude || return 1
-  [[ ! -s $GIT_REF_LOG ]]
+test_busy_send_queues_without_conductor_busy() {
+  printf 'queue me\n' >"$CASE/prompt"
+  run_helper queued send wf-miospot-20260711T151201Z-9f3c --prompt-file "$CASE/prompt"
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op send || return 1
+  assert_contains "$STDOUT" 'queued' || return 1
+  assert_lacks "$STDOUT" 'conductor-busy' || return 1
+  assert_lacks "$STDERR" 'conductor-busy'
 }
 
-test_equal_quiescent_reclaim_releases_without_transfer() {
-  expect_success equal-quiescent reclaim miospot claude || return 1
-  assert_contains "$COMMAND_LOG" '<generation-check> <miospot> <7>' || return 1
-  assert_lacks "$COMMAND_LOG" '<common-state-cas>' || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-  assert_lacks "$COMMAND_LOG" 'stage' || return 1
-  assert_lacks "$COMMAND_LOG" 'apply-exact' || return 1
-  assert_contains "$COMMAND_LOG" 'lease-release'
+test_cancel_pending_is_same_send_op() {
+  run_helper success send wf-miospot-20260711T151201Z-9f3c --cancel-pending
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op send || return 1
+  assert_contains "$SSH_LOG" $'ARG\t--cancel-pending' || return 1
+  assert_mutating_outcome || return 1
+  (( $(combined_output | wc -c | tr -d ' ') <= 4096 ))
 }
 
-test_local_only_quiescent_reclaim_releases_without_transfer() {
-  expect_success local-only-quiescent reclaim miospot claude || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-  assert_lacks "$COMMAND_LOG" 'stage' || return 1
-  assert_lacks "$COMMAND_LOG" 'apply-exact' || return 1
-  assert_lacks "$COMMAND_LOG" 'post-sync-verify' || return 1
-  assert_contains "$COMMAND_LOG" '<release-only-verify> <miospot>' || return 1
-  assert_contains "$COMMAND_LOG" 'lease-release'
+test_ack_event_is_forwarded_as_data() {
+  printf 'answer\n' >"$CASE/prompt"
+  run_helper stale-ack send wf-miospot-20260711T151201Z-9f3c \
+    --prompt-file "$CASE/prompt" --ack-event 17
+  [[ $STATUS -ne 0 ]] || return 1
+  assert_one_registry_op send || return 1
+  assert_contains "$SSH_LOG" $'ARG\t--ack-event' || return 1
+  assert_contains "$SSH_LOG" $'ARG\t17' || return 1
+  combined_output | grep -Fq 'stale-ack' || return 1
+  assert_mutating_outcome
 }
 
-test_real_backend_adapter_over_fake_ssh() {
-  local real_protocol=$SCRIPT_DIR/../../scripts/remote-agent-v1
-  local real_supervisor=$SCRIPT_DIR/../../scripts/agent-supervisor
-  [[ -x $real_protocol ]] || { printf 'missing real protocol: %s\n' "$real_protocol" >&2; return 1; }
-  [[ -x $real_supervisor ]] || { printf 'missing real supervisor: %s\n' "$real_supervisor" >&2; return 1; }
+test_diagnostic_family_takes_registry_lease() {
+  run_helper success diagnostic start miospot codex
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op diagnostic-start || return 1
+  assert_mutating_outcome || return 1
 
-  write_mock tmux <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'remote-tmux' >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
-case "${1:-}" in
-  has-session)
-    target=''
-    while [[ $# -gt 0 ]]; do
-      if [[ $1 == -t ]]; then target=${2:-}; break; fi
-      shift
-    done
-    [[ -f "$XDG_STATE_HOME/adapter.session" && $(<"$XDG_STATE_HOME/adapter.session") == "$target" ]]
-    ;;
-  new-session)
-    session=''
-    arguments=("$@")
-    while [[ $# -gt 0 ]]; do
-      if [[ $1 == -s ]]; then session=${2:-}; fi
-      [[ $1 == -- ]] && break
-      shift
-    done
-    [[ -n $session ]] || exit 64
-    printf '%s\n' "$session" >"$XDG_STATE_HOME/adapter.session"
-    printf '%s\n' '%91' >"$XDG_STATE_HOME/adapter.pane"
-    set -- "${arguments[@]}"
-    while [[ $# -gt 0 && $1 != -- ]]; do shift; done
-    if [[ ${1:-} == -- ]]; then shift; fi
-    if [[ $# -gt 0 ]]; then "$@" </dev/null >/dev/null 2>&1; fi
-    ;;
-  display-message|list-panes) cat "$XDG_STATE_HOME/adapter.pane" ;;
-  respawn-pane)
-    while [[ $# -gt 0 && $1 != -- ]]; do shift; done
-    [[ ${1:-} == -- ]] || exit 64
-    shift
-    "$@" </dev/null >/dev/null 2>&1
-    ;;
-  load-buffer) cat >"$XDG_STATE_HOME/adapter-delivered.stdin" ;;
-  paste-buffer|send-keys) exit 0 ;;
-  kill-session) rm -f "$XDG_STATE_HOME/adapter.session" ;;
-esac
-MOCK
-  cp "$FAKE_BIN/tmux" "$REMOTE_BIN/tmux"
-  write_mock claude <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'remote-claude' >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
-cat >/dev/null
-MOCK
-  cp "$FAKE_BIN/claude" "$REMOTE_BIN/claude"
+  run_helper diagnostic-held list
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op list || return 1
+  assert_contains "$STDOUT" 'diagnostic-held'
+}
 
-  write_mock remote-agent-v1 <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-case ${1:-} in
-  stage)
-    printf '%s' "$2" >"$XDG_STATE_HOME/adapter-received-privacy"
-    printf '%s' "$5" >"$XDG_STATE_HOME/adapter-received-authority"
-    ;;
-  inventory-path)
-    case $3 in *PWNED*) printf '%s' "$3" >"$XDG_STATE_HOME/adapter-received-path" ;; esac
-    ;;
-  lease-provisional)
-    printf '%s' "$4" >"$XDG_STATE_HOME/adapter-received-session"
-    printf '%s' "$6" >"$XDG_STATE_HOME/adapter-received-owner"
-    printf '%s' "$7" >"$XDG_STATE_HOME/adapter-received-authority"
-    ;;
-  git-align)
-    printf '%s %s %s' "$2" "$3" "$4" >"$XDG_STATE_HOME/adapter-received-git-align"
-    printf '%s\n' '{"align":"verified"}'
-    exit 0
-    ;;
-esac
-exec "$REAL_PROTOCOL" "$@"
-MOCK
-  cp "$FAKE_BIN/remote-agent-v1" "$REMOTE_BIN/remote-agent-v1"
-  write_mock agent-supervisor <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ ${1:-} == start ]]; then
-  printf '%s' "$2" >"$XDG_STATE_HOME/adapter-received-supervisor-session"
-  printf '%s' "$4" >"$XDG_STATE_HOME/adapter-received-root"
-fi
-exec "$REAL_SUPERVISOR" "$@"
-MOCK
-  cp "$FAKE_BIN/agent-supervisor" "$REMOTE_BIN/agent-supervisor"
+test_explicit_host_precedes_environment() {
+  run_helper success --host cli-mini list
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op list || return 1
+  assert_contains "$SSH_LOG" $'ARG\tcli-mini' || return 1
+  assert_lacks "$SSH_LOG" $'ARG\tfixture-mini'
+}
 
-  write_mock ssh <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-: "${COMMAND_LOG:?}" "${REAL_PROTOCOL:?}" "${REAL_SUPERVISOR:?}"
-printf 'adapter-ssh' >>"$COMMAND_LOG"
-for argument in "$@"; do printf ' <%q>' "$argument" >>"$COMMAND_LOG"; done
-printf '\n' >>"$COMMAND_LOG"
-shift
-# OpenSSH joins all command operands with spaces, then the remote login shell
-# parses that one string. Execute that exact boundary instead of preserving the
-# caller's local argv array.
-remote_command=$*
-tee -a "$REMOTE_STATE/adapter-ssh.stdin" | \
-  env -i HOME="$REMOTE_HOME" XDG_STATE_HOME="$REMOTE_STATE" PATH="$REMOTE_BIN:/usr/bin:/bin" \
-    COMMAND_LOG="$COMMAND_LOG" REAL_PROTOCOL="$REAL_PROTOCOL" REAL_SUPERVISOR="$REAL_SUPERVISOR" \
-    REMOTE_AGENT_ROOT_MIOSPOT="$REMOTE_ROOT" \
-    REMOTE_AGENT_ROOT_ORCHESTRATION="$REMOTE_ROOT" /bin/sh -c "$remote_command"
-MOCK
+test_hostile_argv_is_rejected_as_data_before_network() {
+  local marker="$CASE/PWNED"
+  run_helper success inspect 'wf-miospot-20260711T151201Z-9f3c;touch PWNED'
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -e $marker ]] || return 1
+  [[ ! -s $SSH_LOG ]] || return 1
+  (( $(combined_output | wc -c | tr -d ' ') <= 4096 ))
+}
 
-  local secret='REAL-ADAPTER-STDIN-CANARY'
-  local session=remote-agent--miospot--claude
-  local safe_path="safe dir/O'Brien \$(touch PWNED).txt"
-  REMOTE_ROOT="$REMOTE_HOME/Projects/miospot"
-  mkdir -p "$REMOTE_ROOT" "$LOCAL_ROOT/${safe_path%/*}"
-  mkdir -p "$REMOTE_ROOT/.remote-agent-stage"
-  printf 'legacy\n' >"$REMOTE_ROOT/.remote-agent-stage/legacy.txt"
-  printf 'quoted path\n' >"$LOCAL_ROOT/$safe_path"
-  local authority_project="$REMOTE_STATE/orchestration/remote-agent/projects/miospot"
-  mkdir -p "$authority_project"
-  printf 'prior-common\n' >"$authority_project/common"
-  printf 'prior-common\n' >"$authority_project/remote"
-  printf '0\n' >"$authority_project/generation"
+test_unknown_and_removed_client_orchestration_refuse() {
+  local invocation
+  for invocation in \
+    'dance' \
+    'continue wf-miospot-20260711T151201Z-9f3c' \
+    'status miospot' \
+    'reclaim miospot' \
+    'start-conductor miospot selected --with-plan selected' \
+    'start-conductor miospot selected --active-plan selected'; do
+    # shellcheck disable=SC2086 -- fixture words intentionally form argv.
+    run_helper success $invocation
+    [[ $STATUS -ne 0 ]] || return 1
+    [[ ! -s $SSH_LOG ]] || return 1
+    (( $(combined_output | wc -c | tr -d ' ') <= 4096 )) || return 1
+  done
+}
+
+test_source_has_no_client_orchestration_or_marker_writer() {
+  local forbidden
+  for forbidden in \
+    'run-codex-impl' 'run-codex-verify' 'run-grok-impl' 'run-grok-verify' \
+    'plan-utils.sh' 'set-frontier' 'start-step' 'record-verdict' \
+    'mini-workflow.json' '.temp/plan-mode' '--with-plan' '--active-plan'; do
+    assert_lacks "$REMOTE_AGENT" "$forbidden" || return 1
+  done
+}
+
+test_relay_writes_no_local_state_or_marker() {
+  local before after
+  before=$(find "$HOME_DIR" "$STATE_DIR" -type f -print -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  run_helper success list
+  [[ $STATUS -eq 0 ]] || return 1
+  after=$(find "$HOME_DIR" "$STATE_DIR" -type f -print -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  [[ $after == "$before" ]] || return 1
+  ! find "$CASE" -name mini-workflow.json -print | grep -q .
+}
+
+test_prompt_is_bounded_stdin_only_and_hashed_locally() {
+  local secret='RELAY-STDIN-CANARY' expected
   printf '%s\n' "$secret" >"$CASE/prompt"
-  MOCK_SAFE_PATH="$safe_path" expect_success equal start miospot claude --prompt-file "$CASE/prompt" || return 1
-  [[ ! -e $REMOTE_ROOT/.remote-agent-stage ]] || return 1
-  assert_lacks "$COMMAND_LOG" "$REMOTE_ROOT/.remote-agent-stage/" || return 1
-  [[ ! -e $LOCAL_ROOT/PWNED ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter.session") == "$session" ]] || return 1
-  [[ $(<"$authority_project/lease-session") == "$session" ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-owner") == "$(<"$authority_project/lease-owner")" ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-owner") == host=*' pid='*' operation=start started='* ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-privacy") == $'umask 077\nmode=0700' ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-path") == "$safe_path" ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-session") == "$session" ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-git-align") == 'miospot main 0123456789abcdef0123456789abcdef01234567' ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-supervisor-session") == "$session" ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-root") == project-root-v1:miospot ]] || return 1
-  [[ $(<"$REMOTE_STATE/adapter-received-authority") == authority-root-v1 ]] || return 1
-  [[ $(<"$authority_project/inventory") == *"$safe_path"* ]] || return 1
-  local canonical_remote_root
-  canonical_remote_root=$(cd "$REMOTE_ROOT" && pwd -P)
-  [[ $(<"$REMOTE_STATE/orchestration/agent-supervisor/sessions/$session/root") == "$canonical_remote_root" ]] || return 1
-  assert_contains "$COMMAND_LOG" "remote-tmux <new-session> <-d> <-s> <$session>" || return 1
-  assert_contains "$COMMAND_LOG" 'remote-claude <--yolo>' || return 1
-  assert_lacks "$COMMAND_LOG" 'XDG_STATE_HOME' || return 1
-  local trace="$REMOTE_STATE/orchestration/remote-agent/trace/miospot.trace"
-  assert_contains "$trace" 'stage' || return 1
-  assert_contains "$trace" 'mutex-acquire' || return 1
-  assert_contains "$trace" 'lease-commit' || return 1
-  cp "$authority_project/remote" "$authority_project/common"
-  MOCK_SAFE_PATH="$safe_path" expect_success equal status miospot claude || return 1
-  [[ $(wc -l <"$STDOUT" | tr -d ' ') -eq 1 ]] || return 1
-  [[ $(wc -c <"$STDOUT" | tr -d ' ') -le 4096 ]] || return 1
-  assert_contains "$STDOUT" '"relation":"equal"' || return 1
-  assert_contains "$STDOUT" '"session":"running"' || return 1
-  local status_epoch status_cursor status_bootstrap
-  status_epoch=$(sed -n 's/.*"epoch":"\([^"]*\)".*/\1/p' "$STDOUT")
-  status_cursor=$(sed -n 's/.*"cursor":\([0-9][0-9]*\).*/\1/p' "$STDOUT")
-  status_bootstrap=$(sed -n 's/.*"bootstrapCursor":"\([^"]*\)".*/\1/p' "$STDOUT")
-  [[ -n $status_epoch && -n $status_cursor && $status_bootstrap == "$status_epoch:$status_cursor" ]] || return 1
-  assert_lacks "$STDOUT" '"scope"' || return 1
-  assert_lacks "$STDOUT" '"kind"' || return 1
-  expect_success equal send miospot claude --prompt-file "$CASE/prompt" || return 1
-  assert_count "$trace" 'mutex-acquire' 2 || return 1
-  assert_contains "$REMOTE_STATE/adapter-ssh.stdin" "$secret" || return 1
-  assert_contains "$REMOTE_STATE/adapter-delivered.stdin" "$secret" || return 1
-  assert_lacks "$COMMAND_LOG" "$secret" || return 1
+  expected=$(shasum -a 256 "$CASE/prompt" | awk '{print $1}')
+  run_helper success send wf-miospot-20260711T151201Z-9f3c --prompt-file "$CASE/prompt"
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op send || return 1
+  assert_contains "$SSH_STDIN" "$secret" || return 1
+  assert_lacks "$SSH_LOG" "$secret" || return 1
   assert_lacks "$STDOUT" "$secret" || return 1
-  assert_lacks "$STDERR" "$secret"
+  assert_lacks "$STDERR" "$secret" || return 1
+  assert_contains "$SSH_LOG" $'ARG\t--payload-sha256' || return 1
+  assert_contains "$SSH_LOG" "$expected" || return 1
+
+  printf '%65537s' '' >"$CASE/oversized"
+  run_helper success send wf-miospot-20260711T151201Z-9f3c --prompt-file "$CASE/oversized"
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -s $SSH_LOG ]] || return 1
+  combined_output | grep -Fq '65536' || return 1
 }
 
-test_reclaim_stages_before_local_apply() {
-  expect_success remote-only reclaim miospot claude || return 1
-  local network_line verify_line local_apply_line
-  network_line=$(grep -n '^rsync .*fixture-mini:' "$COMMAND_LOG" | head -1 | cut -d: -f1)
-  verify_line=$(grep -n 'stage-verify' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  local_apply_line=$(grep -n '^rsync .*remote-agent\..*/inbound-stage/.*local-project/' "$COMMAND_LOG" | tail -1 | cut -d: -f1)
-  [[ -n "$network_line" && -n "$verify_line" && -n "$local_apply_line" ]] || return 1
-  [[ $network_line -lt $verify_line && $verify_line -lt $local_apply_line ]] || return 1
-  ! sed -n "${network_line}p" "$COMMAND_LOG" | grep -Fq -- "$LOCAL_ROOT/"
+test_mini_offline_is_bounded_and_keeps_request_id() {
+  printf 'offline input\n' >"$CASE/prompt"
+  run_helper mini-offline send wf-miospot-20260711T151201Z-9f3c --prompt-file "$CASE/prompt"
+  [[ $STATUS -ne 0 ]] || return 1
+  assert_count "$SSH_LOG" CALL 1 || return 1
+  combined_output | grep -Fq 'mini-unreachable' || return 1
+  assert_mutating_outcome || return 1
+  (( $(combined_output | wc -c | tr -d ' ') <= 4096 ))
 }
 
-test_reclaim_refuses_live_writer_before_transfer() {
-  expect_failure live-writer reclaim miospot claude || return 1
-  assert_contains "$STDERR" 'live exact project writer' || return 1
-  assert_lacks "$COMMAND_LOG" 'rsync' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-release'
+test_client_close_has_no_mini_side_effect() {
+  local probe_before probe_after before after
+  probe_before=$(find "$MINI_STATE" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  SSH_LOG="$SSH_LOG" SSH_STDIN="$SSH_STDIN" MINI_STATE="$MINI_STATE" SSH_MODE=success \
+    "$FAKE_BIN/ssh" fixture-mini \
+      "'/opt/orchestration/workflow-registry' 'release'" >/dev/null
+  probe_after=$(find "$MINI_STATE" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  [[ $probe_after != "$probe_before" ]] || return 1
+  rm -f "$MINI_STATE/transport-mutations"
+
+  before=$(find "$MINI_STATE" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  run_helper success list
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op list || return 1
+  rm -rf "$HOME_DIR" "$STATE_DIR"
+  after=$(find "$MINI_STATE" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort)
+  [[ $after == "$before" ]]
 }
 
-test_post_sync_mismatch_keeps_lease() {
-  expect_failure post-mismatch reclaim miospot claude || return 1
-  assert_contains "$STDERR" 'tampered.txt' || return 1
-  assert_lacks "$COMMAND_LOG" 'lease-release'
+test_refusal_hard_stops_after_one_registry_call() {
+  printf 'answer\n' >"$CASE/prompt"
+  run_helper stale-ack send wf-miospot-20260711T151201Z-9f3c \
+    --prompt-file "$CASE/prompt" --ack-event 17
+  [[ $STATUS -ne 0 ]] || return 1
+  assert_count "$SSH_LOG" CALL 1 || return 1
+  assert_lacks "$SSH_LOG" 'lease-release' || return 1
+  assert_lacks "$SSH_LOG" 'mirror-next' || return 1
+  (( $(combined_output | wc -c | tr -d ' ') <= 4096 ))
 }
 
-run_test 'validates command, project, and harness' test_validation
-run_test 'CLI host beats environment and config without production fallback' test_closed_mapping_and_host_precedence
-run_test 'PROJECT mapping ignores decoy Git cwd for probes manifests digests and paths' test_project_mapping_ignores_decoy_git_cwd
-run_test 'PROJECT mapping defaults safely and rejects symlink non-Git and nested roots' test_project_mapping_defaults_and_rejects_invalid_roots
-run_test 'relative prompt files stay independent of the mapped local checkout' test_relative_prompt_file_is_independent_of_mapped_root
-run_test 'hostile argv is rejected as data' test_hostile_argv_is_data
-run_test 'project and harness map to an exact non-prefix session' test_exact_sessions
-run_test 'inspect captures and never synchronizes' test_inspect_captures_without_sync
-run_test 'inspect returns its bounded capture to the caller' test_inspect_capture_is_visible
-run_test 'continue captures before sending and never synchronizes' test_continue_captures_before_send
-run_test 'wait requires one safe cursor and a bounded timeout' test_wait_requires_a_bounded_cursor_and_timeout
-run_test 'wait delegates every harness to its exact supervisor session' test_wait_delegates_exact_sessions_for_every_harness
-run_test 'wait surfaces distinct timeout, exit, and lifecycle-event wakes' test_wait_surfaces_timeout_exit_and_event_wakes
-run_test 'wait exit recheck refuses to quiesce a restarted session' test_wait_exit_recheck_refuses_a_restarted_session
-run_test 'wait preserves monotonic cursors across supervisor restart epochs' test_wait_preserves_monotonic_restart_aware_cursors
-run_test 'start and status expose a bounded restart-aware cursor usable directly by wait' test_start_and_status_expose_direct_wait_bootstrap_without_leakage
-run_test 'wait returns bounded ephemeral capture without local persistence' test_wait_capture_is_visible_bounded_and_not_persisted_locally
-run_test 'reveal attaches Terminal to the exact existing pane without mutation' test_reveal_delegates_exact_terminal_attachment_without_mutation
-run_test 'prompt body is bounded to stdin and redacted from output and logs' test_prompt_is_bounded_and_redacted
-run_test 'interrupt and kill cover control lifecycle and quiescence' test_control_lifecycle
-run_test 'start stages local-only work then launches and commits the lease' test_start_local_only_transfer
-run_test 'start accepts one bounded prompt and sends it after lease commit' test_start_accepts_optional_prompt
-run_test 'the real supervisor vocabulary rejects the legacy launch verb' test_supervisor_rejects_legacy_launch_verb
-run_test 'Codex control uses the shared supervisor rather than mini-agent' test_codex_uses_shared_supervisor
-run_test 'start forwards exactly one --yolo to the supervisor' test_start_forwards_yolo_exactly
-run_test 'failed supervisor start aborts the provisional lease before mutex release' test_failed_supervisor_start_aborts_provisional_lease
-run_test 'helper-to-supervisor prompts travel only on stdin' test_supervisor_prompt_transport_is_stdin_only
-run_test 'start refuses live writers and two-sided divergence with evidence' test_start_refuses_live_writer_and_divergence
-run_test 'first contact adopts equality only without a live writer' test_first_contact_rules
-run_test 'snapshots bind branch HEAD and NUL-safe strong content fingerprints' test_snapshot_is_strong_and_nul_safe
-run_test 'equal, local-only, remote-only, and divergent states follow the matrix' test_divergence_matrix
-run_test 'Mini authoritative mutex and generation CAS fail closed' test_remote_lease_mutex_and_cas
-run_test 'writer records fail closed without stale-process inference' test_writer_records_fail_closed_without_stale_inference
-run_test 'transfer universe, exclusions, plan bound, and exact deletions are explicit' test_transfer_universe_and_deletions
-run_test 'ignored files require literal per-path approval' test_ignored_paths_need_exact_consent
-run_test 'active plan mutation aborts and extra artifacts stay excluded' test_active_plan_is_bounded_and_stable
-run_test 'payload staging and restore journal are private and verified' test_private_staging_and_restore_journal
-run_test 'failed network staging releases the mutex before apply or lease commit' test_network_staging_failure_stops_before_apply
-run_test 'failed destination apply restores before ownership can advance' test_failed_apply_restores_before_state_change
-run_test 'nonzero apply status restores before ownership can advance' test_nonzero_apply_status_restores_before_state_change
-run_test 'failed restore preserves authoritative recovery and mutex evidence' test_failed_restore_preserves_recovery_evidence
-run_test 'reclaim pulls remote-only work and releases ownership last' test_reclaim_remote_only_release_last
-run_test 'outbound handoff ships a bundle and requests exact branch HEAD alignment' test_outbound_handoff_requests_bundle_and_exact_git_alignment
-run_test 'reclaim fast-forwards the MacBook branch and rebuilds a mixed index' test_reclaim_fast_forwards_branch_and_resets_index_mixed
-run_test 'non-fast-forward reclaim refuses without mutating refs or index' test_reclaim_refuses_non_fast_forward_without_ref_mutation
-run_test 'divergence CAS loss and recovery-required paths never mutate Git' test_refusal_paths_never_mutate_git_refs_or_index
-run_test 'equal quiescent reclaim is release-only with zero transfer' test_equal_quiescent_reclaim_releases_without_transfer
-run_test 'local-only quiescent reclaim is release-only with zero transfer' test_local_only_quiescent_reclaim_releases_without_transfer
-run_test 'reclaim receives into verified private staging before local apply' test_reclaim_stages_before_local_apply
-run_test 'reclaim refuses a live writer before transfer' test_reclaim_refuses_live_writer_before_transfer
-run_test 'post-sync mismatch preserves the remote lease' test_post_sync_mismatch_keeps_lease
-run_test 'real helper adapts to real protocol and supervisor over fake SSH' test_real_backend_adapter_over_fake_ssh
+test_seed_consent_identical_approval() {
+  run_helper success sync wf-miospot-20260711T151201Z-9f3c --seed \
+    --include-ignored .env.local
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -s $SSH_LOG ]] || return 1
+  combined_output | grep -Fq 'ignored path needs identical explicit approval'
+}
+
+test_seed_consent_literal_path_no_glob() {
+  run_helper success sync wf-miospot-20260711T151201Z-9f3c --seed \
+    --include-ignored '.env*' --approve-ignored '.env*'
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -s $SSH_LOG ]] || return 1
+  combined_output | grep -Fq 'ignored approval must name one literal path'
+}
+
+test_seed_consent_path_must_be_ignored() {
+  run_helper success sync wf-miospot-20260711T151201Z-9f3c --seed \
+    --include-ignored README.md --approve-ignored README.md
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -s $SSH_LOG ]] || return 1
+  combined_output | grep -Fq 'approved seed path must be ignored'
+}
+
+test_seed_consent_forwards_one_exact_exception() {
+  run_helper success sync wf-miospot-20260711T151201Z-9f3c --seed \
+    --include-ignored .env.local --approve-ignored .env.local
+  [[ $STATUS -eq 0 ]] || return 1
+  assert_one_registry_op request-mirror-sync || return 1
+  assert_count "$SSH_LOG" $'ARG\t.env.local' 2 || return 1
+  assert_mutating_outcome
+}
+
+# Disposition schema: old-case|preserved-in=... / re-hosted-to=... /
+# superseded-because=...|bounded rationale.  The three legacy_* rows are the
+# deleted plan-seed/client-marker cases called out by R7 even though they were
+# design cases rather than registrations in the immediately preceding suite.
+OLD_CASES=$(cat <<'EOF'
+test_validation
+test_closed_mapping_and_host_precedence
+test_project_mapping_ignores_decoy_git_cwd
+test_project_mapping_defaults_and_rejects_invalid_roots
+test_relative_prompt_file_is_independent_of_mapped_root
+test_hostile_argv_is_data
+test_exact_sessions
+test_inspect_captures_without_sync
+test_inspect_capture_is_visible
+test_continue_captures_before_send
+test_wait_requires_a_bounded_cursor_and_timeout
+test_wait_delegates_exact_sessions_for_every_harness
+test_wait_surfaces_timeout_exit_and_event_wakes
+test_wait_exit_recheck_refuses_a_restarted_session
+test_wait_preserves_monotonic_restart_aware_cursors
+test_start_and_status_expose_direct_wait_bootstrap_without_leakage
+test_wait_capture_is_visible_bounded_and_not_persisted_locally
+test_reveal_delegates_exact_terminal_attachment_without_mutation
+test_prompt_is_bounded_and_redacted
+test_control_lifecycle
+test_start_local_only_transfer
+test_start_accepts_optional_prompt
+test_supervisor_rejects_legacy_launch_verb
+test_codex_uses_shared_supervisor
+test_start_forwards_yolo_exactly
+test_failed_supervisor_start_aborts_provisional_lease
+test_supervisor_prompt_transport_is_stdin_only
+test_start_refuses_live_writer_and_divergence
+test_first_contact_rules
+test_snapshot_is_strong_and_nul_safe
+test_divergence_matrix
+test_remote_lease_mutex_and_cas
+test_writer_records_fail_closed_without_stale_inference
+test_transfer_universe_and_deletions
+test_ignored_paths_need_exact_consent
+test_active_plan_is_bounded_and_stable
+test_private_staging_and_restore_journal
+test_network_staging_failure_stops_before_apply
+test_failed_apply_restores_before_state_change
+test_nonzero_apply_status_restores_before_state_change
+test_failed_restore_preserves_recovery_evidence
+test_reclaim_remote_only_release_last
+test_outbound_handoff_requests_bundle_and_exact_git_alignment
+test_reclaim_fast_forwards_branch_and_resets_index_mixed
+test_reclaim_refuses_non_fast_forward_without_ref_mutation
+test_refusal_paths_never_mutate_git_refs_or_index
+test_equal_quiescent_reclaim_releases_without_transfer
+test_local_only_quiescent_reclaim_releases_without_transfer
+test_reclaim_stages_before_local_apply
+test_reclaim_refuses_live_writer_before_transfer
+test_post_sync_mismatch_keeps_lease
+test_real_backend_adapter_over_fake_ssh
+legacy_with_plan_seed_trio
+legacy_client_side_mini_workflow_marker
+legacy_stale_client_marker_clear
+EOF
+)
+
+DISPOSITION_TABLE=$(cat <<'EOF'
+test_validation|preserved-in=remote-agent.test.sh#test_unknown_and_removed_client_orchestration_refuse|closed verbs and bounded unknown refusal
+test_closed_mapping_and_host_precedence|preserved-in=remote-agent.test.sh#test_explicit_host_precedes_environment|explicit and configured Mini host remain transport inputs
+test_project_mapping_ignores_decoy_git_cwd|re-hosted-to=mirror-worker.test.sh#test_worker_roots_default_and_invalid_refusals|checkout discovery belongs to the mechanical worker
+test_project_mapping_defaults_and_rejects_invalid_roots|re-hosted-to=mirror-worker.test.sh#test_worker_roots_default_and_invalid_refusals|worker validates its configured checkout
+test_relative_prompt_file_is_independent_of_mapped_root|preserved-in=remote-agent.test.sh#test_prompt_is_bounded_stdin_only_and_hashed_locally|prompt resolution remains relay-local
+test_hostile_argv_is_data|preserved-in=remote-agent.test.sh#test_registry_op_anchor_matches_tab_delimited_log|one serialized registry argv and closed atoms
+test_exact_sessions|re-hosted-to=workflow-registry.test.sh#test_mint_workflow_id_format|registry owns workflow and session binding
+test_inspect_captures_without_sync|preserved-in=remote-agent.test.sh#test_read_verb_maps_once|inspect is one read-only registry op
+test_inspect_capture_is_visible|preserved-in=remote-agent.test.sh#test_read_verb_maps_once|bounded registry response is surfaced
+test_continue_captures_before_send|superseded-because=start-conductor-and-send-are-separate-closed-ops|client continue orchestration is deleted
+test_wait_requires_a_bounded_cursor_and_timeout|preserved-in=remote-agent.test.sh#test_read_verb_maps_once|relay forwards one bounded wait
+test_wait_delegates_exact_sessions_for_every_harness|re-hosted-to=workflow-journal.test.sh#test_wait_is_one_bounded_blocking_call|registry journal replaces harness waits
+test_wait_surfaces_timeout_exit_and_event_wakes|re-hosted-to=workflow-journal.test.sh#test_wait_is_one_bounded_blocking_call|durable journal owns wake classification
+test_wait_exit_recheck_refuses_a_restarted_session|superseded-because=registry-cursor-is-restart-durable|client recheck loop is deleted
+test_wait_preserves_monotonic_restart_aware_cursors|re-hosted-to=workflow-journal.test.sh#test_wait_replays_from_zero_and_mid_cursor|registry cursor replaces supervisor epoch cursor
+test_start_and_status_expose_direct_wait_bootstrap_without_leakage|superseded-because=list-and-start-conductor-return-registry-cursors|status alias is deleted
+test_wait_capture_is_visible_bounded_and_not_persisted_locally|preserved-in=remote-agent.test.sh#test_client_close_has_no_mini_side_effect|relay keeps no wait state
+test_reveal_delegates_exact_terminal_attachment_without_mutation|preserved-in=remote-agent.test.sh#test_mutating_verb_maps_once|reveal is one bounded registry op
+test_prompt_is_bounded_and_redacted|preserved-in=remote-agent.test.sh#test_prompt_is_bounded_stdin_only_and_hashed_locally|64KiB stdin-only and digest assertions retained
+test_control_lifecycle|preserved-in=remote-agent.test.sh#test_mutating_verb_maps_once|interrupt kill and release map one-to-one
+test_start_local_only_transfer|superseded-because=start-conductor-never-mirrors-client-content|mirror queue is a separate operation
+test_start_accepts_optional_prompt|superseded-because=start-conductor-and-send-are-separate-idempotent-ops|combined client transaction is deleted
+test_supervisor_rejects_legacy_launch_verb|re-hosted-to=workflow-registry.test.sh#test_start_conductor_is_claude_only|registry composes the fixed supervisor start verb
+test_codex_uses_shared_supervisor|re-hosted-to=workflow-registry.test.sh#test_diagnostic_held_refuses_start_conductor_boundedly|diagnostic family is registry guarded
+test_start_forwards_yolo_exactly|re-hosted-to=workflow-registry.test.sh#test_start_conductor_ordered_mutex_cas_lease|registry owns fixed conductor launch argv
+test_failed_supervisor_start_aborts_provisional_lease|re-hosted-to=workflow-registry.test.sh#test_start_conductor_ordered_mutex_cas_lease|registry owns the atomic start transaction
+test_supervisor_prompt_transport_is_stdin_only|preserved-in=remote-agent.test.sh#test_prompt_is_bounded_stdin_only_and_hashed_locally|relay sends prompt bytes only on stdin
+test_start_refuses_live_writer_and_divergence|re-hosted-to=workflow-registry.test.sh#test_existing_protocol_refusals_surface_through_registry|registry surfaces protocol refusal unchanged
+test_first_contact_rules|re-hosted-to=remote-agent-protocol.test.sh#test_probe_classifies_all_relations|protocol owns baseline adoption
+test_snapshot_is_strong_and_nul_safe|re-hosted-to=mirror-worker.test.sh#test_snapshot_is_strong_and_nul_safe|worker owns strong checkout fingerprints
+test_divergence_matrix|re-hosted-to=mirror-worker.test.sh#test_claim_direction_is_computed_at_claim_time|registry computes direction at claim time
+test_remote_lease_mutex_and_cas|re-hosted-to=remote-agent-protocol.test.sh#test_generation_cas_never_clobbers|authority remains protocol-owned
+test_writer_records_fail_closed_without_stale_inference|re-hosted-to=workflow-registry.test.sh#test_existing_protocol_refusals_surface_through_registry|registry preserves writer refusal evidence
+test_transfer_universe_and_deletions|re-hosted-to=mirror-worker.test.sh#test_transfer_universe_and_deletions|worker stages tracked and ordinary untracked only
+test_ignored_paths_need_exact_consent|preserved-in=remote-agent.test.sh#test_seed_consent_identical_approval|single seed exception retains all three consent guards
+test_active_plan_is_bounded_and_stable|superseded-because=Mini-born-plans-delete-with-plan-handoff|plan trio never crosses the relay
+test_private_staging_and_restore_journal|re-hosted-to=mirror-worker.test.sh#test_private_staging_and_restore_journal|worker and protocol own private staging
+test_network_staging_failure_stops_before_apply|re-hosted-to=mirror-worker.test.sh#test_network_staging_failure_stops_before_apply|worker hard-stops failed transfer
+test_failed_apply_restores_before_state_change|re-hosted-to=remote-agent-protocol.test.sh#test_staging_apply_and_verified_restore|protocol restores before authority advances
+test_nonzero_apply_status_restores_before_state_change|re-hosted-to=remote-agent-protocol.test.sh#test_staging_apply_and_verified_restore|protocol handles nonzero apply identically
+test_failed_restore_preserves_recovery_evidence|re-hosted-to=remote-agent-protocol.test.sh#test_alignment_failure_restores_prior_refs_index_and_content|authority preserves failed restore evidence
+test_reclaim_remote_only_release_last|superseded-because=release-and-mirror-ack-are-independent-registry-ops|five-step client reclaim is deleted
+test_outbound_handoff_requests_bundle_and_exact_git_alignment|re-hosted-to=mirror-worker.test.sh#test_outbound_handoff_requests_bundle_and_exact_git_alignment|step-1 assertions moved intact
+test_reclaim_fast_forwards_branch_and_resets_index_mixed|re-hosted-to=mirror-worker.test.sh#test_reclaim_fast_forwards_branch_and_resets_index_mixed|step-1 assertions moved intact
+test_reclaim_refuses_non_fast_forward_without_ref_mutation|re-hosted-to=mirror-worker.test.sh#test_reclaim_refuses_non_fast_forward_without_ref_mutation|step-1 refusal assertions moved intact
+test_refusal_paths_never_mutate_git_refs_or_index|re-hosted-to=mirror-worker.test.sh#test_refusal_paths_never_mutate_git_refs_or_index|step-1 guard assertions moved intact
+test_equal_quiescent_reclaim_releases_without_transfer|superseded-because=release-is-registry-owned-and-mirror-is-separately-queued|client reclaim branch deleted
+test_local_only_quiescent_reclaim_releases_without_transfer|superseded-because=release-is-registry-owned-and-mirror-is-separately-queued|client reclaim branch deleted
+test_reclaim_stages_before_local_apply|re-hosted-to=mirror-worker.test.sh#test_reclaim_stages_before_local_apply|worker receives into private staging
+test_reclaim_refuses_live_writer_before_transfer|re-hosted-to=mirror-worker.test.sh#test_claim_refusal_precedes_worker_transfer|registry refuses impossible claim before worker transfer
+test_post_sync_mismatch_keeps_lease|re-hosted-to=mirror-worker.test.sh#test_post_sync_mismatch_keeps_lease|divergent ack does not release authority
+test_real_backend_adapter_over_fake_ssh|preserved-in=remote-agent.test.sh#test_registry_op_anchor_matches_tab_delimited_log|relay boundary is tested directly
+legacy_with_plan_seed_trio|superseded-because=Mini-born-plans-delete-with-plan-handoff|deleted R7 seed plan-trio case
+legacy_client_side_mini_workflow_marker|superseded-because=registry-writes-only-the-Mini-side-marker|deleted R7 client provenance case
+legacy_stale_client_marker_clear|superseded-because=no-client-marker-can-become-stale|deleted R7 stale-marker case
+EOF
+)
+
+assert_disposition_targets_exist() {
+  local table=$1 row disposition location file anchor
+  while IFS= read -r row; do
+    disposition=$(printf '%s\n' "$row" | cut -d'|' -f2)
+    case $disposition in
+      preserved-in=*|re-hosted-to=*)
+        location=${disposition#*=}
+        [[ $location == *#* ]] || return 1
+        file=${location%%#*}
+        anchor=${location#*#}
+        [[ -f $SCRIPT_DIR/$file ]] || return 1
+        grep -Eq -- "^${anchor}\\(\\)[[:space:]]*\\{" "$SCRIPT_DIR/$file" || return 1
+        ;;
+      superseded-because=*) ;;
+      *) return 1 ;;
+    esac
+  done <<<"$table"
+}
+
+test_disposition_table_is_complete_and_well_formed() {
+  local expected actual actual_count unique_count
+  expected="$CASE/expected"
+  actual="$CASE/actual"
+  printf '%s\n' "$OLD_CASES" | sed '/^$/d' | LC_ALL=C sort >"$expected"
+  printf '%s\n' "$DISPOSITION_TABLE" | awk -F'|' '
+    NF != 3 { bad=1 }
+    $2 !~ /^(preserved-in|re-hosted-to|superseded-because)=/ { bad=1 }
+    length($3) == 0 { bad=1 }
+    { print $1 }
+    END { exit bad }
+  ' | LC_ALL=C sort >"$actual" || return 1
+  cmp -s "$expected" "$actual" || return 1
+  actual_count=$(wc -l <"$actual" | tr -d ' ')
+  unique_count=$(uniq "$actual" | wc -l | tr -d ' ')
+  [[ $actual_count -eq $unique_count ]] || return 1
+  printf '%s\n' "$DISPOSITION_TABLE" | grep -Fq 'legacy_with_plan_seed_trio|superseded-because=' || return 1
+  printf '%s\n' "$DISPOSITION_TABLE" | grep -Fq 'legacy_client_side_mini_workflow_marker|superseded-because=' || return 1
+  printf '%s\n' "$DISPOSITION_TABLE" | grep -Fq 'test_ignored_paths_need_exact_consent|preserved-in=' || return 1
+  printf '%s\n' "$DISPOSITION_TABLE" | grep -Fq 'test_outbound_handoff_requests_bundle_and_exact_git_alignment|re-hosted-to=mirror-worker.test.sh' || return 1
+  assert_disposition_targets_exist "$DISPOSITION_TABLE" || return 1
+  if assert_disposition_targets_exist \
+      'phantom|re-hosted-to=mirror-worker.test.sh#test_anchor_does_not_exist|negative control'; then
+    return 1
+  fi
+}
+
+if [[ ! -x $REMOTE_AGENT ]]; then
+  fail 'remote-agent helper exists' "missing executable: $REMOTE_AGENT"
+else
+  pass 'remote-agent helper exists'
+fi
+
+run_test 'registry-op helper recognizes a real tab-delimited SSH log' test_registry_op_anchor_matches_tab_delimited_log
+run_test 'list maps to exactly one serialized registry list op' test_read_verb_maps_once list list
+run_test 'start-conductor maps to one mutation with a pre-send requestId' test_mutating_verb_maps_once start-conductor start-conductor miospot selected
+run_test 'inspect maps to exactly one serialized registry inspect op' test_read_verb_maps_once inspect inspect wf-miospot-20260711T151201Z-9f3c
+printf 'map send\n' >"$SUITE/map-send-prompt"
+run_test 'send maps to one mutation with a pre-send requestId' test_mutating_verb_maps_once send send wf-miospot-20260711T151201Z-9f3c --prompt-file "$SUITE/map-send-prompt"
+run_test 'wait maps to exactly one bounded registry wait op' test_read_verb_maps_once wait wait wf-miospot-20260711T151201Z-9f3c --cursor jrn-fixture:0 --timeout 1
+run_test 'interrupt maps to one registry mutation' test_mutating_verb_maps_once interrupt interrupt wf-miospot-20260711T151201Z-9f3c
+run_test 'kill maps to one registry mutation' test_mutating_verb_maps_once kill kill wf-miospot-20260711T151201Z-9f3c
+run_test 'release maps to one registry mutation' test_mutating_verb_maps_once release release wf-miospot-20260711T151201Z-9f3c
+run_test 'sync maps to request-mirror-sync exactly once' test_mutating_verb_maps_once sync request-mirror-sync wf-miospot-20260711T151201Z-9f3c
+run_test 'sync --cancel maps to mirror-cancel exactly once' test_sync_cancel_maps_to_mirror_cancel
+run_test 'reveal maps to one registry mutation and bounded ack' test_mutating_verb_maps_once reveal reveal wf-miospot-20260711T151201Z-9f3c
+run_test 'caller-provided requestId is reused exactly' test_request_id_reuse_is_exact
+run_test 'failed mutations print the requestId minted before SSH' test_failed_mutation_prints_pre_send_request_id
+run_test 'busy send queues without conductor-busy refusal' test_busy_send_queues_without_conductor_busy
+run_test 'send --cancel-pending stays one idempotent send op' test_cancel_pending_is_same_send_op
+run_test 'send --ack-event forwards the exact event and surfaces stale-ack' test_ack_event_is_forwarded_as_data
+run_test 'desktop diagnostic family takes a registry lease visible as diagnostic-held' test_diagnostic_family_takes_registry_lease
+run_test 'diagnostic inspect maps to exactly one registry op' test_read_verb_maps_once diagnostic diagnostic-inspect inspect miospot codex
+run_test 'diagnostic send maps to one requestId mutation' test_mutating_verb_maps_once diagnostic diagnostic-send send miospot codex --prompt-file "$SUITE/map-send-prompt"
+run_test 'diagnostic interrupt maps to one requestId mutation' test_mutating_verb_maps_once diagnostic diagnostic-interrupt interrupt miospot codex
+run_test 'diagnostic kill maps to one requestId mutation' test_mutating_verb_maps_once diagnostic diagnostic-kill kill miospot codex
+run_test 'diagnostic release maps to one requestId mutation' test_mutating_verb_maps_once diagnostic diagnostic-release release miospot codex
+run_test 'explicit Mini host precedes environment without fallback' test_explicit_host_precedes_environment
+run_test 'hostile argv is rejected as data before network send' test_hostile_argv_is_rejected_as_data_before_network
+run_test 'unknown and removed client-orchestration verbs refuse before SSH' test_unknown_and_removed_client_orchestration_refuse
+run_test 'relay source contains no lane frontier plan handoff or marker writer' test_source_has_no_client_orchestration_or_marker_writer
+run_test 'relay writes no local state or mini-workflow marker' test_relay_writes_no_local_state_or_marker
+run_test 'prompt is 64KiB bounded stdin-only and locally SHA-256 labelled' test_prompt_is_bounded_stdin_only_and_hashed_locally
+run_test 'Mini offline returns bounded mini-unreachable with requestId' test_mini_offline_is_bounded_and_keeps_request_id
+run_test 'closing the stateless client changes nothing Mini-side' test_client_close_has_no_mini_side_effect
+run_test 'registry refusal hard-stops after one network call' test_refusal_hard_stops_after_one_registry_call
+run_test 'seed consent requires identical explicit approval' test_seed_consent_identical_approval
+run_test 'seed consent rejects glob patterns and requires a literal path' test_seed_consent_literal_path_no_glob
+run_test 'seed consent path must actually be ignored' test_seed_consent_path_must_be_ignored
+run_test 'seed consent forwards exactly one approved ignored exception' test_seed_consent_forwards_one_exact_exception
+run_test 'legacy disposition table covers every old seed marker and behavior case' test_disposition_table_is_complete_and_well_formed
 
 printf '%d tests passed, %d tests failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ $FAIL_COUNT -eq 0 ]]

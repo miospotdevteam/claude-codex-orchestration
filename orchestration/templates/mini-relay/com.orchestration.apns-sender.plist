@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent TEMPLATE for Mini APNs push sender (GUI session).
+
+  Placeholders (substituted ONLY by: apns-sender install-launchagent):
+    @PLUGIN_ROOT@  — absolute path to the orchestration plugin root
+    @STATE_HOME@   — XDG_STATE_HOME or $HOME/.local/state
+
+  This tracked file is a template and is NOT installed until
+  `apns-sender install-launchagent` writes a substituted copy under
+  ~/Library/LaunchAgents/ (optional --load). Do not treat the presence
+  of this template as evidence that the agent is loaded.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.orchestration.apns-sender</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PLUGIN_ROOT@/scripts/apns-sender</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<!-- LaunchAgent stdout/stderr: size-capped by apns-sender bound_launchd_logs
+	     via copy-truncate (LOG_MAX_BYTES) so open launchd FDs stop growing. -->
+	<key>StandardOutPath</key>
+	<string>@STATE_HOME@/orchestration/apns/logs/apns-sender.launchd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>@STATE_HOME@/orchestration/apns/logs/apns-sender.launchd.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent TEMPLATE for Mini workflow-resume (GUI session, D2).
+
+  Invokes ONLY: workflow-registry resume-scan
+  — at load (RunAtLoad) and on a bounded interval (StartInterval).
+  All recovery logic (episode ledger, failed-recovery stickiness,
+  delivery-pending reconcile) lives inside the registry. This agent
+  carries zero frontier/lane/plan logic.
+
+  Placeholders (substituted ONLY by: workflow-registry install-launchagent):
+    @PLUGIN_ROOT@  — absolute path to the orchestration plugin root
+    @STATE_HOME@   — XDG_STATE_HOME or $HOME/.local/state
+    @PATH@         — install-time resolved PATH that can find tmux/claude/jq
+                     (e.g. /opt/homebrew/bin, /usr/local/bin, ~/.local/bin,
+                     system bins). NEVER ship a system-only PATH under launchd:
+                     missing tmux would look like a dead session and burn the
+                     D2 3-attempt cap into sticky failed-recovery.
+
+  This tracked file is a template and is NOT installed until
+  `workflow-registry install-launchagent` writes a substituted copy under
+  ~/Library/LaunchAgents/ (optional --load). The installer also creates
+  @STATE_HOME@/orchestration/workflows/logs/ (launchd will not create parents).
+  Do not treat the presence of this template as evidence that the agent is loaded.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.orchestration.workflow-resume</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PLUGIN_ROOT@/scripts/workflow-registry</string>
+		<string>resume-scan</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Bounded interval (seconds): re-scan open workflows without tight spin. -->
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<!-- One-shot resume-scan per wake; failures go to launchd logs only. -->
+	<key>StandardOutPath</key>
+	<string>@STATE_HOME@/orchestration/workflows/logs/workflow-resume.launchd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>@STATE_HOME@/orchestration/workflows/logs/workflow-resume.launchd.err.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+</dict>
+</plist>

@@ -5,6 +5,9 @@ set -euo pipefail
 # Event records contain labels only; terminal and prompt content is never stored.
 umask 077
 
+SUPERVISOR_DIR=$(cd "$(dirname "$0")" && pwd -P)
+REGISTRY_BIN="${AGENT_SUPERVISOR_REGISTRY:-$SUPERVISOR_DIR/workflow-registry}"
+
 usage() {
   printf '%s\n' 'usage: agent-supervisor version|start|status|capture|send|interrupt|kill|enqueue|wait|reveal ...' >&2
   exit 64
@@ -15,12 +18,194 @@ die() {
   exit 1
 }
 
+# Host boot-time token for enqueue lock liveness (same source as workflow-registry).
+boot_token() {
+  local raw token sysctl_bin
+  if [[ -r /proc/stat ]]; then
+    awk '/^btime / { print $2; exit }' /proc/stat
+    return
+  fi
+  if command -v sysctl >/dev/null 2>&1 || [[ -x /usr/sbin/sysctl ]]; then
+    sysctl_bin=$(command -v sysctl 2>/dev/null || printf '%s\n' /usr/sbin/sysctl)
+    raw=$($sysctl_bin -n kern.boottime 2>/dev/null || true)
+    token=$(printf '%s\n' "$raw" | awk -F'[=,{} \t]+' '{
+      for (i = 1; i <= NF; i++)
+        if ($i == "sec" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit }
+    }')
+    if [[ -n $token ]]; then
+      printf '%s\n' "$token"
+      return
+    fi
+  fi
+  stat -c %W / 2>/dev/null || stat -f %B / 2>/dev/null || printf '0\n'
+}
+
+valid_workflow_id() {
+  [[ ${1:-} =~ ^wf-[a-z0-9][a-z0-9-]{0,47}-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}$ ]]
+}
+
+workflows_root() {
+  printf '%s/orchestration/workflows\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
+}
+
+release_enqueue_lock() {
+  local lock=${1:-}
+  [[ -n $lock && -d $lock ]] || return 0
+  rm -rf -- "$lock" 2>/dev/null || true
+}
+
+# Projection registry calls must finish strictly inside the 2 s hook budget.
+# Default 1.5 s is genuinely shorter than 2 s (sub-second precision — never
+# ceiling fractional budgets up to the full hook window).
+# Read env on every call so callers can override per-invocation.
+project_timeout_budget_ms() {
+  local budget=${AGENT_SUPERVISOR_PROJECT_TIMEOUT:-}
+  # Empty (env -i passthrough) or non-numeric → default 1.5 s (< 2 s hook budget).
+  [[ $budget =~ ^[0-9]+([.][0-9]+)?$ ]] || budget=1.5
+  # Convert to integer milliseconds; floor at 50 ms so a 0 override still spins once.
+  awk -v b="$budget" 'BEGIN {
+    ms = int(b * 1000 + 0.5)
+    if (ms < 50) ms = 50
+    print ms
+  }'
+}
+
+# Wall-clock milliseconds (portable). Prefer high-res clocks so fractional
+# projection budgets are real, not whole-second ceilings.
+now_ms() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf "%d\n", int(time * 1000)' 2>/dev/null && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null && return 0
+  fi
+  # Coarse fallback: whole seconds only.
+  printf '%s\n' $(( $(date +%s) * 1000 ))
+}
+
+# Tear down a bounded child and its descendants (bash shim + /bin/sleep, etc.).
+kill_bounded_tree() {
+  local pid=$1
+  # Parent + direct children so a hanging sleep under a shim cannot outlive us.
+  kill -TERM "$pid" 2>/dev/null || true
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  /bin/sleep 0.05
+  kill -KILL "$pid" 2>/dev/null || true
+  pkill -KILL -P "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# Run a command under a shared wall-clock budget starting at start_ms.
+# total_ms is the full allowance for the hook-path work (project + optional
+# deliver share ONE budget — never stacked). Returns 124 on timeout.
+# Uses a single fractional sleep watchdog (no perl poll loop) so sub-second
+# budgets stay accurate under the 2 s hook window.
+run_bounded_remaining() {
+  local start_ms=$1 total_ms=$2
+  shift 2
+  local pid watcher rc=0 now remaining remaining_sec
+  now=$(now_ms)
+  remaining=$((total_ms - (now - start_ms)))
+  if (( remaining <= 0 )); then
+    return 124
+  fi
+  remaining_sec=$(awk -v ms="$remaining" 'BEGIN { printf "%.3f", ms / 1000 }')
+  "$@" &
+  pid=$!
+  (
+    /bin/sleep "$remaining_sec"
+    # Still running past the shared deadline — tear down the tree.
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      /bin/sleep 0.05
+      kill -KILL "$pid" 2>/dev/null || true
+      pkill -KILL -P "$pid" 2>/dev/null || true
+    fi
+  ) &
+  watcher=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  # Cancel the watchdog if the child finished first.
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  now=$(now_ms)
+  # Signal death at/after the shared deadline is a timeout (GNU-like 124).
+  if (( rc != 0 && now - start_ms >= total_ms )); then
+    return 124
+  fi
+  return "$rc"
+}
+
+# Single-call convenience: fresh budget for one registry invocation.
+run_bounded() {
+  local start_ms total_ms
+  start_ms=$(now_ms)
+  total_ms=$(project_timeout_budget_ms)
+  run_bounded_remaining "$start_ms" "$total_ms" "$@"
+}
+
+# Age of a path in whole seconds (0 if unreadable). Used for lock-init grace.
+path_age_secs() {
+  local path=$1 now mtime
+  now=$(date +%s)
+  mtime=$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf '%s\n' "$now")
+  printf '%s\n' $(( now - mtime ))
+}
+
+# Append-only journal-pending key: one file per session+cursor+kind projection.
+pending_projection_key() {
+  local session=$1 cursor=$2 kind=$3
+  # Sanitize path separators; keep the key filesystem-safe and labels-only.
+  session=${session//\//_}
+  printf '%s.%s.%s\n' "$session" "$cursor" "$kind"
+}
+
+ensure_journal_pending_dir() {
+  local wf_dir=$1 pending="$1/journal-pending" legacy
+  if [[ -f $pending ]]; then
+    legacy="$pending.legacy.$$"
+    mv -- "$pending" "$legacy" 2>/dev/null || true
+    mkdir -p -m 700 -- "$pending" 2>/dev/null || return 1
+    if [[ -f $legacy ]]; then
+      mv -- "$legacy" "$pending/legacy-singleton" 2>/dev/null || rm -f -- "$legacy"
+    fi
+    return 0
+  fi
+  mkdir -p -m 700 -- "$pending" 2>/dev/null || return 1
+}
+
+write_journal_pending() {
+  # Content MUST include session+cursor+kind so content-hash keys (if any
+  # consumer still hashes the body) cannot collide across distinct projections.
+  # The filename is already session.cursor.kind — the unique identity.
+  local wf_dir=$1 key=$2 scope=$3 kind=$4 session=$5 cursor=$6 file
+  ensure_journal_pending_dir "$wf_dir" || return 0
+  file="$wf_dir/journal-pending/$key"
+  printf '{"scope":"%s","kind":"%s","session":"%s","cursor":%s,"source":"enqueue"}\n' \
+    "$scope" "$kind" "$session" "$cursor" >"$file" 2>/dev/null || true
+  chmod 600 "$file" 2>/dev/null || true
+}
+
+clear_own_journal_pending() {
+  local wf_dir=$1 key=$2
+  rm -f -- "$wf_dir/journal-pending/$key" 2>/dev/null || true
+}
+
 valid_session() {
   case ${1:-} in
     remote-agent--miospot--claude|remote-agent--miospot--codex|remote-agent--miospot--grok|\
     remote-agent--orchestration--claude|remote-agent--orchestration--codex|remote-agent--orchestration--grok) return 0 ;;
-    *) return 1 ;;
   esac
+  # Chat writer atoms: closed project, literal chat slot, strict chatid of
+  # lowercase alphanumerics joined by single hyphens (1-63 bytes, anchored,
+  # so separators, whitespace, globs, and traversal never form a session).
+  [[ ${1:-} =~ ^remote-agent--(miospot|orchestration)--chat--[a-z0-9](-?[a-z0-9]){0,31}$ ]]
+}
+
+# Chat writer atoms share the session vocabulary but are not one of the six
+# workflow slots; launch stays exactly the six-slot family.
+chat_session() {
+  case ${1:-} in remote-agent--*--chat--*) return 0 ;; *) return 1 ;; esac
 }
 
 session_harness() { printf '%s\n' "${1##*--}"; }
@@ -104,13 +289,136 @@ open_terminal_launcher() {
 }
 
 acquire_lock() {
-  local lock=$1 attempts=0
-  while ! mkdir "$lock" 2>/dev/null; do
+  local lock=$1 attempts=0 holder pid held_boot current_boot stale live_spins=0 age
+  # Dead/wrong-boot holders are broken. A live same-boot holder is busy after a
+  # few brief spins so the 2 s hook budget is never spent waiting on a live lock.
+  # Holder is written immediately after mkdir. Contenders that observe a missing
+  # holder MUST grace-wait (keyed to lock dir age + acquiring window) so they
+  # never steal a newly acquired LIVE lock mid-populate.
+  # /bin/sleep avoids PATH sleep shims and keeps spin cost predictable.
+  current_boot=$(boot_token)
+  while (( attempts < 50 )); do
+    if mkdir -m 700 -- "$lock" 2>/dev/null; then
+      # Critical section start: holder record BEFORE the lock is "held" for
+      # contenders. Any failure after mkdir still leaves a young lock dir that
+      # peers grace over rather than steal.
+      holder="$lock/holder"
+      printf 'pid=%s\nboot=%s\n' "$$" "$current_boot" >"$holder"
+      chmod 600 "$holder"
+      return 0
+    fi
+
+    holder="$lock/holder"
+    pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+    held_boot=$(sed -n 's/^boot=\(.*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+
+    # Missing/corrupt holder: grace window — never treat a temporarily missing
+    # holder file as immediately stale (init race).
+    if [[ -z $pid || -z $held_boot ]]; then
+      if [[ -d $lock ]]; then
+        age=$(path_age_secs "$lock")
+        # Grace: up to ~1s of wall age, or a few spins if clock is coarse.
+        if (( age <= 1 )); then
+          live_spins=$((live_spins + 1))
+          if (( live_spins >= 8 )); then
+            die 'event state is busy'
+          fi
+          /bin/sleep 0.02
+          attempts=$((attempts + 1))
+          continue
+        fi
+      fi
+      # Older than grace with no verifiable holder → break as stale.
+      stale="${lock}.stale.$$.$attempts"
+      if mv -- "$lock" "$stale" 2>/dev/null; then
+        rm -rf -- "$stale"
+      fi
+      attempts=$((attempts + 1))
+      continue
+    fi
+
+    # Live holder on this boot: brief spin, then refuse busy (do not steal).
+    if [[ $held_boot == "$current_boot" ]] && kill -0 "$pid" 2>/dev/null; then
+      live_spins=$((live_spins + 1))
+      if (( live_spins >= 3 )); then
+        die 'event state is busy'
+      fi
+      /bin/sleep 0.01
+      attempts=$((attempts + 1))
+      continue
+    fi
+
+    # Dead pid or wrong boot: break and retry.
+    stale="${lock}.stale.$$.$attempts"
+    if mv -- "$lock" "$stale" 2>/dev/null; then
+      rm -rf -- "$stale"
+    fi
     attempts=$((attempts + 1))
-    [[ $attempts -lt 500 ]] || die 'event state is busy'
-    sleep 0.01
   done
-  chmod 700 "$lock"
+  die 'event state is busy'
+}
+
+# Project session event labels into the bound workflow journal (fail-open).
+# Session event is already committed; projection/delivery failures never fail enqueue.
+# journal-pending is an append-only set keyed by session+cursor+kind.
+# project-event and optional deliver-queue share ONE projection budget so the
+# input-needed success path cannot stack two full timeouts inside the 2 s hook.
+project_bound_workflow() {
+  local directory=$1 session=$2 cursor=$3 scope=$4 kind=$5
+  local workflow_id wf_dir pending_key had_pending=0 reg rc=0
+  local start_ms total_ms
+  [[ -f $directory/workflow ]] || return 0
+  IFS= read -r workflow_id <"$directory/workflow" || true
+  valid_workflow_id "$workflow_id" || return 0
+  wf_dir="$(workflows_root)/$workflow_id"
+  [[ -d $wf_dir ]] || return 0
+  pending_key=$(pending_projection_key "$session" "$cursor" "$kind")
+
+  # Write this projection's pending record FIRST so a kill mid-registry still
+  # leaves an append-only reconcile marker within the hook budget.
+  write_journal_pending "$wf_dir" "$pending_key" "$scope" "$kind" "$session" "$cursor"
+
+  [[ -f $wf_dir/pending-send.json || -f $wf_dir/pending-send.payload ]] && had_pending=1
+
+  reg=$REGISTRY_BIN
+  [[ -x $reg ]] || reg=$SUPERVISOR_DIR/workflow-registry
+  [[ -x $reg ]] || {
+    if [[ $kind == input-needed && $had_pending -eq 1 ]]; then
+      printf 'delivery-pending\n' >"$wf_dir/delivery-pending" 2>/dev/null || true
+      chmod 600 "$wf_dir/delivery-pending" 2>/dev/null || true
+    fi
+    return 0
+  }
+
+  # Single combined wall-clock budget for the entire projection/delivery path.
+  start_ms=$(now_ms)
+  total_ms=$(project_timeout_budget_ms)
+
+  rc=0
+  run_bounded_remaining "$start_ms" "$total_ms" \
+    "$reg" project-event "$workflow_id" "$scope" "$kind" >/dev/null 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    # project-event raises the latch and runs queue-one delivery for input-needed.
+    # If a pending message somehow remains, try deliver-queue fail-open under the
+    # REMAINING shared budget (never a fresh second full timeout).
+    if [[ $kind == input-needed && ( -f $wf_dir/pending-send.json || -f $wf_dir/pending-send.payload ) ]]; then
+      if ! run_bounded_remaining "$start_ms" "$total_ms" \
+        "$reg" deliver-queue "$workflow_id" >/dev/null 2>&1; then
+        printf 'delivery-pending\n' >"$wf_dir/delivery-pending" 2>/dev/null || true
+        chmod 600 "$wf_dir/delivery-pending" 2>/dev/null || true
+      fi
+    fi
+    # Success clears only THIS projection's record; siblings stay.
+    clear_own_journal_pending "$wf_dir" "$pending_key"
+    return 0
+  fi
+
+  # Projection failed or timed out: leave own pending record; enqueue stays open.
+  if [[ $kind == input-needed && $had_pending -eq 1 ]]; then
+    printf 'delivery-pending\n' >"$wf_dir/delivery-pending" 2>/dev/null || true
+    chmod 600 "$wf_dir/delivery-pending" 2>/dev/null || true
+  fi
+  return 0
 }
 
 bounded_tail() {
@@ -166,9 +474,21 @@ init_state
 
 case $command in
   start)
-    [[ $# -eq 4 && $4 == --yolo ]] || usage
-    session=$1 harness=$2 requested_root_token=$3
+    # start SESSION HARNESS PROJECT_ROOT_TOKEN --yolo
+    # start SESSION HARNESS PROJECT_ROOT_TOKEN --workflow-binding PATH --yolo
+    workflow_binding=
+    if [[ $# -eq 4 && $4 == --yolo ]]; then
+      session=$1 harness=$2 requested_root_token=$3
+    elif [[ $# -eq 6 && $4 == --workflow-binding && $6 == --yolo ]]; then
+      session=$1 harness=$2 requested_root_token=$3
+      workflow_binding=$5
+    else
+      usage
+    fi
     valid_session "$session" || usage
+    # Chat writer atoms never widen the six-slot launch surface, even when a
+    # chatid collides with a harness name.
+    ! chat_session "$session" || usage
     case $harness in claude|codex|grok) ;; *) usage ;; esac
     [[ $(session_harness "$session") == "$harness" ]] || usage
     case $requested_root_token in
@@ -180,6 +500,13 @@ case $command in
     [[ -d $requested_root && ! -L $requested_root ]] || die 'worktree root must be a real directory'
     root=$(cd "$requested_root" && pwd -P) || die 'cannot canonicalize worktree root'
     tmux has-session -t "$session" 2>/dev/null && die "session already exists: $session"
+    if [[ -n $workflow_binding ]]; then
+      [[ -f $workflow_binding && ! -L $workflow_binding ]] \
+        || die 'workflow binding file must be an owned regular file'
+      [[ -O $workflow_binding ]] || die 'workflow binding file must be owned'
+      IFS= read -r bound_workflow <"$workflow_binding" || true
+      valid_workflow_id "${bound_workflow:-}" || die 'workflow binding file must contain a valid workflowId'
+    fi
 
     directory=$(state_dir "$session")
     mkdir -p "$directory/events"
@@ -188,6 +515,7 @@ case $command in
     if [[ -f $directory/cursor ]]; then IFS= read -r cursor <"$directory/cursor"; fi
     valid_uint "$cursor" || die 'corrupt event cursor'
     rm -f "$directory/events/"*
+    rm -f "$directory/workflow"
     epoch="epoch-$(date +%s)-$$-$RANDOM"
 
     start_complete=0
@@ -220,6 +548,9 @@ case $command in
     atomic_write "$directory/pane" "$pane"
     atomic_write "$directory/epoch" "$epoch"
     atomic_write "$directory/cursor" "$cursor"
+    if [[ -n $workflow_binding ]]; then
+      atomic_write "$directory/workflow" "$bound_workflow"
+    fi
     tmux respawn-pane -k -t "$pane" -c "$root" -- "$harness" --yolo
     start_complete=1
     trap - EXIT
@@ -311,11 +642,15 @@ case $command in
     root=$(cd "$requested_root" && pwd -P) || die 'cannot canonicalize event root'
 
     matched=''
+    # One shared loop: the six workflow slots and the chat writer family both
+    # live under the remote-agent-- prefix, and only names that pass the
+    # closed session vocabulary may participate in root/pane matching.
     for directory in "$state_base/sessions/"remote-agent--*; do
+      session=${directory##*/}
+      valid_session "$session" || continue
       [[ -d $directory && -f $directory/root && -f $directory/pane ]] || continue
       IFS= read -r stored_root <"$directory/root"
       IFS= read -r stored_pane <"$directory/pane"
-      session=${directory##*/}
       if [[ $stored_root == "$root" && $stored_pane == "$pane" ]] && tmux has-session -t "$session" 2>/dev/null; then
         [[ -z $matched ]] || die 'ambiguous root and pane binding'
         matched=$session
@@ -325,7 +660,7 @@ case $command in
     directory=$(state_dir "$matched")
     lock=$directory/enqueue.lock
     acquire_lock "$lock"
-    trap 'rmdir "$lock" 2>/dev/null || true' EXIT HUP INT TERM
+    trap 'release_enqueue_lock "'"$lock"'"' EXIT HUP INT TERM
     cursor=$(current_cursor "$matched")
     cursor=$((cursor + 1))
     event=$(printf '%020d' "$cursor")
@@ -334,7 +669,9 @@ case $command in
     chmod 600 "$temporary"
     mv -f "$temporary" "$directory/events/$event"
     atomic_write "$directory/cursor" "$cursor"
-    rmdir "$lock"
+    # Session event is durable first. Projection is fail-open within the hook budget.
+    project_bound_workflow "$directory" "$matched" "$cursor" "$scope" "$kind" || true
+    release_enqueue_lock "$lock"
     trap - EXIT HUP INT TERM
     ;;
 

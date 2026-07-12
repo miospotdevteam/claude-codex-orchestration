@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# MacBook mechanical mirror worker.  Pulls claimed jobs over SSH (no inbound
+# listener), reads direction from the claim response, and executes only
+# fingerprint → stage → apply → verify → ack via protocol verbs plus
+# git-align / populate-inbound.  Ownership and direction decisions stay on
+# the Mini registry.
+#
+# Known limitation (source-side deletion inventory): outbound deletion
+# inventory lists only the local transfer universe (tracked + ordinary
+# untracked + single approved ignored path). Paths that exist only on the
+# Mini destination are never inventoried, so apply-exact cannot delete them.
+# After a successful apply the remote digest advances to the local universe
+# fingerprint — a "last staged content" marker, not full destination-tree
+# equality. Full destination-orphan deletion would need a protocol verb that
+# enumerates the Mini transfer universe; that is out of scope for this worker.
+umask 077
+
+readonly PROTOCOL=remote-agent-v1
+readonly AUTHORITY_TOKEN=authority-root-v1
+readonly PROJECTS=(miospot orchestration)
+
+usage() {
+  cat >&2 <<'EOF'
+usage: mirror-worker [--host HOST] [--once] [--timeout SECONDS]
+  --once      claim at most one job (or empty) and exit
+  --timeout   mirror-next long-poll seconds (0..300, default 30; 0 with --once)
+EOF
+}
+
+die() {
+  printf 'mirror-worker: %s\n' "$*" >&2
+  exit 1
+}
+
+valid_atom() {
+  case $1 in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+valid_relative_path() {
+  case $1 in
+    ''|/*|*/../*|../*|*/..|..|*//*|*[$'\n\r']*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+contains_glob() {
+  case $1 in
+    *'*'*|*'?'*|*'['*|*']'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+json_string() {
+  # Extract the first JSON string value for key $1 from stdin/arg $2.
+  local key=$1 text=${2:-}
+  if [[ -z $text ]]; then
+    IFS= read -r text || true
+  fi
+  printf '%s' "$text" | sed -n "s/.*\"${key}\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+}
+
+json_raw() {
+  local key=$1 text=$2
+  printf '%s' "$text" | sed -n "s/.*\"${key}\":\\([^,}]*\\).*/\\1/p" | head -n 1
+}
+
+serialize_ssh_command() {
+  local argument escaped separator=''
+  REPLY=''
+  [[ $# -gt 0 ]] || die 'internal empty SSH command'
+  for argument in "$@"; do
+    escaped=${argument//\'/\'\\\'\'}
+    REPLY+="${separator}'${escaped}'"
+    separator=' '
+  done
+}
+
+ssh_call() {
+  local remote_command
+  serialize_ssh_command "$@"
+  remote_command=$REPLY
+  # Mechanical worker never ships payload bytes on SSH stdin; keep stdin closed
+  # so test doubles (and OpenSSH) cannot block on an inherited pipe.
+  # shellcheck disable=SC2029
+  ssh "$host" "$remote_command" </dev/null
+}
+
+ssh_quiet() {
+  ssh_call "$@" >/dev/null
+}
+
+hash_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# Resolve the configured checkout for a claimed project.  Refuses symlinks,
+# non-directories, non-Git trees, and nested worktrees.
+resolve_local_root() {
+  local project=$1 root canonical toplevel
+  case $project in
+    miospot)
+      root=${LOCAL_MIOSPOT_ROOT:-${LOCAL_ROOT:-"$HOME/Projects/miospot"}}
+      ;;
+    orchestration)
+      root=${LOCAL_ORCHESTRATION_ROOT:-${LOCAL_ROOT:-"$HOME/Projects/orchestration"}}
+      ;;
+    *) die "unsupported project: $project" ;;
+  esac
+  [[ -d $root && ! -L $root ]] || die 'local project root is not a real directory'
+  canonical=$(cd -- "$root" 2>/dev/null && pwd -P) || die 'local project root is not a real directory'
+  [[ $root == "$canonical" ]] || die 'local project root must be a canonical real directory'
+  cd -- "$root"
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || die 'configured local project root is not a Git worktree'
+  [[ $toplevel == "$root" ]] || die 'configured local project root is not the exact Git toplevel'
+  local_root=$root
+  local_branch=$(git rev-parse --abbrev-ref HEAD)
+  local_head=$(git rev-parse HEAD)
+  [[ $local_head != HEAD ]] || die 'detached or ambiguous local HEAD'
+  [[ $local_branch != HEAD ]] || die 'detached or ambiguous local HEAD'
+}
+
+append_manifest_path() {
+  local path=$1
+  valid_relative_path "$path" || die 'Git produced an unsafe relative path'
+  [[ $path != .git && $path != .git/* ]] || die '.git is never transferable'
+  [[ $path != .remote-agent-git.bundle ]] || die 'reserved bundle path is not transferable'
+  [[ ! -L $path ]] || die "refusing symlink in transfer universe: $path"
+  [[ -f $path ]] || return 0
+  printf '%s\0' "$path" >>"$manifest"
+}
+
+build_transfer_universe() {
+  local tracked=$work_dir/tracked.nul untracked=$work_dir/untracked.nul path
+  manifest=$work_dir/manifest.nul
+  : >"$manifest"
+  chmod 600 "$manifest"
+  git ls-files -z >"$tracked"
+  git ls-files --others --exclude-standard -z >"$untracked"
+  chmod 600 "$tracked" "$untracked"
+  while IFS= read -r -d '' path; do
+    append_manifest_path "$path"
+  done <"$tracked"
+  while IFS= read -r -d '' path; do
+    append_manifest_path "$path"
+  done <"$untracked"
+
+  if [[ -n $include_ignored || -n $approve_ignored ]]; then
+    [[ -n $include_ignored && $include_ignored == "$approve_ignored" ]] \
+      || die 'ignored path needs identical explicit approval'
+    valid_relative_path "$include_ignored" || die 'invalid ignored path'
+    contains_glob "$include_ignored" && die 'ignored approval must name one literal path'
+    git check-ignore -- "$include_ignored" >/dev/null 2>&1 || die 'approved path is not ignored'
+    append_manifest_path "$include_ignored"
+  fi
+}
+
+snapshot_payload() {
+  local output=$1 path digest
+  : >"$output"
+  while IFS= read -r -d '' path; do
+    [[ -f $path && ! -L $path ]] || die "snapshot path changed or became unsafe: $path"
+    digest=$(hash_stream <"$path")
+    printf '%s\0%s\0' "$path" "$digest" >>"$output"
+  done <"$manifest"
+  printf '%s\0%s\0' "$local_branch" "$local_head" >>"$output"
+}
+
+# Content-strong fingerprint over the transfer universe + branch/HEAD.
+# Snapshot payload is a private work-dir file; the strong digest is a stream
+# hash of that payload (no test-shaped filename residue in argv logs).
+compute_fingerprint() {
+  local pre=$work_dir/snapshot.payload
+  snapshot_payload "$pre"
+  hash_stream <"$pre"
+}
+
+request_stage() {
+  local direction=$1 privacy_directive=$'umask 077\nmode=0700'
+  local response bytes
+  response=$(ssh_call "$PROTOCOL" stage "$privacy_directive" "$project" "$direction" "$AUTHORITY_TOKEN") \
+    || die 'Mini stage creation failed'
+  bytes=$(printf '%s' "$response" | wc -c | tr -d ' ')
+  [[ $bytes -le 4096 ]] || die 'Mini stage response exceeds 4096-byte bound'
+  case $response in
+    *$'\n'*|*$'\r'*) die 'Mini stage response is not one bounded JSON line' ;;
+  esac
+  stage_path=$(json_string stagePath "$response")
+  # Fail closed: never invent a stage path. A missing stagePath with
+  # apply-exact's deletion inventory can delete the wrong tree.
+  [[ -n $stage_path ]] || die 'stage-path-missing: Mini stage response omitted stagePath'
+  [[ $stage_path == /* ]] || die 'Mini returned an invalid stage path'
+  case $stage_path in
+    *..*|*[[:space:]]*) die 'Mini returned an unsafe stage path' ;;
+  esac
+}
+
+run_guarded_apply() {
+  local apply_result=$work_dir/apply-result apply_status=0 apply_response
+  : >"$apply_result"
+  chmod 600 "$apply_result"
+  if ssh_call "$PROTOCOL" apply-exact "$project" "$universe_digest" >"$apply_result"; then
+    apply_status=0
+  else
+    apply_status=$?
+  fi
+  apply_response=$(<"$apply_result")
+
+  if [[ $apply_status -eq 0 && $apply_response != *'"apply":"failed"'* ]]; then
+    return 0
+  fi
+  case $apply_response in
+    *'"restore":"verified"'*)
+      ssh_quiet "$PROTOCOL" restore-verify "$project" || true
+      die 'apply-failed: pre-transfer snapshot restored and verified'
+      ;;
+    *'"restore":"failed"'*)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "mirror-worker:$$" || true
+      die 'apply-failed: restore-failed; recovery-required retained'
+      ;;
+    *)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "mirror-worker:$$" || true
+      die "apply-failed: status=$apply_status; recovery-required retained"
+      ;;
+  esac
+}
+
+run_guarded_alignment() {
+  local alignment_result=$work_dir/alignment-result alignment_status=0 alignment_response
+  : >"$alignment_result"
+  chmod 600 "$alignment_result"
+  if ssh_call "$PROTOCOL" git-align "$project" "$local_branch" "$local_head" >"$alignment_result"; then
+    return 0
+  else
+    alignment_status=$?
+  fi
+  alignment_response=$(<"$alignment_result")
+  case $alignment_response in
+    *'"restore":"verified"'*)
+      ssh_quiet "$PROTOCOL" restore-verify "$project" || true
+      die 'align-failed: pre-transfer snapshot restored and verified'
+      ;;
+    *'"restore":"failed"'*)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "mirror-worker:$$" || true
+      die 'align-failed: restore-failed; recovery-required retained'
+      ;;
+    *)
+      ssh_quiet "$PROTOCOL" recovery-required "$project" "mirror-worker:$$" || true
+      die "align-failed: status=$alignment_status; recovery-required retained"
+      ;;
+  esac
+}
+
+transfer_outbound() {
+  local bundle=$work_dir/.remote-agent-git.bundle
+  local post_snapshot=$work_dir/post-snapshot.nul
+  local post_status=$work_dir/post-status.nul pre_status=$work_dir/pre-status.nul
+  local path
+  git status --porcelain=v1 -z >"$pre_status"
+  git bundle create "$bundle" "refs/heads/$local_branch" >/dev/null
+  git bundle verify "$bundle" >/dev/null 2>&1
+  request_stage outbound
+  # Source-side inventory only (see header limitation): candidate deletions are
+  # local transfer-universe paths. Destination-only orphans are not listed.
+  ssh_quiet "$PROTOCOL" deletion-inventory "$project" "$universe_digest"
+  while IFS= read -r -d '' path; do
+    ssh_quiet "$PROTOCOL" inventory-path "$project" "$path"
+  done <"$manifest"
+  ssh_quiet "$PROTOCOL" restore-journal mode=0600 "$project"
+  # Transfer universe is enforced here at stage time (tracked + ordinary
+  # untracked; ignored only via the single enumerated exception above).
+  # Explicit || die: never rely solely on set -e across bash versions.
+  rsync -a --from0 --files-from="$manifest" -- "$local_root/" "$host:$stage_path/" \
+    || die 'network-staging-failed: outbound rsync of transfer universe failed'
+  rsync -a -- "$bundle" "$host:$stage_path/.remote-agent-git.bundle" \
+    || die 'network-staging-failed: outbound rsync of git bundle failed'
+  ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
+  snapshot_payload "$post_snapshot"
+  cmp -s "$work_dir/snapshot.payload" "$post_snapshot" || die 'source snapshot changed during outbound staging'
+  git status --porcelain=v1 -z >"$post_status"
+  cmp -s "$pre_status" "$post_status" || die 'source Git status changed during outbound staging'
+  run_guarded_apply
+  run_guarded_alignment
+}
+
+transfer_inbound() {
+  local advertised bundle inbound_stage=$work_dir/inbound-stage
+  local current_branch current_head remote_branch remote_head
+  remote_branch=${claim_branch:-}
+  remote_head=${claim_head:-}
+  [[ -n $remote_branch && -n $remote_head ]] || die 'claim omitted Git alignment metadata'
+  git check-ref-format --branch "$remote_branch" >/dev/null 2>&1 || die 'claim returned an invalid branch'
+  [[ $remote_head =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die 'claim returned an invalid commit ID'
+  mkdir "$inbound_stage"
+  chmod 700 "$inbound_stage"
+  request_stage inbound
+  ssh_quiet "$PROTOCOL" populate-inbound "$project" "$remote_branch" "$remote_head"
+  rsync -a -- "$host:$stage_path/" "$inbound_stage/" \
+    || die 'network-staging-failed: inbound rsync from Mini stage failed'
+  ssh_quiet "$PROTOCOL" stage-verify "$project" "$universe_digest"
+  bundle=$inbound_stage/.remote-agent-git.bundle
+  advertised=$(git bundle list-heads "$bundle" 2>/dev/null) || die 'Mini reciprocal Git bundle could not be inspected'
+  [[ $advertised == "$remote_head refs/heads/$remote_branch" ]] || die 'Mini reciprocal Git bundle advertised unexpected refs'
+  git bundle verify "$bundle" >/dev/null 2>&1 || die 'Mini reciprocal Git bundle failed verification'
+  git bundle unbundle "$bundle" >/dev/null 2>&1 || die 'Mini reciprocal Git bundle could not be imported'
+  current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || die 'local HEAD became detached during inbound apply'
+  current_head=$(git rev-parse HEAD) || die 'local HEAD became invalid during inbound apply'
+  [[ $current_branch == "$local_branch" && $current_head == "$local_head" ]] \
+    || die 'local branch or HEAD changed during inbound apply'
+  git merge-base --is-ancestor "$local_head" "$remote_head" \
+    || die 'inbound apply requires a fast-forward from the local HEAD'
+  rsync -a --exclude=/.remote-agent-git.bundle -- "$inbound_stage/" "$local_root/" \
+    || die 'network-staging-failed: inbound local apply rsync failed'
+  if [[ $remote_branch == "$local_branch" ]]; then
+    git update-ref "refs/heads/$remote_branch" "$remote_head" "$local_head"
+  else
+    git update-ref "refs/heads/$remote_branch" "$remote_head" ''
+    git symbolic-ref HEAD "refs/heads/$remote_branch"
+  fi
+  git reset --mixed "$remote_head" >/dev/null
+}
+
+mirror_ack_job() {
+  local status=$1 response ack_status=0
+  local -a args
+  # claim_token is required at claim time; never fabricate a token here.
+  [[ -n $claim_token ]] || die 'claim omitted claimToken'
+  args=(
+    "$registry_bin" mirror-ack "$job_id"
+    --status "$status"
+    --claim-token "$claim_token"
+  )
+  if [[ -n $universe_digest ]]; then
+    args+=(--fingerprint "$universe_digest")
+  fi
+  if [[ -n ${claim_branch:-$local_branch} ]]; then
+    args+=(--branch "${claim_branch:-$local_branch}")
+  fi
+  if [[ -n ${claim_head:-$local_head} ]]; then
+    args+=(--head "${claim_head:-$local_head}")
+  fi
+  set +e
+  response=$(ssh_call "${args[@]}" 2>"$work_dir/ack.err")
+  ack_status=$?
+  set -e
+  if [[ $ack_status -ne 0 ]]; then
+    if [[ -s $work_dir/ack.err ]]; then
+      cat "$work_dir/ack.err" >&2
+    fi
+    if [[ -n $response ]]; then
+      printf '%s\n' "$response" >&2
+    fi
+    die "mirror-ack refused: ${response:-status=$ack_status}"
+  fi
+  case $response in
+    *'"ok":false'*|*'post-sync-mismatch'*)
+      printf '%s\n' "$response" >&2
+      die "mirror-ack refused: $response"
+      ;;
+  esac
+}
+
+# Reset per-job workspace so consecutive loop iterations cannot collide on
+# inbound-stage (or any other job-scoped path). Trap still owns the parent
+# work_dir lifetime.
+reset_job_workspace() {
+  if [[ -d $work_dir ]]; then
+    find "$work_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  else
+    mkdir -m 700 "$work_dir"
+  fi
+  chmod 700 "$work_dir" 2>/dev/null || true
+}
+
+process_claim() {
+  local claim=$1 direction ok job_raw
+  # Transfer path must run with errexit so rsync/apply failures hard-stop
+  # before stage-verify / apply-exact / ack (never swallowed by callers).
+  set -e
+  ok=$(json_raw ok "$claim")
+  if [[ $ok == false ]]; then
+    local err
+    err=$(json_string error "$claim")
+    die "${err:-claim-refused}"
+  fi
+  job_raw=$(json_raw jobId "$claim")
+  if [[ $job_raw == null || -z $job_raw ]]; then
+    # Bash 3.2: `return 1` under `set -e` exits the whole process even when
+    # the caller used `set +e`. Clear errexit before returning empty.
+    set +e
+    return 1
+  fi
+  job_id=$(json_string jobId "$claim")
+  [[ -n $job_id ]] || die 'claim omitted jobId'
+  project=$(json_string project "$claim")
+  [[ -n $project ]] || die 'claim omitted project'
+  direction=$(json_string direction "$claim")
+  claim_token=$(json_string claimToken "$claim")
+  # Token-less claims must never reach stage/apply (finding #5).
+  [[ -n $claim_token ]] || die 'claim omitted claimToken'
+  claim_branch=$(json_string branch "$claim")
+  claim_head=$(json_string head "$claim")
+  include_ignored=$(json_string includeIgnored "$claim")
+  approve_ignored=$(json_string approveIgnored "$claim")
+
+  case $direction in
+    outbound|inbound) ;;
+    *) die "claim returned unsupported direction: ${direction:-empty}" ;;
+  esac
+
+  # Transfer-time universe + digest (protocol fingerprint is the local
+  # universe digest; there is no remote-agent-v1 "fingerprint" verb).
+  resolve_local_root "$project"
+  build_transfer_universe
+  universe_digest=$(compute_fingerprint)
+
+  case $direction in
+    outbound) transfer_outbound ;;
+    inbound) transfer_inbound ;;
+  esac
+
+  mirror_ack_job verified
+  printf '{"ok":true,"jobId":"%s","direction":"%s","status":"verified"}\n' \
+    "$job_id" "$direction"
+  set +e
+  return 0
+}
+
+# Returns 0 when a job was processed, 1 when the claim was empty.
+# Hard failures call die (exit) or abort via set -e — never swallowed.
+# Empty claims are a normal non-fatal outcome: never let process_claim's
+# return 1 under errexit exit the whole process (that stranded later
+# projects in drain_once and made --once exit 1 on a fully empty queue).
+claim_project() {
+  local project_name=$1 response status=0 claim_digest process_status=0
+  # Re-enable errexit: callers may invoke us under set +e to capture empty.
+  set -e
+  reset_job_workspace
+  # Clear per-job globals so a prior claim cannot leak into this attempt.
+  project=
+  local_root=
+  local_branch=
+  local_head=
+  job_id=
+  claim_token=
+  claim_branch=
+  claim_head=
+  include_ignored=
+  approve_ignored=
+  universe_digest=
+  manifest=
+  stage_path=
+
+  # Fingerprint before claim so --local-digest can fire registry digests
+  # (diverged / direction). Transfer-time rebuild may add the single
+  # enumerated ignored path once the claim response names it.
+  resolve_local_root "$project_name"
+  build_transfer_universe
+  claim_digest=$(compute_fingerprint)
+  [[ -n $claim_digest ]] || die 'failed to compute local universe digest'
+  # Registry local-digest atoms are bounded; hex digests fit.
+  [[ $claim_digest =~ ^[A-Za-z0-9._-]{1,128}$ ]] \
+    || die 'local universe digest is not a valid local-digest atom'
+
+  set +e
+  response=$(ssh_call "$registry_bin" mirror-next "$project_name" \
+    --timeout "$poll_timeout" --local-digest "$claim_digest" 2>"$work_dir/claim.err")
+  status=$?
+  set -e
+  if [[ $status -ne 0 ]]; then
+    if [[ -s $work_dir/claim.err ]]; then
+      cat "$work_dir/claim.err" >&2
+    fi
+    if [[ -n $response ]]; then
+      printf '%s\n' "$response" >&2
+      local err
+      err=$(json_string error "$response")
+      die "${err:-mirror-next-failed}"
+    fi
+    die "mirror-next failed with status $status"
+  fi
+  # Capture empty (1) without placing process_claim in an `if` condition —
+  # that would disable set -e for the whole transfer path under bash 3.2.
+  # Stay under set +e through return: bash 3.2 exits on `return N!=0` when
+  # errexit is active, even if the outer caller had set +e.
+  set +e
+  process_claim "$response"
+  process_status=$?
+  return "$process_status"
+}
+
+drain_once() {
+  local project_name st
+  for project_name in "${PROJECTS[@]}"; do
+    # Capture empty (1) without placing claim_project in an `if` condition —
+    # that would disable set -e for the whole transfer path.
+    set +e
+    claim_project "$project_name"
+    st=$?
+    if [[ $st -eq 0 ]]; then
+      return 0
+    fi
+    if [[ $st -ne 1 ]]; then
+      exit "$st"
+    fi
+    # empty claim → try next project (errexit still off for return 1 below)
+  done
+  # Empty across all projects is normal; return under set +e (bash 3.2).
+  set +e
+  return 1
+}
+
+# ── argv ────────────────────────────────────────────────────────────────────
+
+host=''
+once=0
+poll_timeout=30
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --host)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      host=$2
+      shift 2
+      ;;
+    --once)
+      once=1
+      shift
+      ;;
+    --timeout)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      poll_timeout=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    run)
+      # launchd entrypoint alias (KeepAlive loop)
+      shift
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+if [[ $once -eq 1 && $poll_timeout -eq 30 ]]; then
+  poll_timeout=0
+fi
+[[ $poll_timeout =~ ^[0-9]+$ ]] && (( poll_timeout <= 300 )) \
+  || die 'timeout must be an integer from 0 through 300'
+
+state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
+config_host=$state_root/orchestration-remote-host
+if [[ -z $host && -n ${REMOTE_AGENT_HOST:-} ]]; then
+  host=$REMOTE_AGENT_HOST
+fi
+if [[ -z $host && -f $config_host && ! -L $config_host ]]; then
+  IFS= read -r host <"$config_host" || true
+fi
+[[ -n $host ]] || die 'Mini host is required via --host, REMOTE_AGENT_HOST, or XDG state config'
+valid_atom "$host" || die 'invalid Mini host'
+
+registry_bin=${REMOTE_REGISTRY_BIN:-workflow-registry}
+
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/mirror-worker.XXXXXX")
+chmod 700 "$work_dir"
+cleanup() { rm -rf "$work_dir"; }
+trap cleanup EXIT HUP INT TERM
+
+# Job/claim state (set per claim).
+project=
+local_root=
+local_branch=
+local_head=
+job_id=
+claim_token=
+claim_branch=
+claim_head=
+include_ignored=
+approve_ignored=
+universe_digest=
+manifest=
+stage_path=
+
+# Optional bounds for tests/ops (0 = unlimited). Loop sleep defaults to 2s.
+max_jobs=${MIRROR_WORKER_MAX_JOBS:-0}
+loop_sleep=${MIRROR_WORKER_LOOP_SLEEP:-2}
+[[ $max_jobs =~ ^[0-9]+$ ]] || die 'MIRROR_WORKER_MAX_JOBS must be a non-negative integer'
+[[ $loop_sleep =~ ^[0-9]+$ ]] || die 'MIRROR_WORKER_LOOP_SLEEP must be a non-negative integer'
+jobs_done=0
+
+# drain_once return: 0 = processed a job, 1 = empty. Hard failures exit the
+# process (set -e / die). Never put drain_once in `if` or `||` — on bash 3.2
+# that disables errexit for the whole transfer path (rsync would be swallowed).
+if [[ $once -eq 1 ]]; then
+  set +e
+  drain_once
+  st=$?
+  set -e
+  if [[ $st -eq 0 || $st -eq 1 ]]; then
+    exit 0
+  fi
+  exit "$st"
+fi
+
+# KeepAlive loop: drain the durable Mini queue whenever the MacBook is awake.
+# SSH pull only — never opens an inbound listener.
+while :; do
+  set +e
+  drain_once
+  st=$?
+  set -e
+  if [[ $st -eq 0 ]]; then
+    jobs_done=$((jobs_done + 1))
+    if (( max_jobs > 0 && jobs_done >= max_jobs )); then
+      exit 0
+    fi
+  elif [[ $st -ne 1 ]]; then
+    exit "$st"
+  fi
+  sleep "$loop_sleep"
+done

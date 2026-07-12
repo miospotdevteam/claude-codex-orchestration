@@ -6,6 +6,12 @@ umask 077
 MAX_OUTPUT_BYTES=4096
 LOCK_DIR=
 LOCK_BOOT=
+LOCK_BROKEN_PID=
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+PROTOCOL_BIN="$SCRIPT_DIR/remote-agent-v1"
+PROTOCOL_AUTHORITY=authority-root-v1
+PROTOCOL_OWNER=workflow-registry-v1
+PROTOCOL_MUTEX_PROJECT=
 
 json_error() {
   local code=$1 message=$2
@@ -62,6 +68,7 @@ release_lock() {
 acquire_lock() {
   local wanted=$1 holder pid held_boot current_boot stale attempt
   current_boot=$(boot_token)
+  LOCK_BROKEN_PID=
   attempt=0
   while (( attempt < 3 )); do
     if mkdir -m 700 -- "$wanted" 2>/dev/null; then
@@ -85,6 +92,7 @@ acquire_lock() {
 
     stale="${wanted}.stale.$$.$attempt"
     if mv -- "$wanted" "$stale" 2>/dev/null; then
+      LOCK_BROKEN_PID=$pid
       rm -rf -- "$stale"
     fi
     attempt=$((attempt + 1))
@@ -115,6 +123,216 @@ atomic_text() {
   mv -f -- "$tmp" "$target"
 }
 
+atomic_json() {
+  local target=$1 value=$2 tmp
+  tmp=$(mktemp "${target}.tmp.XXXXXX")
+  printf '%s\n' "$value" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+
+trim_json_dir() {
+  local dir=$1 limit=$2 count old
+  count=$(find "$dir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  if (( count > limit )); then
+    while IFS= read -r old && (( count > limit )); do
+      rm -f -- "$old"; count=$((count - 1))
+    done < <(find "$dir" -maxdepth 1 -type f -name '*.json' -print | LC_ALL=C sort)
+  fi
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+workflow_path() {
+  validate_workflow_id "$1"
+  local path="$registry_root/$1"
+  [[ -d $path ]] || fail not-found 'workflow not found' 66
+  printf '%s\n' "$path"
+}
+
+journal_epoch() {
+  head -n 1 "$1/journal/epoch"
+}
+
+journal_seq() {
+  local wf_dir=$1 stored last raw
+  stored=$(head -n 1 "$wf_dir/journal/journal-cursor" 2>/dev/null || printf '0')
+  [[ $stored =~ ^[0-9]+$ ]] || stored=0
+  last=$(find "$wf_dir/journal" -maxdepth 1 -type f -name '[0-9]*.json' -print 2>/dev/null \
+    | LC_ALL=C sort | tail -n 1)
+  if [[ -n $last ]]; then
+    raw=$(basename "$last" .json | sed 's/^0*//')
+    [[ -n $raw ]] || raw=0
+    (( raw > stored )) && stored=$raw
+  fi
+  printf '%s\n' "$stored"
+}
+
+journal_append_locked() {
+  local wf_dir=$1 kind=$2 scope=${3:-main} detail=${4:-} seq event tmp
+  seq=$(( $(journal_seq "$wf_dir") + 1 ))
+  event=$(jq -cn \
+    --arg kind "$kind" --arg scope "$scope" --argjson seq "$seq" \
+    --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg detail "$detail" '
+      {kind:$kind,scope:$scope,seq:$seq,at:$at}
+      + (if $detail == "" then {} else {detail:($detail[0:256])} end)
+      + (if $kind == "lock-broken" then {deadPid:($detail | tonumber)} else {} end)
+    ')
+  tmp=$(mktemp "$wf_dir/journal/.event.XXXXXX")
+  printf '%s\n' "$event" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$wf_dir/journal/$(printf '%020d' "$seq").json"
+  atomic_text "$wf_dir/journal/journal-cursor" "$seq"
+  printf '%s\n' "$seq"
+}
+
+journal_append_pending_locked() {
+  local wf_dir=$1 kind=$2 scope=$3 pending_key=$4 seq event tmp
+  seq=$(( $(journal_seq "$wf_dir") + 1 ))
+  event=$(jq -cn --arg kind "$kind" --arg scope "$scope" --arg pendingKey "$pending_key" \
+    --argjson seq "$seq" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{kind:$kind,scope:$scope,seq:$seq,at:$at,pendingKey:$pendingKey}')
+  tmp=$(mktemp "$wf_dir/journal/.event.XXXXXX")
+  printf '%s\n' "$event" >"$tmp"; chmod 600 "$tmp"
+  mv -f -- "$tmp" "$wf_dir/journal/$(printf '%020d' "$seq").json"
+  atomic_text "$wf_dir/journal/journal-cursor" "$seq"
+  printf '%s\n' "$seq"
+}
+
+journal_broken_lock_locked() {
+  local wf_dir=$1
+  if [[ -n ${LOCK_BROKEN_PID:-} ]]; then
+    journal_append_locked "$wf_dir" lock-broken registry "$LOCK_BROKEN_PID" >/dev/null
+    LOCK_BROKEN_PID=
+  fi
+}
+
+notify_waiter() {
+  local wf_dir=$1 waiters="$1/journal/waiters" fifo waiter pid held_boot current_boot
+  [[ -d $waiters ]] || return 0
+  for waiter in "$waiters"/*.waiting; do
+    [[ -f $waiter ]] || continue
+    pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$waiter" | head -n 1)
+    held_boot=$(sed -n 's/^boot=\(.*\)$/\1/p' "$waiter" | head -n 1)
+    fifo="$waiters/wake.$pid.fifo"
+    current_boot=$(boot_token)
+    if [[ -n $pid && $held_boot == "$current_boot" && -p $fifo ]] && kill -0 "$pid" 2>/dev/null; then
+      printf '.\n' >"$fifo" 2>/dev/null || true
+    else
+      rm -f -- "$waiter" "$fifo"
+    fi
+  done
+}
+
+raise_latch_locked() {
+  local wf_dir=$1 workflow_id=$2 seq=$3 record
+  record=$(jq -cn --arg workflowId "$workflow_id" --argjson seq "$seq" \
+    --arg raisedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{workflowId:$workflowId,state:"open",journalSeq:$seq,kind:"input-needed",raisedAt:$raisedAt}')
+  atomic_json "$wf_dir/needs-input.json" "$record"
+}
+
+record_request_locked() {
+  local wf_dir=$1 request_id=$2 digest=$3 outcome=$4 record
+  mkdir -p -m 700 -- "$wf_dir/requests"
+  record=$(jq -cn --arg requestId "$request_id" --arg sha256 "$digest" \
+    --argjson outcome "$outcome" '{requestId:$requestId,sha256:$sha256,outcome:$outcome}')
+  atomic_json "$wf_dir/requests/$request_id.json" "$record"
+}
+
+deliver_pending_locked() {
+  local wf_dir=$1 workflow_id=$2 meta payload request_id digest actual latch state seq outcome
+  local latch_workflow latch_seq latch_event latch_kind
+  meta="$wf_dir/pending-send.json"
+  payload="$wf_dir/pending-send.payload"
+  [[ -f $meta && -f $payload ]] || return 0
+  latch="$wf_dir/needs-input.json"
+  [[ -f $latch ]] || return 0
+  state=$(jq -r '.state // empty' "$latch")
+  [[ $state == open || $state == pending || $state == raised ]] || return 0
+  latch_workflow=$(jq -r '.workflowId // empty' "$latch")
+  latch_seq=$(jq -r '.journalSeq // .seq // empty' "$latch")
+  [[ $latch_workflow == "$workflow_id" && $latch_seq =~ ^[0-9]+$ ]] \
+    || fail invalid-latch 'needs-input latch evidence is invalid' 65
+  latch_event="$wf_dir/journal/$(printf '%020d' "$latch_seq").json"
+  latch_kind=$(jq -r '.kind // empty' "$latch_event" 2>/dev/null || true)
+  [[ $latch_kind == input-needed || $latch_kind == needs-input ]] \
+    || fail invalid-latch 'needs-input latch does not reference an input event' 65
+  request_id=$(jq -r '.requestId' "$meta")
+  digest=$(jq -r '.sha256' "$meta")
+  actual=$(sha256_file "$payload")
+  [[ $actual == "$digest" ]] || fail digest-mismatch 'queued payload digest mismatch' 65
+  seq=$(journal_append_locked "$wf_dir" delivered-from-queue main)
+  outcome=$(jq -cn --arg workflowId "$workflow_id" --arg requestId "$request_id" \
+    --arg sha256 "$digest" --argjson seq "$seq" \
+    '{ok:true,workflowId:$workflowId,requestId:$requestId,status:"delivered-from-queue",sha256:$sha256,journalSeq:$seq}')
+  record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+  atomic_json "$latch" "$(jq -c --arg requestId "$request_id" '.state="acked" | .requestId=$requestId' "$latch")"
+  rm -f -- "$payload" "$meta"
+}
+
+# Soft queue-one delivery for delivery-pending reconciliation: validates digest and
+# requestId against the stored payload/ledger, delivers, ACKs the latch. Returns 0
+# only on real delivery; returns 1 on any refusal (digest mismatch, missing latch,
+# missing payload) WITHOUT synthesizing journal entries or clearing markers.
+deliver_pending_reconcile_locked() {
+  local wf_dir=$1 workflow_id=$2 meta payload request_id digest actual latch state
+  local latch_workflow latch_seq latch_event latch_kind seq outcome recorded
+  meta="$wf_dir/pending-send.json"
+  payload="$wf_dir/pending-send.payload"
+  [[ -f $meta && -f $payload ]] || return 1
+  latch="$wf_dir/needs-input.json"
+  [[ -f $latch ]] || return 1
+  state=$(jq -r '.state // empty' "$latch")
+  [[ $state == open || $state == pending || $state == raised ]] || return 1
+  latch_workflow=$(jq -r '.workflowId // empty' "$latch")
+  latch_seq=$(jq -r '.journalSeq // .seq // empty' "$latch")
+  [[ $latch_workflow == "$workflow_id" && $latch_seq =~ ^[0-9]+$ ]] || return 1
+  latch_event="$wf_dir/journal/$(printf '%020d' "$latch_seq").json"
+  latch_kind=$(jq -r '.kind // empty' "$latch_event" 2>/dev/null || true)
+  [[ $latch_kind == input-needed || $latch_kind == needs-input ]] || return 1
+  request_id=$(jq -r '.requestId // empty' "$meta")
+  digest=$(jq -r '.sha256 // empty' "$meta")
+  [[ -n $request_id && $digest =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  digest=$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]')
+  actual=$(sha256_file "$payload")
+  [[ $actual == "$digest" ]] || return 1
+  # Ledger conflict: same requestId with a different digest must refuse.
+  if [[ -f $wf_dir/requests/$request_id.json ]]; then
+    recorded=$(jq -r '.sha256 // empty' "$wf_dir/requests/$request_id.json" 2>/dev/null || true)
+    recorded=$(printf '%s' "$recorded" | tr '[:upper:]' '[:lower:]')
+    if [[ -n $recorded && $recorded != "$digest" ]]; then
+      return 1
+    fi
+  fi
+  seq=$(journal_append_locked "$wf_dir" delivered-from-queue main)
+  outcome=$(jq -cn --arg workflowId "$workflow_id" --arg requestId "$request_id" \
+    --arg sha256 "$digest" --argjson seq "$seq" \
+    '{ok:true,workflowId:$workflowId,requestId:$requestId,status:"delivered-from-queue",sha256:$sha256,journalSeq:$seq}')
+  record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+  atomic_json "$latch" "$(jq -c --arg requestId "$request_id" '.state="acked" | .requestId=$requestId' "$latch")"
+  rm -f -- "$payload" "$meta"
+  return 0
+}
+
+project_event_locked() {
+  local wf_dir=$1 workflow_id=$2 scope=$3 kind=$4 seq
+  journal_broken_lock_locked "$wf_dir"
+  seq=$(journal_append_locked "$wf_dir" "$kind" "$scope")
+  if [[ $kind == input-needed || $kind == needs-input ]]; then
+    raise_latch_locked "$wf_dir" "$workflow_id" "$seq"
+    deliver_pending_locked "$wf_dir" "$workflow_id"
+  fi
+  notify_waiter "$wf_dir"
+  printf '%s\n' "$seq"
+}
+
 phase_transition_allowed() {
   local from=$1 to=$2
   case "$from:$to" in
@@ -127,7 +345,7 @@ phase_transition_allowed() {
     delivery-pending:delivery-pending|delivery-pending:running|delivery-pending:needs-input|delivery-pending:failed|delivery-pending:failed-recovery|delivery-pending:recovering|delivery-pending:quiescing|\
     exited:exited|exited:recovering|exited:failed-recovery|exited:quiescing|\
     recovering:recovering|recovering:running|recovering:idle|recovering:needs-input|recovering:failed-recovery|recovering:quiescing|\
-    failed:failed|failed-recovery:failed-recovery|\
+    failed:failed|failed-recovery:failed-recovery|failed-recovery:recovering|\
     quiescing:quiescing|quiescing:quiesced|quiesced:quiesced|quiesced:released|released:released)
       return 0
       ;;
@@ -208,7 +426,7 @@ workflow_record() {
 mint_workflow() {
   [[ $# -eq 4 ]] || fail usage 'mint requires PROJECT PLAN_ID CHECKOUT HOST' 64
   local project=$1 plan_id=$2 checkout_arg=$3 resident_host=$4 checkout plan_dir
-  local root_var configured_root stamp suffix workflow_id wf_dir binding meta_tmp marker marker_tmp
+  local root_var configured_root stamp suffix workflow_id wf_dir binding meta_tmp marker marker_tmp journal_epoch_value
 
   validate_atom "$project" project
   [[ $project =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || fail invalid-project 'invalid project' 64
@@ -241,6 +459,15 @@ mint_workflow() {
     fail active-workflow "project already has active workflow $workflow_id" 73
   fi
 
+  # Stale-job fencing (D9): unclaimed jobs that would claim as outbound
+  # refuse mint with mirror-pending naming the jobIds.
+  local pending_outbound pending_msg
+  pending_outbound=$(collect_unclaimed_outbound_job_ids "$project")
+  if [[ -n $pending_outbound ]]; then
+    pending_msg="unclaimed outbound mirror jobs: ${pending_outbound//$'\n'/, }"
+    fail mirror-pending "$pending_msg" 73
+  fi
+
   stamp=$(date -u '+%Y%m%dT%H%M%SZ')
   suffix=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
   workflow_id="wf-$project-$stamp-$suffix"
@@ -248,6 +475,7 @@ mint_workflow() {
   [[ ! -e $wf_dir ]] || fail id-collision 'workflowId collision' 73
 
   mkdir -m 700 -- "$wf_dir"
+  mkdir -m 700 -- "$wf_dir/journal" "$wf_dir/requests" "$wf_dir/mirror-queue"
   meta_tmp=$(mktemp "$wf_dir/.meta.XXXXXX")
   jq -cn \
     --arg workflowId "$workflow_id" \
@@ -261,6 +489,9 @@ mint_workflow() {
   chmod 600 "$meta_tmp"
   mv -f -- "$meta_tmp" "$wf_dir/meta.json"
   atomic_text "$wf_dir/phase" bootstrapping
+  journal_epoch_value="jrn-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  atomic_text "$wf_dir/journal/epoch" "$journal_epoch_value"
+  atomic_text "$wf_dir/journal/journal-cursor" 0
 
   marker="$plan_dir/mini-workflow.json"
   marker_tmp=$(mktemp "$plan_dir/.mini-workflow.XXXXXX")
@@ -276,7 +507,8 @@ mint_workflow() {
 
   release_lock
   trap - EXIT HUP INT TERM
-  jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"bootstrapping"}'
+  jq -cn --arg workflowId "$workflow_id" --arg journalEpoch "$journal_epoch_value" \
+    '{ok:true,workflowId:$workflowId,phase:"bootstrapping",journalEpoch:$journalEpoch,cursor:($journalEpoch+":0")}'
 }
 
 list_workflows() {
@@ -296,16 +528,324 @@ list_workflows() {
   printf '%s\n' "$output"
 }
 
+# Collect journal-pending records: legacy singleton file and/or append-only set dir.
+collect_journal_pending_files() {
+  local wf_dir=$1 pending="$1/journal-pending" f
+  JOURNAL_PENDING_FILES=()
+  if [[ -f $pending ]]; then
+    JOURNAL_PENDING_FILES+=("$pending")
+    return 0
+  fi
+  if [[ -d $pending ]]; then
+    for f in "$pending"/*; do
+      [[ -f $f ]] || continue
+      JOURNAL_PENDING_FILES+=("$f")
+    done
+  fi
+}
+
+# True when a queued payload is present but its digest does not match meta.
+pending_payload_digest_mismatched() {
+  local wf_dir=$1 meta="$1/pending-send.json" payload="$1/pending-send.payload"
+  local digest actual
+  [[ -f $meta && -f $payload ]] || return 1
+  digest=$(jq -r '.sha256 // empty' "$meta" 2>/dev/null || true)
+  [[ $digest =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  digest=$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]')
+  actual=$(sha256_file "$payload")
+  [[ $actual != "$digest" ]]
+}
+
+# Move a corrupt queue aside so inspect/wait stay readable; leave delivery-pending.
+quarantine_corrupt_queued_payload() {
+  local wf_dir=$1 qdir="$1/quarantine" stamp
+  stamp=$(date -u '+%Y%m%dT%H%M%SZ')-$$
+  mkdir -p -m 700 -- "$qdir" 2>/dev/null || true
+  if [[ -f $wf_dir/pending-send.payload ]]; then
+    mv -- "$wf_dir/pending-send.payload" "$qdir/pending-send.payload.$stamp" 2>/dev/null || true
+  fi
+  if [[ -f $wf_dir/pending-send.json ]]; then
+    mv -- "$wf_dir/pending-send.json" "$qdir/pending-send.json.$stamp" 2>/dev/null || true
+  fi
+  printf 'corrupt-digest\n' >"$wf_dir/delivery-pending" 2>/dev/null || true
+  chmod 600 "$wf_dir/delivery-pending" 2>/dev/null || true
+}
+
+# Identity for a pending projection: prefer the unique session.cursor.kind
+# filename. Never key solely on sha256(content):inode — identical bodies plus
+# inode reuse would silently drop a distinct projection (latch loss).
+pending_projection_dedupe_key() {
+  local pending=$1 base session cursor kind
+  base=${pending##*/}
+  # Append-only set: filename is already session.cursor.kind (or legacy-singleton).
+  if [[ $pending == */journal-pending/* && $base != journal-pending ]]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  # Legacy singleton file at journal-pending: prefer embedded session+cursor+kind.
+  session=$(jq -r '.session // empty' "$pending" 2>/dev/null || true)
+  cursor=$(jq -r '.cursor // empty' "$pending" 2>/dev/null || true)
+  kind=$(jq -r '.kind // empty' "$pending" 2>/dev/null || true)
+  if [[ -n $session && -n $cursor && -n $kind ]]; then
+    printf '%s.%s.%s\n' "$session" "$cursor" "$kind"
+    return 0
+  fi
+  if [[ -n $kind ]]; then
+    printf 'legacy-%s-%s\n' "$(jq -r '.scope // "main"' "$pending" 2>/dev/null || printf 'main')" "$kind"
+    return 0
+  fi
+  printf 'legacy-singleton\n'
+}
+
+reconcile_one_pending_locked() {
+  local workflow_id=$1 wf_dir=$2 pending=$3
+  local scope kind pending_key seq latch latch_seq
+  [[ -f $pending ]] || return 0
+  scope=$(jq -r '.scope // "main"' "$pending" 2>/dev/null || printf 'main')
+  kind=$(jq -r '.kind // empty' "$pending" 2>/dev/null || true)
+  [[ -n $kind ]] || fail invalid-state 'journal-pending is invalid' 65
+  pending_key=$(pending_projection_dedupe_key "$pending")
+  seq=$(jq -rs --arg key "$pending_key" \
+    '[.[] | select(.pendingKey == $key) | .seq][0] // empty' \
+    "$wf_dir"/journal/[0-9]*.json 2>/dev/null || true)
+  if [[ -z $seq ]]; then
+    seq=$(journal_append_pending_locked "$wf_dir" "$kind" "$scope" "$pending_key")
+  fi
+  if [[ $kind == input-needed || $kind == needs-input ]]; then
+    latch="$wf_dir/needs-input.json"; latch_seq=
+    [[ ! -f $latch ]] || latch_seq=$(jq -r '.journalSeq // .seq // empty' "$latch")
+    if [[ $latch_seq != "$seq" ]]; then
+      raise_latch_locked "$wf_dir" "$workflow_id" "$seq"
+    fi
+    # Soft queue-one only: a corrupt payload must never hard-fail inspect/wait.
+    # Refuse + quarantine on digest mismatch; keep serving read-only state.
+    if deliver_pending_reconcile_locked "$wf_dir" "$workflow_id"; then
+      rm -f -- "$wf_dir/delivery-pending" 2>/dev/null || true
+    elif pending_payload_digest_mismatched "$wf_dir"; then
+      quarantine_corrupt_queued_payload "$wf_dir"
+    elif [[ -f $wf_dir/pending-send.json || -f $wf_dir/pending-send.payload ]]; then
+      printf 'delivery-pending\n' >"$wf_dir/delivery-pending" 2>/dev/null || true
+      chmod 600 "$wf_dir/delivery-pending" 2>/dev/null || true
+    fi
+  fi
+  rm -f -- "$pending"
+}
+
+reconcile_workflow() {
+  local workflow_id=$1 wf_dir=$2 pending
+  local JOURNAL_PENDING_FILES=()
+  collect_journal_pending_files "$wf_dir"
+  (( ${#JOURNAL_PENDING_FILES[@]} > 0 )) || return 0
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  # Re-collect under lock in case the set changed.
+  collect_journal_pending_files "$wf_dir"
+  for pending in "${JOURNAL_PENDING_FILES[@]}"; do
+    reconcile_one_pending_locked "$workflow_id" "$wf_dir" "$pending"
+  done
+  # Drop empty append-only dir (best-effort).
+  if [[ -d $wf_dir/journal-pending ]]; then
+    rmdir "$wf_dir/journal-pending" 2>/dev/null || true
+  fi
+  notify_waiter "$wf_dir"
+  release_lock
+  trap - EXIT HUP INT TERM
+}
+
 inspect_workflow() {
   [[ $# -eq 1 ]] || fail usage 'inspect requires WORKFLOW_ID' 64
   local workflow_id=$1 wf_dir record output
   validate_workflow_id "$workflow_id"
   wf_dir="$registry_root/$workflow_id"
   [[ -d $wf_dir ]] || fail not-found 'workflow not found' 66
+  reconcile_workflow "$workflow_id" "$wf_dir"
   record=$(workflow_record "$wf_dir") || fail invalid-state 'workflow state is incomplete' 65
   output=$(jq -cn --argjson workflow "$record" '{ok:true,workflow:$workflow}')
   (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) || fail output-too-large 'inspect output exceeded bound' 70
   printf '%s\n' "$output"
+}
+
+project_event() {
+  [[ $# -eq 3 ]] || fail usage 'project-event requires WORKFLOW_ID SCOPE KIND' 64
+  local workflow_id=$1 scope=$2 kind=$3 wf_dir seq
+  validate_atom "$scope" scope
+  validate_atom "$kind" kind
+  wf_dir=$(workflow_path "$workflow_id")
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  seq=$(project_event_locked "$wf_dir" "$workflow_id" "$scope" "$kind")
+  release_lock
+  trap - EXIT HUP INT TERM
+  jq -cn --arg workflowId "$workflow_id" --arg kind "$kind" --argjson seq "$seq" \
+    '{ok:true,workflowId:$workflowId,kind:$kind,seq:$seq}'
+}
+
+wait_workflow() {
+  [[ $# -eq 5 && $2 == --cursor && $4 == --timeout ]] \
+    || fail usage 'wait requires WORKFLOW_ID --cursor CURSOR --timeout SECONDS' 64
+  local workflow_id=$1 cursor=$3 timeout=$5 wf_dir epoch requested current batch latch phase fifo waiter
+  local should_wait=0 response_seq output page_size=16
+  [[ $timeout =~ ^[0-9]+$ ]] && (( timeout <= 300 )) \
+    || fail usage 'timeout must be an integer from 0 through 300' 64
+  wf_dir=$(workflow_path "$workflow_id")
+  reconcile_workflow "$workflow_id" "$wf_dir"
+  epoch=$(journal_epoch "$wf_dir")
+  [[ $cursor =~ ^jrn-[A-Za-z0-9._-]+:[0-9]+$ && ${cursor%:*} == "$epoch" ]] \
+    || fail invalid-cursor 'cursor does not belong to this journal epoch' 65
+  requested=${cursor##*:}
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  current=$(journal_seq "$wf_dir")
+  if (( current <= requested && timeout > 0 )); then
+    mkdir -p -m 700 -- "$wf_dir/journal/waiters"
+    fifo="$wf_dir/journal/waiters/wake.$$.fifo"
+    waiter="$wf_dir/journal/waiters/$$.waiting"
+    [[ -p $fifo ]] || { rm -f -- "$fifo"; mkfifo -m 600 "$fifo"; }
+    exec 9<>"$fifo"
+    atomic_text "$waiter" "$(printf 'pid=%s\nboot=%s' "$$" "$(boot_token)")"
+    should_wait=1
+  fi
+  release_lock; trap - EXIT HUP INT TERM
+  if (( should_wait )); then
+    read -r -t "$timeout" -u 9 _wake || true
+    rm -f -- "$waiter"
+    exec 9>&-
+    rm -f -- "$fifo"
+    current=$(journal_seq "$wf_dir")
+  fi
+  batch=$(jq -sc --argjson after "$requested" '[.[] | select(.seq > $after)][0:16]' \
+    "$wf_dir"/journal/[0-9]*.json 2>/dev/null || printf '[]')
+  phase=$(head -n 1 "$wf_dir/phase")
+  latch=null
+  [[ ! -f $wf_dir/needs-input.json ]] || latch=$(jq -c . "$wf_dir/needs-input.json")
+  while :; do
+    response_seq=$(jq -r --argjson fallback "$requested" 'if length == 0 then $fallback else .[-1].seq end' <<<"$batch")
+    output=$(jq -cn --arg journalEpoch "$epoch" --arg cursor "$epoch:$response_seq" \
+      --arg phase "$phase" --argjson latch "$latch" --argjson batch "$batch" \
+      '{ok:true,journalEpoch:$journalEpoch,cursor:$cursor,phase:$phase,latch:$latch,batch:$batch}')
+    (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) && break
+    page_size=$((page_size - 1))
+    (( page_size > 0 )) || fail output-too-large 'one journal event exceeded the output bound' 70
+    batch=$(jq -c --argjson size "$page_size" '.[0:$size]' <<<"$batch")
+  done
+  printf '%s\n' "$output"
+}
+
+send_workflow() {
+  (( $# >= 3 )) || fail usage 'send requires WORKFLOW_ID --request-id ID and options' 64
+  local workflow_id=$1 wf_dir request_id= digest= ack_event= cancel=0 arg input actual record replay recorded_digest
+  local latch latch_seq latch_state outcome seq tmp_meta
+  shift
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --request-id) (( $# )) || fail usage 'missing requestId' 64; request_id=$1; shift ;;
+      --payload-sha256) (( $# )) || fail usage 'missing payload digest' 64; digest=$1; shift ;;
+      --ack-event) (( $# )) || fail usage 'missing ack event seq' 64; ack_event=$1; shift ;;
+      --cancel-pending) cancel=1 ;;
+      *) fail usage 'unknown send option' 64 ;;
+    esac
+  done
+  validate_atom "$request_id" requestId
+  wf_dir=$(workflow_path "$workflow_id")
+  if (( cancel )); then
+    [[ -z $digest && -z $ack_event ]] || fail usage 'cancel-pending takes no payload options' 64
+    acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+    trap release_lock EXIT HUP INT TERM
+    journal_broken_lock_locked "$wf_dir"
+    rm -f -- "$wf_dir/pending-send.payload" "$wf_dir/pending-send.json"
+    outcome=$(jq -cn --arg workflowId "$workflow_id" --arg requestId "$request_id" \
+      '{ok:true,workflowId:$workflowId,requestId:$requestId,status:"cancelled"}')
+    release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$outcome"
+    return
+  fi
+  [[ $digest =~ ^[0-9a-fA-F]{64}$ ]] || fail usage 'payload-sha256 must be 64 hexadecimal characters' 64
+  [[ -z $ack_event || $ack_event =~ ^[0-9]+$ ]] || fail usage 'ack-event must be numeric' 64
+  input=$(mktemp "${TMPDIR:-/tmp}/workflow-send.XXXXXX")
+  chmod 600 "$input"
+  dd of="$input" bs=64k 2>/dev/null
+  actual=$(sha256_file "$input")
+  actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  digest=$(printf '%s' "$digest" | tr '[:upper:]' '[:lower:]')
+  if [[ $actual != "$digest" ]]; then
+    rm -f -- "$input"
+    fail digest-mismatch 'payload-sha256 does not match buffered stdin' 65
+  fi
+  acquire_lock "$wf_dir/lock" || { rm -f -- "$input"; fail busy 'workflow lock is busy' 75; }
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  record="$wf_dir/requests/$request_id.json"
+  if [[ -f $record ]]; then
+    recorded_digest=$(jq -r '.sha256 // empty' "$record")
+    if [[ $recorded_digest != "$digest" ]]; then
+      rm -f -- "$input"
+      fail digest-conflict 'requestId payload digest conflict' 65
+    fi
+    replay=$(jq -c '.outcome' "$record")
+    rm -f -- "$input"
+    release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$replay"
+    return
+  fi
+  if [[ -n $ack_event ]]; then
+    latch="$wf_dir/needs-input.json"
+    [[ -f $latch ]] || { rm -f -- "$input"; fail missing-latch 'no needs-input latch is open' 65; }
+    latch_seq=$(jq -r '.journalSeq // .seq // empty' "$latch")
+    latch_state=$(jq -r '.state // empty' "$latch")
+    [[ $(jq -r '.workflowId // empty' "$latch") == "$workflow_id" ]] \
+      || { rm -f -- "$input"; fail invalid-latch 'latch belongs to another workflow' 65; }
+    [[ $latch_state == open || $latch_state == pending || $latch_state == raised ]] \
+      || { rm -f -- "$input"; fail stale-ack 'needs-input latch is not open' 65; }
+    [[ $latch_seq == "$ack_event" ]] \
+      || { rm -f -- "$input"; fail stale-ack 'ack-event does not match the current latch' 65; }
+    [[ $(jq -r '.kind // empty' "$wf_dir/journal/$(printf '%020d' "$latch_seq").json" 2>/dev/null || true) =~ ^(input-needed|needs-input)$ ]] \
+      || { rm -f -- "$input"; fail invalid-latch 'ack-event does not reference an input event' 65; }
+    seq=$(journal_append_locked "$wf_dir" delivered main)
+    outcome=$(jq -cn --arg workflowId "$workflow_id" --arg requestId "$request_id" \
+      --arg sha256 "$digest" --argjson seq "$seq" \
+      '{ok:true,workflowId:$workflowId,requestId:$requestId,status:"delivered",sha256:$sha256,journalSeq:$seq}')
+    record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+    atomic_json "$latch" "$(jq -c --arg requestId "$request_id" '.state="acked" | .requestId=$requestId' "$latch")"
+    notify_waiter "$wf_dir"
+  else
+    [[ ! -e $wf_dir/pending-send.json && ! -e $wf_dir/pending-send.payload ]] \
+      || { rm -f -- "$input"; fail queue-full 'one input is already pending' 65; }
+    mv -- "$input" "$wf_dir/pending-send.payload"
+    chmod 600 "$wf_dir/pending-send.payload"
+    tmp_meta=$(jq -cn --arg requestId "$request_id" --arg sha256 "$digest" \
+      --argjson bytes "$(wc -c <"$wf_dir/pending-send.payload" | tr -d ' ')" \
+      --arg queuedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      '{requestId:$requestId,sha256:$sha256,bytes:$bytes,queuedAt:$queuedAt}')
+    atomic_json "$wf_dir/pending-send.json" "$tmp_meta"
+    outcome=$(jq -cn --arg workflowId "$workflow_id" --arg requestId "$request_id" --arg sha256 "$digest" \
+      '{ok:true,workflowId:$workflowId,requestId:$requestId,status:"pending",sha256:$sha256}')
+    record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+  fi
+  rm -f -- "$input"
+  release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
+}
+
+deliver_queue() {
+  [[ $# -eq 1 ]] || fail usage 'deliver-queue requires WORKFLOW_ID' 64
+  local workflow_id=$1 wf_dir latch state
+  wf_dir=$(workflow_path "$workflow_id")
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  latch="$wf_dir/needs-input.json"
+  if [[ ! -f $latch ]]; then
+    fail missing-latch 'delivery requires a fresh needs-input latch' 65
+  fi
+  state=$(jq -r '.state // empty' "$latch")
+  [[ $state == open || $state == pending || $state == raised ]] \
+    || fail missing-latch 'delivery requires an open needs-input latch' 65
+  deliver_pending_locked "$wf_dir" "$workflow_id"
+  release_lock; trap - EXIT HUP INT TERM
+  jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,status:"delivered-from-queue"}'
 }
 
 set_phase() {
@@ -318,6 +858,7 @@ set_phase() {
   [[ -d $wf_dir && -f $wf_dir/phase ]] || fail not-found 'workflow not found' 66
   acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
   trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
   current=$(head -n 1 "$wf_dir/phase")
   phase_transition_allowed "$current" "$next" \
     || fail invalid-transition 'phase transition is refused' 65
@@ -326,6 +867,1448 @@ set_phase() {
   trap - EXIT HUP INT TERM
   jq -cn --arg workflowId "$workflow_id" --arg phase "$next" \
     '{ok:true,workflowId:$workflowId,phase:$phase}'
+}
+
+feed_append() {
+  [[ $# -eq 4 ]] || fail usage 'feed-append requires PROJECT CLASS ENTITY_ID SEQ' 64
+  local project=$1 class=$2 entity_id=$3 seq=$4 feed_dir key hash file record
+  validate_atom "$project" project
+  validate_atom "$entity_id" entityId
+  [[ $class =~ ^(needs-input|awaiting-approval|failed-recovery|completed|released|mirror-done|mirror-failed|chat-question|chat-reply-completed)$ ]] \
+    || fail invalid-class 'notification class is outside the closed vocabulary' 64
+  [[ $seq =~ ^[0-9]+$ ]] || fail usage 'feed seq must be numeric' 64
+  feed_dir="$registry_root/notifications/$project"
+  mkdir -p -m 700 -- "$registry_root/notifications" "$feed_dir"
+  local lock_attempt=0
+  while ! acquire_lock "$registry_root/.notification-feed.lock"; do
+    lock_attempt=$((lock_attempt + 1))
+    (( lock_attempt < 100 )) || fail busy 'notification feed is busy' 75
+    sleep 0.01
+  done
+  trap release_lock EXIT HUP INT TERM
+  key="$class|$entity_id|$seq"
+  hash=$(printf '%s' "$key" | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print substr($1,1,16)}')
+  file="$feed_dir/$(printf '%020d' "$seq")-$hash.json"
+  if [[ ! -f $file ]]; then
+    record=$(jq -cn --arg class "$class" --arg entityId "$entity_id" --argjson seq "$seq" \
+      '{class:$class,entityId:$entityId,seq:$seq}')
+    atomic_json "$file" "$record"
+  fi
+  trim_json_dir "$feed_dir" 256
+  release_lock; trap - EXIT HUP INT TERM
+  jq -cn --arg class "$class" --arg entityId "$entity_id" --argjson seq "$seq" \
+    '{ok:true,class:$class,entityId:$entityId,seq:$seq}'
+}
+
+device_register() {
+  local device= credential= build= request_id= arg outbox_root device_dir meta
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || fail usage 'missing device-id' 64; device=$1; shift ;;
+      --credential) (( $# )) || fail usage 'missing credential' 64; credential=$1; shift ;;
+      --build-type) (( $# )) || fail usage 'missing build-type' 64; build=$1; shift ;;
+      --request-id) (( $# )) || fail usage 'missing request-id' 64; request_id=$1; shift ;;
+      *) fail usage 'unknown device-register option' 64 ;;
+    esac
+  done
+  validate_atom "$device" deviceId
+  validate_atom "$request_id" requestId
+  [[ -n $credential && $credential != *$'\n'* ]] || fail invalid-argument 'invalid credential' 64
+  [[ $build == sandbox || $build == production ]] || fail invalid-argument 'invalid build-type' 64
+  outbox_root="$registry_root/outbox"; device_dir="$outbox_root/$device"
+  mkdir -p -m 700 -- "$outbox_root"
+  acquire_lock "$outbox_root/.devices.lock" || fail busy 'device registry is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  mkdir -p -m 700 -- "$device_dir" "$device_dir/requests" "$device_dir/failures"
+  printf '%s\n' "$credential" >"$device_dir/credential"; chmod 600 "$device_dir/credential"
+  meta=$(jq -cn --arg deviceId "$device" --arg buildType "$build" \
+    '{deviceId:$deviceId,buildType:$buildType,revoked:false,cursor:0}')
+  atomic_json "$device_dir/meta.json" "$meta"
+  [[ -f $device_dir/acked.json ]] || atomic_json "$device_dir/acked.json" '[]'
+  release_lock; trap - EXIT HUP INT TERM
+  jq -cn --arg deviceId "$device" --arg requestId "$request_id" \
+    '{ok:true,deviceId:$deviceId,requestId:$requestId,status:"registered"}'
+}
+
+device_revoke() {
+  local device= request_id= arg device_dir
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || fail usage 'missing device-id' 64; device=$1; shift ;;
+      --request-id) (( $# )) || fail usage 'missing request-id' 64; request_id=$1; shift ;;
+      *) fail usage 'unknown device-revoke option' 64 ;;
+    esac
+  done
+  validate_atom "$device" deviceId; validate_atom "$request_id" requestId
+  device_dir="$registry_root/outbox/$device"
+  [[ -f $device_dir/meta.json ]] || fail not-found 'device not found' 66
+  acquire_lock "$device_dir/lock" || fail busy 'device outbox is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  atomic_json "$device_dir/meta.json" "$(jq -c '.revoked=true' "$device_dir/meta.json")"
+  release_lock; trap - EXIT HUP INT TERM
+  jq -cn --arg deviceId "$device" --arg requestId "$request_id" \
+    '{ok:true,deviceId:$deviceId,requestId:$requestId,status:"revoked"}'
+}
+
+check_device_credential() {
+  local device_dir=$1 credential=$2
+  [[ -f $device_dir/meta.json && -f $device_dir/credential ]] || fail not-found 'device not found' 66
+  [[ $(jq -r '.revoked // false' "$device_dir/meta.json") != true ]] || fail revoked 'device credential is revoked' 65
+  [[ $(head -n 1 "$device_dir/credential") == "$credential" ]] || fail invalid-credential 'device credential is invalid' 65
+}
+
+outbox_fetch() {
+  local device= credential= cursor= arg device_dir rows file seq top=0 record acked count=0 output page_size=32
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || fail usage 'missing device-id' 64; device=$1; shift ;;
+      --credential) (( $# )) || fail usage 'missing credential' 64; credential=$1; shift ;;
+      --cursor) (( $# )) || fail usage 'missing cursor' 64; cursor=$1; shift ;;
+      *) fail usage 'unknown outbox-fetch option' 64 ;;
+    esac
+  done
+  validate_atom "$device" deviceId; [[ $cursor =~ ^[0-9]+$ ]] || fail invalid-cursor 'outbox cursor must be numeric' 64
+  device_dir="$registry_root/outbox/$device"; check_device_credential "$device_dir" "$credential"
+  acked=$(jq -c . "$device_dir/acked.json" 2>/dev/null || printf '[]')
+  rows=$(mktemp "${TMPDIR:-/tmp}/outbox.XXXXXX")
+  if [[ -d $registry_root/notifications ]]; then
+    while IFS= read -r file; do
+      seq=$(jq -r '.seq // 0' "$file" 2>/dev/null || printf 0)
+      [[ $seq =~ ^[0-9]+$ ]] || continue
+      (( seq > top )) && top=$seq
+      if (( seq > cursor )) && ! jq -e --argjson seq "$seq" 'index($seq) != null' <<<"$acked" >/dev/null; then
+        jq -c '{class,entityId,seq}' "$file" >>"$rows"
+        count=$((count + 1))
+        (( count < 32 )) || break
+      fi
+    done < <(find "$registry_root/notifications" -type f -name '*.json' -print | LC_ALL=C sort)
+  fi
+  record=$(jq -sc . "$rows"); rm -f -- "$rows"
+  while :; do
+    top=$(jq -r --argjson fallback "$cursor" 'if length == 0 then $fallback else .[-1].seq end' <<<"$record")
+    output=$(jq -cn --argjson cursor "$top" --argjson records "$record" \
+      '{ok:true,cursor:($cursor|tostring),records:$records}')
+    (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) && break
+    page_size=$((page_size - 1))
+    (( page_size > 0 )) || fail output-too-large 'one outbox record exceeded the output bound' 70
+    record=$(jq -c --argjson size "$page_size" '.[0:$size]' <<<"$record")
+  done
+  printf '%s\n' "$output"
+}
+
+feed_has_seq() {
+  local wanted=$1 file
+  [[ -d $registry_root/notifications ]] || return 1
+  while IFS= read -r file; do
+    [[ $(jq -r '.seq // empty' "$file" 2>/dev/null || true) == "$wanted" ]] && return 0
+  done < <(find "$registry_root/notifications" -type f -name '*.json' -print)
+  return 1
+}
+
+outbox_ack() {
+  local device= credential= request_id= seq= arg device_dir ledger durable outcome acked
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || fail usage 'missing device-id' 64; device=$1; shift ;;
+      --credential) (( $# )) || fail usage 'missing credential' 64; credential=$1; shift ;;
+      --request-id) (( $# )) || fail usage 'missing request-id' 64; request_id=$1; shift ;;
+      --seq) (( $# )) || fail usage 'missing seq' 64; seq=$1; shift ;;
+      *) fail usage 'unknown outbox-ack option' 64 ;;
+    esac
+  done
+  validate_atom "$device" deviceId; validate_atom "$request_id" requestId
+  [[ $seq =~ ^[0-9]+$ ]] || fail usage 'outbox ack seq must be numeric' 64
+  device_dir="$registry_root/outbox/$device"; check_device_credential "$device_dir" "$credential"
+  feed_has_seq "$seq" || fail not-found 'outbox seq does not identify a retained notification' 66
+  acquire_lock "$device_dir/lock" || fail busy 'device outbox is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  ledger="$device_dir/requests/$request_id.json"
+  if [[ -f $ledger ]]; then
+    [[ $(jq -r '.op // empty' "$ledger") == ack && $(jq -r '.seq // empty' "$ledger") == "$seq" ]] \
+      || fail request-conflict 'requestId was already used for another outbox operation' 65
+    jq -c '.outcome' "$ledger"
+    release_lock; trap - EXIT HUP INT TERM
+    return
+  fi
+  acked=$(jq -c . "$device_dir/acked.json" 2>/dev/null || printf '[]')
+  ! jq -e --argjson seq "$seq" 'index($seq) != null' <<<"$acked" >/dev/null \
+    || fail already-acked 'outbox seq was already acknowledged' 65
+  atomic_json "$device_dir/acked.json" "$(jq -c --argjson seq "$seq" '. + [$seq] | unique | sort | if length > 256 then .[-256:] else . end' <<<"$acked")"
+  durable=$(jq -r '.cursor // 0' "$device_dir/meta.json")
+  if (( seq > durable )); then
+    atomic_json "$device_dir/meta.json" "$(jq -c --argjson cursor "$seq" '.cursor=$cursor' "$device_dir/meta.json")"
+  fi
+  outcome=$(jq -cn --arg deviceId "$device" --arg requestId "$request_id" --argjson cursor "$seq" \
+    '{ok:true,deviceId:$deviceId,requestId:$requestId,status:"acked",cursor:($cursor|tostring)}')
+  atomic_json "$ledger" "$(jq -cn --arg requestId "$request_id" --argjson seq "$seq" --argjson outcome "$outcome" \
+    '{op:"ack",requestId:$requestId,seq:$seq,outcome:$outcome}')"
+  trim_json_dir "$device_dir/requests" 256
+  release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
+}
+
+outbox_mark_failed() {
+  local device= seq= reason= arg device_dir marker
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --device-id) (( $# )) || fail usage 'missing device-id' 64; device=$1; shift ;;
+      --seq) (( $# )) || fail usage 'missing seq' 64; seq=$1; shift ;;
+      --reason) (( $# )) || fail usage 'missing reason' 64; reason=$1; shift ;;
+      *) fail usage 'unknown outbox-mark-failed option' 64 ;;
+    esac
+  done
+  validate_atom "$device" deviceId; [[ $seq =~ ^[0-9]+$ ]] || fail usage 'seq must be numeric' 64
+  validate_atom "$reason" reason
+  device_dir="$registry_root/outbox/$device"; [[ -d $device_dir ]] || fail not-found 'device not found' 66
+  acquire_lock "$device_dir/lock" || fail busy 'device outbox is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  marker=$(jq -cn --argjson seq "$seq" --arg reason "$reason" '{seq:$seq,reason:$reason}')
+  atomic_json "$device_dir/failures/$seq.json" "$marker"
+  trim_json_dir "$device_dir/failures" 256
+  release_lock; trap - EXIT HUP INT TERM
+  jq -cn --arg deviceId "$device" --argjson seq "$seq" '{ok:true,deviceId:$deviceId,seq:$seq,status:"retained"}'
+}
+
+protocol_project_dir() {
+  printf '%s/orchestration/remote-agent/projects/%s\n' "$state_home" "$1"
+}
+
+conductor_session() {
+  printf 'remote-agent--%s--claude\n' "$1"
+}
+
+validate_lifecycle_project() {
+  case $1 in
+    miospot|orchestration) ;;
+    *) fail invalid-project 'lifecycle project is outside the closed vocabulary' 64 ;;
+  esac
+}
+
+protocol_call() {
+  "$PROTOCOL_BIN" "$@"
+}
+
+protocol_refusal_envelope() {
+  json_error protocol-refusal 'remote-agent-v1 refused the guarded lifecycle transition'
+}
+
+protocol_mutex_release_quiet() {
+  local project=${PROTOCOL_MUTEX_PROJECT:-}
+  [[ -n $project ]] || return 0
+  protocol_call mutex-release "$project" "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" \
+    </dev/null >/dev/null 2>&1 || true
+  PROTOCOL_MUTEX_PROJECT=
+}
+
+lifecycle_journal_only() {
+  local wf_dir=$1 kind=$2 detail=${3:-}
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  journal_broken_lock_locked "$wf_dir"
+  journal_append_locked "$wf_dir" "$kind" lifecycle "$detail" >/dev/null
+  notify_waiter "$wf_dir"
+  release_lock
+}
+
+protocol_mutex_preflight() {
+  local project=$1 wf_dir=${2:-} directory holder pid held_boot current_boot owner
+  directory=$(protocol_project_dir "$project")
+  [[ -d $directory/mutex ]] || return 0
+  holder="$directory/mutex/holder"
+  pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+  held_boot=$(sed -n 's/^boot=\(.*\)$/\1/p' "$holder" 2>/dev/null | head -n 1 || true)
+  current_boot=$(boot_token)
+
+  if [[ -n $pid && $held_boot =~ ^[0-9]+$ \
+      && ( $held_boot != "$current_boot" || ! -d /proc/$pid ) ]]; then
+    if [[ $held_boot == "$current_boot" ]] && kill -0 "$pid" 2>/dev/null; then
+      protocol_call mutex-acquire "$project" "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" >/dev/null
+      return
+    fi
+    owner=$(head -n 1 "$directory/mutex/owner" 2>/dev/null || true)
+    [[ -n $owner ]] || {
+      protocol_call mutex-acquire "$project" "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" >/dev/null
+      return
+    }
+    protocol_call mutex-release "$project" "$owner" "$PROTOCOL_AUTHORITY" >/dev/null
+    if [[ -n $wf_dir && -d $wf_dir ]]; then
+      lifecycle_journal_only "$wf_dir" lifecycle-recovering 'dead protocol mutex released'
+    fi
+    return 0
+  fi
+
+  # Let the protocol authority provide its exact refusal token. A live or
+  # unverifiable holder is never stolen by registry-side heuristics.
+  protocol_call mutex-acquire "$project" "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" >/dev/null
+}
+
+protocol_mutex_acquire() {
+  local project=$1 wf_dir=${2:-}
+  protocol_mutex_preflight "$project" "$wf_dir" || return $?
+  protocol_call mutex-acquire "$project" "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" \
+    </dev/null >/dev/null || return $?
+  PROTOCOL_MUTEX_PROJECT=$project
+}
+
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
+checkout_fingerprint() {
+  local checkout=$1 inventory path rel digest
+  inventory=$(mktemp "${TMPDIR:-/tmp}/workflow-fingerprint.XXXXXX")
+  chmod 600 "$inventory"
+  while IFS= read -r -d '' path; do
+    [[ -f $path && ! -L $path ]] || continue
+    rel=${path#"$checkout"/}
+    digest=$(sha256_file "$path")
+    printf '%s\0%s\0' "$rel" "$digest" >>"$inventory"
+  done < <(find "$checkout" -path "$checkout/.git" -prune -o -type f -print0 | LC_ALL=C sort -z)
+  digest=$(sha256_stream <"$inventory")
+  rm -f -- "$inventory"
+  printf '%s\n' "$digest"
+}
+
+lifecycle_phase_locked() {
+  local wf_dir=$1 next=$2 kind=$3 detail=${4:-} current transition_detail
+  current=$(head -n 1 "$wf_dir/phase" 2>/dev/null || printf bootstrapping)
+  if [[ $current != "$next" ]]; then
+    phase_transition_allowed "$current" "$next" \
+      || fail invalid-transition "phase transition $current -> $next is refused" 65
+    atomic_text "$wf_dir/phase" "$next"
+  fi
+  transition_detail="$current->$next"
+  [[ -z $detail ]] || transition_detail="$transition_detail $detail"
+  journal_append_locked "$wf_dir" "$kind" lifecycle "$transition_detail" >/dev/null
+}
+
+update_lifecycle_binding() {
+  local wf_dir=$1 workflow_id=$2 generation=$3 event_kind=$4 detail=${5:-}
+  local session=$6 next_phase=${7:-running}
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  journal_broken_lock_locked "$wf_dir"
+  atomic_json "$wf_dir/meta.json" "$(jq -c \
+    --arg session "$session" --argjson generation "$generation" \
+    '.session=$session | .leaseGeneration=$generation' "$wf_dir/meta.json")"
+  lifecycle_phase_locked "$wf_dir" "$next_phase" "$event_kind" "$detail"
+  notify_waiter "$wf_dir"
+  release_lock
+}
+
+episode_id() {
+  printf 'ep-%s-%s\n' "$(date -u '+%Y%m%dT%H%M%SZ')" \
+    "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+write_recovery_locked() {
+  local wf_dir=$1 episode=$2 attempts=$3 state=$4
+  atomic_json "$wf_dir/recovery.json" "$(jq -cn \
+    --arg episodeId "$episode" --argjson attempts "$attempts" --arg state "$state" \
+    --arg lastAttemptAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{episodeId:$episodeId,attempts:$attempts,state:$state,lastAttemptAt:$lastAttemptAt}')"
+}
+
+feed_emit() {
+  local project=$1 class=$2 workflow_id=$3 seq=$4
+  feed_append "$project" "$class" "$workflow_id" "$seq" >/dev/null
+}
+
+resolve_lifecycle_target() {
+  local supplied=$1 workflow_id project wf_dir
+  if [[ $supplied == wf-* ]]; then
+    validate_workflow_id "$supplied"
+    workflow_id=$supplied
+    wf_dir=$(workflow_path "$workflow_id")
+    project=$(jq -r '.project // empty' "$wf_dir/meta.json")
+  else
+    project=$supplied
+    validate_lifecycle_project "$project"
+    [[ -f $byproject_root/$project ]] || fail not-found 'project has no active workflow' 66
+    workflow_id=$(head -n 1 "$byproject_root/$project")
+    validate_workflow_id "$workflow_id"
+    wf_dir=$(workflow_path "$workflow_id")
+  fi
+  validate_lifecycle_project "$project"
+  RESOLVED_WORKFLOW_ID=$workflow_id
+  RESOLVED_PROJECT=$project
+  RESOLVED_WORKFLOW_DIR=$wf_dir
+}
+
+# SAFETY: an unresolvable lifecycle binary must NEVER be treated as a dead
+# session. Liveness is probed via tmux; auto re-bind starts sessions with
+# claude. Missing tools fail loudly (missing-dependency) without consuming a
+# recovery attempt or flipping phase to failed-recovery.
+require_bin() {
+  local name=$1
+  if ! command -v "$name" >/dev/null 2>&1; then
+    fail missing-dependency \
+      "required binary unresolvable: $name (not treated as dead session)" \
+      69
+  fi
+}
+
+require_resume_probe_bins() {
+  # Needed to distinguish LIVE vs DEAD without false dead on command-not-found.
+  require_bin tmux
+}
+
+require_resume_rebind_bins() {
+  # Needed before burning a D2 recovery attempt on the auto re-bind path.
+  require_bin tmux
+  require_bin claude
+}
+
+session_is_live() {
+  # Defense in depth: never map command-not-found onto "session dead".
+  require_bin tmux
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+start_session() {
+  local session=$1 checkout=$2
+  # Human start-conductor and auto re-bind both reach here. Require tmux so a
+  # missing server binary is not a cryptic tmux-not-found from the shell.
+  require_bin tmux
+  tmux new-session -d -s "$session" -c "$checkout" -- claude --yolo
+}
+
+release_orphan_lease() {
+  local project=$1 session=$2
+  protocol_call quiescent "$session" "$PROTOCOL_AUTHORITY" >/dev/null || return $?
+  protocol_call release-only-verify "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null || return $?
+  protocol_call lease-release temp-rename "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null || return $?
+}
+
+take_conductor_lease() {
+  local project=$1 session=$2 expected=$3 checkout=$4 adopt_digest=${5:-}
+  local next=$((expected + 1)) status
+  protocol_call common-state-cas temp-rename "$project" "$expected" "$PROTOCOL_AUTHORITY" \
+    >/dev/null || return $?
+  if [[ -n $adopt_digest ]]; then
+    protocol_call adopt "$project" "$adopt_digest" >/dev/null || return $?
+  fi
+  protocol_call lease-provisional temp-rename "$project" "$session" "$next" \
+    "$PROTOCOL_OWNER" "$PROTOCOL_AUTHORITY" >/dev/null || return $?
+  if start_session "$session" "$checkout"; then
+    :
+  else
+    status=$?
+    protocol_call lease-abort temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    return "$status"
+  fi
+  if protocol_call lease-commit temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null; then
+    :
+  else
+    status=$?
+    tmux kill-session -t "$session" 2>/dev/null || true
+    protocol_call lease-abort temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    return "$status"
+  fi
+  TAKEN_GENERATION=$next
+}
+
+rebind_existing_workflow() {
+  local workflow_id=$1 project=$2 wf_dir=$3 checkout=$4 mode=$5
+  local session expected phase prior_episode new_episode recovery_attempts status
+  session=$(conductor_session "$project")
+  expected=$(jq -r '.leaseGeneration // .generation // empty' "$wf_dir/meta.json")
+  [[ $expected =~ ^[0-9]+$ ]] || fail invalid-state 'workflow lease generation is invalid' 65
+
+  protocol_mutex_acquire "$project" "$wf_dir" || return $?
+  if release_orphan_lease "$project" "$session"; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  if protocol_call generation-check "$project" "$expected" "$PROTOCOL_AUTHORITY" >/dev/null; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  if take_conductor_lease "$project" "$session" "$expected" "$checkout"; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+
+  phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || printf exited)
+  if [[ $mode == human ]]; then
+    acquire_lock "$wf_dir/lock" || {
+      protocol_mutex_release_quiet
+      fail busy 'workflow lock is busy' 75
+    }
+    if [[ $phase == failed-recovery ]]; then
+      prior_episode=$(jq -r '.episodeId // "unknown-episode"' "$wf_dir/recovery.json" 2>/dev/null || printf unknown-episode)
+      new_episode=$(episode_id)
+      journal_append_locked "$wf_dir" prior-failed-recovery lifecycle "$prior_episode" >/dev/null
+      write_recovery_locked "$wf_dir" "$new_episode" 0 recovering
+    fi
+    lifecycle_phase_locked "$wf_dir" recovering lifecycle-recovering 'human re-bind'
+    release_lock
+  fi
+  update_lifecycle_binding "$wf_dir" "$workflow_id" "$TAKEN_GENERATION" \
+    lifecycle-rebind "$mode" "$session" running
+  if [[ $mode == human && -f $wf_dir/recovery.json ]]; then
+    new_episode=$(jq -r '.episodeId // empty' "$wf_dir/recovery.json")
+    recovery_attempts=$(jq -r '.attempts // 0' "$wf_dir/recovery.json")
+    acquire_lock "$wf_dir/lock" || {
+      protocol_mutex_release_quiet
+      fail busy 'workflow lock is busy' 75
+    }
+    write_recovery_locked "$wf_dir" "$new_episode" "$recovery_attempts" running
+    release_lock
+  fi
+  protocol_mutex_release_quiet
+  jq -cn --arg workflowId "$workflow_id" --argjson leaseGeneration "$TAKEN_GENERATION" \
+    '{ok:true,workflowId:$workflowId,phase:"running",leaseGeneration:$leaseGeneration,rebound:true}'
+}
+
+start_conductor() {
+  if [[ $# -ne 4 ]]; then
+    fail claude-only 'start-conductor is Claude-only and accepts no harness selector' 64
+  fi
+  local project=$1 plan_id=$2 checkout_arg=$3 resident_host=$4 binding workflow_id wf_dir
+  local session lease_session lease_state checkout digest expected mint_json phase status
+  validate_lifecycle_project "$project"
+  validate_atom "$plan_id" planId
+  validate_atom "$resident_host" residentHost
+  [[ $checkout_arg == /* && -d $checkout_arg ]] || fail invalid-checkout 'checkout does not exist' 66
+  checkout=$(cd "$checkout_arg" && pwd -P)
+  session=$(conductor_session "$project")
+  binding="$byproject_root/$project"
+
+  lease_state=$(head -n 1 "$(protocol_project_dir "$project")/lease-state" 2>/dev/null || true)
+  lease_session=$(head -n 1 "$(protocol_project_dir "$project")/lease-session" 2>/dev/null || true)
+  if [[ $lease_state == active && -n $lease_session && $lease_session != "$session" ]]; then
+    fail diagnostic-held "diagnostic-held lease blocks start-conductor: $lease_session" 73
+  fi
+
+  if [[ -f $binding ]]; then
+    workflow_id=$(head -n 1 "$binding")
+    validate_workflow_id "$workflow_id"
+    wf_dir=$(workflow_path "$workflow_id")
+    protocol_mutex_preflight "$project" "$wf_dir" || return $?
+    if session_is_live "$session"; then
+      fail active-workflow "project already has active workflow $workflow_id; remote-agent-v1: lease already exists" 73
+    fi
+    phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || true)
+    if [[ $phase == failed-recovery ]]; then
+      # Human intent starts a distinct durable recovery episode; the prior
+      # episode is journaled by the guarded re-bind before it is replaced.
+      :
+    fi
+    rebind_existing_workflow "$workflow_id" "$project" "$wf_dir" "$checkout" human
+    return
+  fi
+
+  protocol_mutex_acquire "$project" || return $?
+  digest=$(checkout_fingerprint "$checkout")
+  expected=$(head -n 1 "$(protocol_project_dir "$project")/generation" 2>/dev/null || printf 0)
+  [[ $expected =~ ^[0-9]+$ ]] || {
+    protocol_mutex_release_quiet
+    fail invalid-state 'protocol generation is invalid' 65
+  }
+
+  if [[ $lease_state == active ]]; then
+    if session_is_live "$session"; then
+      protocol_mutex_release_quiet
+      fail active-workflow 'remote-agent-v1: lease already exists' 73
+    fi
+    if release_orphan_lease "$project" "$session"; then
+      :
+    else
+      status=$?
+      protocol_refusal_envelope
+      protocol_mutex_release_quiet
+      return "$status"
+    fi
+  elif [[ -n $lease_state ]]; then
+    protocol_mutex_release_quiet
+    printf '%s\n' 'remote-agent-v1: lease already exists' >&2
+    return 1
+  fi
+
+  if take_conductor_lease "$project" "$session" "$expected" "$checkout" "$digest"; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  if mint_json=$(mint_workflow "$project" "$plan_id" "$checkout" "$resident_host"); then
+    workflow_id=$(jq -r '.workflowId' <<<"$mint_json")
+  else
+    status=$?
+    tmux kill-session -t "$session" 2>/dev/null || true
+    protocol_call quiescent "$session" "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    protocol_call release-only-verify "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    protocol_call lease-release temp-rename "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  wf_dir=$(workflow_path "$workflow_id")
+  acquire_lock "$wf_dir/lock" || {
+    protocol_mutex_release_quiet
+    fail busy 'workflow lock is busy' 75
+  }
+  write_recovery_locked "$wf_dir" "$(episode_id)" 0 running
+  release_lock
+  update_lifecycle_binding "$wf_dir" "$workflow_id" "$TAKEN_GENERATION" \
+    lifecycle-start 'initial conductor bind' "$session" running
+  protocol_mutex_release_quiet
+  jq -cn --arg workflowId "$workflow_id" --argjson leaseGeneration "$TAKEN_GENERATION" \
+    '{ok:true,workflowId:$workflowId,phase:"running",leaseGeneration:$leaseGeneration}'
+}
+
+mark_failed_recovery() {
+  local workflow_id=$1 project=$2 wf_dir=$3 episode=$4 attempts=$5 seq
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  write_recovery_locked "$wf_dir" "$episode" "$attempts" failed-recovery
+  lifecycle_phase_locked "$wf_dir" failed-recovery failed-recovery "attempts=$attempts"
+  seq=$(journal_seq "$wf_dir")
+  notify_waiter "$wf_dir"
+  release_lock
+  feed_emit "$project" failed-recovery "$workflow_id" "$seq"
+}
+
+resume_one_workflow() {
+  local workflow_id=$1 project=$2 wf_dir=$3 phase session checkout episode attempts state
+  local fault_marker err status
+  phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || true)
+  session=$(conductor_session "$project")
+  case $phase in
+    quiescing|quiesced|released|failed-recovery) return 0 ;;
+  esac
+
+  # Before any liveness probe: refuse to treat missing tmux as DEAD.
+  require_resume_probe_bins
+
+  if session_is_live "$session"; then
+    if [[ -f $wf_dir/delivery-pending ]]; then
+      # Real queue-one contract only: consume stored payload, validate digest +
+      # requestId against the ledger, deliver, ACK latch. Never synthesize a
+      # journal entry or clear the marker on refusal (fail-open for resume).
+      if acquire_lock "$wf_dir/lock"; then
+        if deliver_pending_reconcile_locked "$wf_dir" "$workflow_id"; then
+          rm -f -- "$wf_dir/delivery-pending"
+          notify_waiter "$wf_dir"
+        fi
+        release_lock
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ -f $wf_dir/recovery.json ]]; then
+    episode=$(jq -r '.episodeId // empty' "$wf_dir/recovery.json")
+    attempts=$(jq -r '.attempts // 0' "$wf_dir/recovery.json")
+    state=$(jq -r '.state // empty' "$wf_dir/recovery.json")
+  else
+    episode=$(episode_id)
+    attempts=0
+    state=idle
+  fi
+  [[ $attempts =~ ^[0-9]+$ ]] || attempts=0
+  if [[ $state == failed-recovery || $attempts -ge 3 ]]; then
+    if [[ $phase != failed-recovery ]]; then
+      mark_failed_recovery "$workflow_id" "$project" "$wf_dir" "$episode" 3
+    fi
+    return 0
+  fi
+
+  # Dead session path: require re-bind tools BEFORE consuming an attempt.
+  # Missing claude under a bad launchd PATH must not burn the D2 cap.
+  require_resume_rebind_bins
+
+  attempts=$((attempts + 1))
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  write_recovery_locked "$wf_dir" "$episode" "$attempts" recovering
+  lifecycle_phase_locked "$wf_dir" recovering recovery-attempt "episode=$episode attempts=$attempts"
+  notify_waiter "$wf_dir"
+  release_lock
+
+  fault_marker="$state_home/orchestration/test-faults/crash-after-recovery-increment"
+  if [[ ${WORKFLOW_REGISTRY_TEST_FAULT:-} == crash-after-recovery-increment \
+      && -f $fault_marker && $(head -n 1 "$fault_marker" 2>/dev/null || true) == armed ]]; then
+    atomic_text "$fault_marker" consumed
+    return 70
+  fi
+
+  checkout=$(jq -r '.checkout // empty' "$wf_dir/meta.json")
+  err=$(mktemp "${TMPDIR:-/tmp}/workflow-rebind.XXXXXX")
+  if rebind_existing_workflow "$workflow_id" "$project" "$wf_dir" "$checkout" auto 2>"$err" >/dev/null; then
+    acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+    write_recovery_locked "$wf_dir" "$episode" "$attempts" running
+    release_lock
+    rm -f -- "$err"
+    return 0
+  fi
+  status=$?
+  cat "$err" >&2
+  rm -f -- "$err"
+  if (( attempts >= 3 )); then
+    mark_failed_recovery "$workflow_id" "$project" "$wf_dir" "$episode" "$attempts"
+    return 0
+  fi
+  return "$status"
+}
+
+resume_scan() {
+  [[ $# -eq 0 ]] || fail usage 'resume-scan takes no arguments' 64
+  local binding project workflow_id wf_dir
+  [[ -d $byproject_root ]] || { jq -cn '{ok:true,scanned:0}'; return; }
+  # Fail the whole scan loudly if lifecycle tools are unresolvable — before
+  # any workflow is touched or any recovery attempt is consumed.
+  local any=0
+  for binding in "$byproject_root"/miospot "$byproject_root"/orchestration; do
+    [[ -f $binding ]] && any=1 && break
+  done
+  if (( any )); then
+    require_resume_probe_bins
+  fi
+  local scanned=0
+  for binding in "$byproject_root"/miospot "$byproject_root"/orchestration; do
+    [[ -f $binding ]] || continue
+    project=${binding##*/}
+    workflow_id=$(head -n 1 "$binding" 2>/dev/null || true)
+    validate_workflow_id "$workflow_id"
+    wf_dir=$(workflow_path "$workflow_id")
+    resume_one_workflow "$workflow_id" "$project" "$wf_dir" || return $?
+    scanned=$((scanned + 1))
+  done
+  jq -cn --argjson scanned "$scanned" '{ok:true,scanned:$scanned}'
+}
+
+# ── LaunchAgent packaging (workflow-resume) ────────────────────────────────
+# Substitute @PLUGIN_ROOT@ / @STATE_HOME@ / @PATH@ and create the logs dir
+# launchd will not create for StandardOutPath/StandardErrorPath.
+
+workflow_resume_plist_template() {
+  local cand
+  cand="$SCRIPT_DIR/../templates/mini-relay/com.orchestration.workflow-resume.plist"
+  if [[ -f $cand ]]; then
+    cd "$(dirname "$cand")" && printf '%s\n' "$(pwd -P)/$(basename "$cand")"
+    return 0
+  fi
+  return 1
+}
+
+ensure_workflow_logs_dir() {
+  local logs
+  logs="$registry_root/logs"
+  mkdir -p -m 700 -- "$registry_root" "$logs"
+  chmod 700 "$registry_root" "$logs" 2>/dev/null || true
+}
+
+# Discover install-time PATH for the LaunchAgent EnvironmentVariables.
+# Prefer directories that actually host tmux/claude/jq on this machine, then
+# standard Homebrew/user/system roots. Never emit system-only /usr/bin:/bin
+# alone when real tool roots exist — launchd will not inherit the user shell PATH.
+resolve_launchd_path() {
+  local dirs=() seen=() d bin path_val candidate
+  for bin in tmux claude jq; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      candidate=$(command -v "$bin")
+      d=$(cd "$(dirname "$candidate")" && pwd -P)
+      dirs+=("$d")
+    fi
+  done
+  for d in \
+    /opt/homebrew/bin \
+    /usr/local/bin \
+    "${HOME}/.local/bin" \
+    "${HOME}/.local/yolo-bin" \
+    /usr/bin \
+    /bin \
+    /usr/sbin \
+    /sbin
+  do
+    [[ -n $d && -d $d ]] && dirs+=("$d")
+  done
+  path_val=
+  for d in "${dirs[@]}"; do
+    [[ -n $d ]] || continue
+    local already=0 s
+    for s in "${seen[@]+"${seen[@]}"}"; do
+      if [[ $s == "$d" ]]; then
+        already=1
+        break
+      fi
+    done
+    if (( already )); then
+      continue
+    fi
+    seen+=("$d")
+    if [[ -n $path_val ]]; then
+      path_val="$path_val:$d"
+    else
+      path_val="$d"
+    fi
+  done
+  if [[ -z $path_val ]]; then
+    path_val='/usr/bin:/bin:/usr/sbin:/sbin'
+  fi
+  printf '%s\n' "$path_val"
+}
+
+install_launchagent() {
+  local plugin_root= dest= do_load=0 arg state launch_path tmpl
+  local pr_esc st_esc path_esc
+  state=$state_home
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --plugin-root) (( $# )) || fail usage 'missing --plugin-root' 64; plugin_root=$1; shift ;;
+      --dest) (( $# )) || fail usage 'missing --dest' 64; dest=$1; shift ;;
+      --load) do_load=1 ;;
+      --state-home)
+        (( $# )) || fail usage 'missing --state-home' 64
+        state=$1
+        shift
+        # Re-bind registry_root for logs creation under the requested state home.
+        state_home=$state
+        registry_root="$state_home/orchestration/workflows"
+        byproject_root="$registry_root/byproject"
+        ;;
+      *) fail usage "unknown install-launchagent option: $arg" 64 ;;
+    esac
+  done
+  if [[ -z $plugin_root ]]; then
+    plugin_root=$(cd "$SCRIPT_DIR/.." && pwd -P)
+  fi
+  [[ $plugin_root == /* && -d $plugin_root ]] \
+    || fail invalid-argument 'plugin root must be an absolute existing directory' 64
+  if [[ -z $dest ]]; then
+    dest="${HOME:?HOME is required}/Library/LaunchAgents/com.orchestration.workflow-resume.plist"
+  fi
+  tmpl=$(workflow_resume_plist_template) \
+    || fail not-found 'LaunchAgent template not found (templates/mini-relay/com.orchestration.workflow-resume.plist)' 66
+
+  launch_path=$(resolve_launchd_path)
+
+  mkdir -p -m 700 -- "$(dirname "$dest")"
+  # Escape sed replacements carefully — paths only.
+  pr_esc=$(printf '%s' "$plugin_root" | sed -e 's/[\\/&]/\\&/g')
+  st_esc=$(printf '%s' "$state" | sed -e 's/[\\/&]/\\&/g')
+  path_esc=$(printf '%s' "$launch_path" | sed -e 's/[\\/&]/\\&/g')
+  sed \
+    -e "s/@PLUGIN_ROOT@/${pr_esc}/g" \
+    -e "s/@STATE_HOME@/${st_esc}/g" \
+    -e "s/@PATH@/${path_esc}/g" \
+    "$tmpl" >"$dest"
+  chmod 644 "$dest"
+  if grep -Eq '@PLUGIN_ROOT@|@STATE_HOME@|@PATH@' "$dest"; then
+    rm -f -- "$dest"
+    fail invalid-state 'install-launchagent left unresolved placeholders' 65
+  fi
+
+  # launchd does not create parent directories for StandardOutPath/StandardErrorPath.
+  ensure_workflow_logs_dir
+
+  if [[ $do_load -eq 1 ]]; then
+    if command -v launchctl >/dev/null 2>&1; then
+      launchctl bootout "gui/$(id -u)" "$dest" 2>/dev/null || \
+        launchctl unload "$dest" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$dest" 2>/dev/null || \
+        launchctl load "$dest" 2>/dev/null || true
+    fi
+  fi
+
+  jq -cn \
+    --arg dest "$dest" \
+    --arg path "$launch_path" \
+    --arg logs "$registry_root/logs" \
+    --argjson load "$do_load" \
+    '{ok:true,status:"launchagent-installed",dest:$dest,path:$path,logs:$logs,loaded:$load}'
+}
+
+kill_workflow() {
+  [[ $# -eq 1 ]] || fail usage 'kill requires WORKFLOW_ID or PROJECT' 64
+  resolve_lifecycle_target "$1"
+  local workflow_id=$RESOLVED_WORKFLOW_ID project=$RESOLVED_PROJECT wf_dir=$RESOLVED_WORKFLOW_DIR
+  local phase session seq status
+  phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || true)
+  case $phase in
+    quiescing|quiesced|released|failed-recovery)
+      jq -cn --arg workflowId "$workflow_id" --arg phase "$phase" \
+        '{ok:true,workflowId:$workflowId,phase:$phase,noOp:true}'
+      return
+      ;;
+  esac
+  session=$(conductor_session "$project")
+  protocol_mutex_acquire "$project" "$wf_dir" || return $?
+  if protocol_call quiescent "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  if protocol_call release-only-verify "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  tmux has-session -t "$session" 2>/dev/null && tmux kill-session -t "$session"
+  acquire_lock "$wf_dir/lock" || {
+    protocol_mutex_release_quiet
+    fail busy 'workflow lock is busy' 75
+  }
+  lifecycle_phase_locked "$wf_dir" quiescing lifecycle-quiescing
+  lifecycle_phase_locked "$wf_dir" quiesced completed
+  seq=$(journal_seq "$wf_dir")
+  notify_waiter "$wf_dir"
+  release_lock
+  protocol_mutex_release_quiet
+  feed_emit "$project" completed "$workflow_id" "$seq"
+  jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"quiesced"}'
+}
+
+release_workflow() {
+  [[ $# -eq 1 ]] || fail usage 'release requires WORKFLOW_ID or PROJECT' 64
+  resolve_lifecycle_target "$1"
+  local workflow_id=$RESOLVED_WORKFLOW_ID project=$RESOLVED_PROJECT wf_dir=$RESOLVED_WORKFLOW_DIR
+  local phase session seq status
+  phase=$(head -n 1 "$wf_dir/phase" 2>/dev/null || true)
+  if [[ $phase == released ]]; then
+    jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"released",noOp:true}'
+    return
+  fi
+  session=$(conductor_session "$project")
+  protocol_mutex_acquire "$project" "$wf_dir" || return $?
+  if protocol_call lease-release temp-rename "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then
+    :
+  else
+    status=$?
+    protocol_refusal_envelope
+    protocol_mutex_release_quiet
+    return "$status"
+  fi
+  acquire_lock "$wf_dir/lock" || {
+    protocol_mutex_release_quiet
+    fail busy 'workflow lock is busy' 75
+  }
+  lifecycle_phase_locked "$wf_dir" released released
+  seq=$(journal_seq "$wf_dir")
+  notify_waiter "$wf_dir"
+  release_lock
+  if [[ -f $byproject_root/$project \
+      && $(head -n 1 "$byproject_root/$project" 2>/dev/null || true) == "$workflow_id" ]]; then
+    rm -f -- "$byproject_root/$project"
+  fi
+  protocol_mutex_release_quiet
+  feed_emit "$project" released "$workflow_id" "$seq"
+  jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"released"}'
+}
+
+# ── Mirror queue (D6+D9): request / next / cancel / ack ────────────────────
+
+valid_mirror_relpath() {
+  case $1 in
+    ''|/*|*/../*|../*|*/..|..|*//*|*[$'\n\r']*|*'*'*|*'?'*|*'['*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+protocol_read() {
+  local project=$1 key=$2 default=${3:-}
+  local path
+  path=$(protocol_project_dir "$project")/$key
+  if [[ -f $path ]]; then
+    head -n 1 "$path" 2>/dev/null || printf '%s\n' "$default"
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+protocol_has_live_writer() {
+  local project=$1 directory lease
+  directory=$(protocol_project_dir "$project")
+  lease=$(protocol_read "$project" lease-state '')
+  [[ $lease == active ]] || return 1
+  [[ -f $directory/quiescent ]] && return 1
+  return 0
+}
+
+# Compute the only protocol-legal direction from CURRENT authoritative state.
+# Sets MIRROR_DIRECTION to outbound|inbound. Fails with live-writer / diverged
+# when illegal (must not be called inside a command substitution — fail() must
+# exit the main registry process). local_digest is optional (worker claim).
+compute_mirror_direction() {
+  local project=$1 job_file=$2 local_digest=${3:-}
+  local seed common remote active_binding
+
+  MIRROR_DIRECTION=
+  if protocol_has_live_writer "$project"; then
+    fail live-writer 'active live writer refuses mirror claim' 65
+  fi
+
+  seed=$(jq -r 'if .seed == true then "true" else "false" end' "$job_file")
+  common=$(protocol_read "$project" common '')
+  remote=$(protocol_read "$project" remote "$common")
+  active_binding=
+  [[ -f $byproject_root/$project ]] && active_binding=1
+
+  if [[ -n $local_digest ]]; then
+    if [[ -n $common ]]; then
+      if [[ $local_digest != "$common" && $remote != "$common" && $local_digest != "$remote" ]]; then
+        fail diverged 'mirror claim refuses divergent digests' 65
+      fi
+      if [[ $local_digest != "$common" && $remote == "$common" ]]; then
+        MIRROR_DIRECTION=outbound
+        return 0
+      fi
+      if [[ $local_digest == "$common" && $remote != "$common" ]]; then
+        MIRROR_DIRECTION=inbound
+        return 0
+      fi
+      # equal from worker view (local==common==remote or local==remote)
+    fi
+  fi
+
+  # Seed jobs are always outbound (MacBook → Mini) when legal.
+  if [[ $seed == true ]]; then
+    MIRROR_DIRECTION=outbound
+    return 0
+  fi
+
+  # Mini owns the checkout (active workflow) or has remote-only changes → inbound.
+  if [[ -n $active_binding || ( -n $common && -n $remote && $remote != "$common" ) ]]; then
+    MIRROR_DIRECTION=inbound
+    return 0
+  fi
+
+  # No Mini ownership delta → outbound (operator/seed-class sync from MacBook).
+  MIRROR_DIRECTION=outbound
+}
+
+# List unclaimed jobIds for project that would claim as outbound right now.
+collect_unclaimed_outbound_job_ids() {
+  local project=$1 job_file job_project state dir_out ids=
+  [[ -d $registry_root ]] || return 0
+  while IFS= read -r job_file; do
+    [[ -f $job_file ]] || continue
+    state=$(jq -r '.state // empty' "$job_file" 2>/dev/null || true)
+    [[ $state == pending ]] || continue
+    job_project=$(jq -r '.project // empty' "$job_file" 2>/dev/null || true)
+    [[ $job_project == "$project" ]] || continue
+    # Direction evaluation for fencing must not trip live-writer (mint is a
+    # different path). Seed or equal/non-active → outbound fences.
+    if dir_out=$(
+      seed=$(jq -r 'if .seed == true then "true" else "false" end' "$job_file")
+      common=$(protocol_read "$project" common '')
+      remote=$(protocol_read "$project" remote "$common")
+      if [[ $seed == true ]]; then
+        printf 'outbound\n'
+      elif [[ -f $byproject_root/$project ]]; then
+        printf 'inbound\n'
+      elif [[ -n $common && -n $remote && $remote != "$common" ]]; then
+        printf 'inbound\n'
+      else
+        printf 'outbound\n'
+      fi
+    ); then
+      if [[ $dir_out == outbound ]]; then
+        ids+="$(jq -r '.jobId' "$job_file")"$'\n'
+      fi
+    fi
+  done < <(find "$registry_root" -mindepth 3 -maxdepth 3 -type f -path '*/mirror-queue/*.json' -print 2>/dev/null | LC_ALL=C sort)
+  printf '%s' "$ids" | sed '/^$/d'
+}
+
+find_mirror_job_file() {
+  local job_id=$1 hit=
+  [[ $job_id =~ ^job-[A-Za-z0-9._-]+$ ]] || fail invalid-argument 'invalid jobId' 64
+  while IFS= read -r hit; do
+    if [[ -f $hit ]] && [[ $(jq -r '.jobId // empty' "$hit" 2>/dev/null || true) == "$job_id" ]]; then
+      printf '%s\n' "$hit"
+      return 0
+    fi
+  done < <(find "$registry_root" -mindepth 3 -maxdepth 3 -type f \( -name "${job_id}.json" -o -path '*/mirror-queue/*.json' \) -print 2>/dev/null | LC_ALL=C sort)
+  fail not-found 'mirror job not found' 66
+}
+
+request_mirror_sync() {
+  (( $# >= 1 )) || fail usage 'request-mirror-sync requires WORKFLOW_ID --request-id ID' 64
+  local workflow_id=$1 wf_dir project request_id= seed=0 include_ignored= approve_ignored= arg
+  local digest record replay job_id job_path created outcome job_json
+  shift
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --request-id) (( $# )) || fail usage 'missing requestId' 64; request_id=$1; shift ;;
+      --seed) seed=1 ;;
+      --include-ignored) (( $# )) || fail usage 'missing include-ignored path' 64; include_ignored=$1; shift ;;
+      --approve-ignored) (( $# )) || fail usage 'missing approve-ignored path' 64; approve_ignored=$1; shift ;;
+      *) fail usage 'unknown request-mirror-sync option' 64 ;;
+    esac
+  done
+  validate_atom "$request_id" requestId
+  if (( seed )); then
+    valid_mirror_relpath "$include_ignored" || fail invalid-argument 'invalid include-ignored path' 64
+    valid_mirror_relpath "$approve_ignored" || fail invalid-argument 'invalid approve-ignored path' 64
+    [[ $include_ignored == "$approve_ignored" ]] \
+      || fail invalid-argument 'include-ignored and approve-ignored must match' 64
+  else
+    [[ -z $include_ignored && -z $approve_ignored ]] \
+      || fail usage 'ignored-path flags require --seed' 64
+  fi
+
+  wf_dir=$(workflow_path "$workflow_id")
+  project=$(jq -r '.project // empty' "$wf_dir/meta.json")
+  validate_atom "$project" project
+
+  # Payload digest covers the labels-and-paths-only request shape (no direction).
+  digest=$(printf 'mirror-sync|%s|%s|%s|%s|%s' "$workflow_id" "$request_id" \
+    "$( ((seed)) && printf 1 || printf 0 )" "$include_ignored" "$approve_ignored" \
+    | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } \
+    | awk '{print $1}')
+
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  mkdir -p -m 700 -- "$wf_dir/mirror-queue" "$wf_dir/requests"
+
+  record="$wf_dir/requests/$request_id.json"
+  if [[ -f $record ]]; then
+    if [[ $(jq -r '.sha256 // empty' "$record") != "$digest" ]]; then
+      fail digest-conflict 'requestId payload digest conflict' 65
+    fi
+    replay=$(jq -c '.outcome' "$record")
+    release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$replay"
+    return
+  fi
+
+  job_id="job-$project-$(date -u '+%Y%m%dT%H%M%SZ')-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
+  created=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  job_json=$(jq -cn \
+    --arg jobId "$job_id" \
+    --arg requestId "$request_id" \
+    --arg workflowId "$workflow_id" \
+    --arg project "$project" \
+    --arg createdAt "$created" \
+    --argjson seed "$( ((seed)) && printf true || printf false )" \
+    --arg includeIgnored "$include_ignored" \
+    --arg approveIgnored "$approve_ignored" '
+      {
+        jobId: $jobId,
+        requestId: $requestId,
+        workflowId: $workflowId,
+        project: $project,
+        state: "pending",
+        createdAt: $createdAt,
+        seed: $seed
+      }
+      + (if $seed then {includeIgnored:$includeIgnored, approveIgnored:$approveIgnored} else {} end)
+    ')
+  # Intentionally NO direction field — computed only at claim time (D6+D9).
+  job_path="$wf_dir/mirror-queue/${job_id}.json"
+  atomic_json "$job_path" "$job_json"
+
+  outcome=$(jq -cn \
+    --arg workflowId "$workflow_id" \
+    --arg requestId "$request_id" \
+    --arg jobId "$job_id" \
+    '{ok:true,workflowId:$workflowId,requestId:$requestId,jobId:$jobId,status:"pending"}')
+  record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+  release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
+}
+
+# Claim the oldest pending job for project (CAS under the workflow lock).
+# On success sets CLAIMED_* globals and returns 0. On hard claim refusal
+# (diverged/live-writer) compute_mirror_direction exits via fail(). Returns 1
+# when no pending job is claimable.
+try_claim_mirror_job() {
+  local project=$1 local_digest=$2 job_file wf_dir job_id claim_token direction job_json
+  local workflow_id branch head claimed_at checkout
+
+  while IFS= read -r job_file; do
+    [[ -f $job_file ]] || continue
+    [[ $(jq -r '.project // empty' "$job_file" 2>/dev/null || true) == "$project" ]] || continue
+    [[ $(jq -r '.state // empty' "$job_file" 2>/dev/null || true) == pending ]] || continue
+
+    workflow_id=$(jq -r '.workflowId // empty' "$job_file")
+    [[ -n $workflow_id ]] || continue
+    wf_dir="$registry_root/$workflow_id"
+    [[ -d $wf_dir ]] || continue
+
+    acquire_lock "$wf_dir/lock" || continue
+    trap release_lock EXIT HUP INT TERM
+    # Re-read under lock — CAS: only pending is claimable.
+    if [[ ! -f $job_file ]] || [[ $(jq -r '.state // empty' "$job_file") != pending ]]; then
+      release_lock; trap - EXIT HUP INT TERM
+      continue
+    fi
+
+    # Direction from CURRENT authoritative state only (claim time). fail() exits
+    # the process on diverged / live-writer (fail-closed; job stays pending).
+    # Must not use command substitution — fail() has to kill this process.
+    compute_mirror_direction "$project" "$job_file" "$local_digest"
+    direction=$MIRROR_DIRECTION
+    job_id=$(jq -r '.jobId' "$job_file")
+    claim_token="ct-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    claimed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    branch=$(protocol_read "$project" remote-branch '')
+    head=$(protocol_read "$project" remote-head '')
+    if [[ -z $branch && $direction == inbound ]]; then
+      checkout=$(jq -r '.checkout // empty' "$wf_dir/meta.json" 2>/dev/null || true)
+      if [[ -n $checkout && -d $checkout/.git ]]; then
+        branch=$(git -C "$checkout" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+        head=$(git -C "$checkout" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
+      fi
+    fi
+    CLAIMED_INCLUDE_IGNORED=$(jq -r '.includeIgnored // empty' "$job_file")
+    CLAIMED_APPROVE_IGNORED=$(jq -r '.approveIgnored // empty' "$job_file")
+    job_json=$(jq -c \
+      --arg state claimed \
+      --arg direction "$direction" \
+      --arg claimToken "$claim_token" \
+      --arg claimedAt "$claimed_at" \
+      --arg branch "$branch" \
+      --arg head "$head" '
+        .state = $state
+        | .direction = $direction
+        | .claimToken = $claimToken
+        | .claimedAt = $claimedAt
+        | (if $branch != "" then .branch = $branch else . end)
+        | (if $head != "" then .head = $head else . end)
+      ' "$job_file")
+    atomic_json "$job_file" "$job_json"
+    release_lock; trap - EXIT HUP INT TERM
+    CLAIMED_JOB_FILE=$job_file
+    CLAIMED_DIRECTION=$direction
+    CLAIMED_TOKEN=$claim_token
+    CLAIMED_JOB_ID=$job_id
+    CLAIMED_WORKFLOW_ID=$workflow_id
+    CLAIMED_BRANCH=$branch
+    CLAIMED_HEAD=$head
+    return 0
+  done < <(find "$registry_root" -mindepth 3 -maxdepth 3 -type f -path '*/mirror-queue/*.json' -print 2>/dev/null | LC_ALL=C sort)
+  return 1
+}
+
+mirror_next() {
+  (( $# >= 1 )) || fail usage 'mirror-next requires PROJECT --timeout SECONDS' 64
+  local project=$1 timeout=0 local_digest= arg
+  shift
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --timeout) (( $# )) || fail usage 'missing timeout' 64; timeout=$1; shift ;;
+      --local-digest) (( $# )) || fail usage 'missing local-digest' 64; local_digest=$1; shift ;;
+      *) fail usage 'unknown mirror-next option' 64 ;;
+    esac
+  done
+  validate_lifecycle_project "$project"
+  [[ $timeout =~ ^[0-9]+$ ]] && (( timeout <= 300 )) \
+    || fail usage 'timeout must be an integer from 0 through 300' 64
+  if [[ -n $local_digest ]]; then
+    [[ $local_digest =~ ^[A-Za-z0-9._-]{1,128}$ ]] \
+      || fail invalid-argument 'invalid local-digest' 64
+  fi
+
+  local deadline now
+  now=$(date +%s)
+  deadline=$((now + timeout))
+  CLAIMED_JOB_FILE= CLAIMED_DIRECTION= CLAIMED_TOKEN= CLAIMED_JOB_ID=
+  CLAIMED_WORKFLOW_ID= CLAIMED_BRANCH= CLAIMED_HEAD=
+  CLAIMED_INCLUDE_IGNORED= CLAIMED_APPROVE_IGNORED=
+
+  while :; do
+    if try_claim_mirror_job "$project" "$local_digest"; then
+      jq -cn \
+        --arg jobId "$CLAIMED_JOB_ID" \
+        --arg workflowId "$CLAIMED_WORKFLOW_ID" \
+        --arg project "$project" \
+        --arg direction "$CLAIMED_DIRECTION" \
+        --arg claimToken "$CLAIMED_TOKEN" \
+        --arg branch "${CLAIMED_BRANCH:-}" \
+        --arg head "${CLAIMED_HEAD:-}" \
+        --arg includeIgnored "${CLAIMED_INCLUDE_IGNORED:-}" \
+        --arg approveIgnored "${CLAIMED_APPROVE_IGNORED:-}" '
+          {
+            ok: true,
+            jobId: $jobId,
+            workflowId: $workflowId,
+            project: $project,
+            direction: $direction,
+            claimToken: $claimToken
+          }
+          + (if $branch != "" then {branch:$branch} else {} end)
+          + (if $head != "" then {head:$head} else {} end)
+          + (if $includeIgnored != "" then {includeIgnored:$includeIgnored, approveIgnored:$approveIgnored} else {} end)
+        '
+      return 0
+    fi
+    now=$(date +%s)
+    if (( timeout == 0 || now >= deadline )); then
+      jq -cn '{ok:true,jobId:null,status:"empty"}'
+      return 0
+    fi
+    sleep 0.2
+  done
+}
+
+mirror_cancel() {
+  (( $# >= 1 )) || fail usage 'mirror-cancel requires JOB_ID --request-id ID' 64
+  local job_id=$1 request_id= arg job_file wf_dir workflow_id state outcome
+  shift
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --request-id) (( $# )) || fail usage 'missing requestId' 64; request_id=$1; shift ;;
+      *) fail usage 'unknown mirror-cancel option' 64 ;;
+    esac
+  done
+  [[ -n $request_id ]] || fail usage 'mirror-cancel requires --request-id' 64
+  validate_atom "$request_id" requestId
+  job_file=$(find_mirror_job_file "$job_id")
+  workflow_id=$(jq -r '.workflowId // empty' "$job_file")
+  wf_dir=$(workflow_path "$workflow_id")
+
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  state=$(jq -r '.state // empty' "$job_file")
+  case $state in
+    pending)
+      rm -f -- "$job_file"
+      outcome=$(jq -cn --arg jobId "$job_id" --arg requestId "$request_id" \
+        '{ok:true,jobId:$jobId,requestId:$requestId,status:"cancelled"}')
+      # Best-effort ledger for cancel requestId (digest = cancel of jobId).
+      local digest
+      digest=$(printf 'mirror-cancel|%s|%s' "$job_id" "$request_id" \
+        | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } \
+        | awk '{print $1}')
+      record_request_locked "$wf_dir" "$request_id" "$digest" "$outcome"
+      release_lock; trap - EXIT HUP INT TERM
+      printf '%s\n' "$outcome"
+      ;;
+    claimed)
+      release_lock; trap - EXIT HUP INT TERM
+      fail already-claimed 'mirror job is already claimed' 65
+      ;;
+    cancelled)
+      release_lock; trap - EXIT HUP INT TERM
+      jq -cn --arg jobId "$job_id" --arg requestId "$request_id" \
+        '{ok:true,jobId:$jobId,requestId:$requestId,status:"cancelled"}'
+      ;;
+    *)
+      release_lock; trap - EXIT HUP INT TERM
+      fail invalid-state "mirror job state refuses cancel: $state" 65
+      ;;
+  esac
+}
+
+mirror_ack() {
+  (( $# >= 1 )) || fail usage 'mirror-ack requires JOB_ID options' 64
+  local job_id=$1 claim_token= status= fingerprint= branch= head= arg
+  local job_file wf_dir workflow_id project state stored_token job_json mirror_json seq
+  shift
+  while (( $# )); do
+    arg=$1; shift
+    case "$arg" in
+      --claim-token) (( $# )) || fail usage 'missing claim-token' 64; claim_token=$1; shift ;;
+      --status) (( $# )) || fail usage 'missing status' 64; status=$1; shift ;;
+      --fingerprint) (( $# )) || fail usage 'missing fingerprint' 64; fingerprint=$1; shift ;;
+      --branch) (( $# )) || fail usage 'missing branch' 64; branch=$1; shift ;;
+      --head) (( $# )) || fail usage 'missing head' 64; head=$1; shift ;;
+      --request-id) (( $# )) || fail usage 'missing requestId' 64; shift ;; # accepted, unused
+      *) fail usage 'unknown mirror-ack option' 64 ;;
+    esac
+  done
+  [[ $status =~ ^(verified|diverged|failed)$ ]] \
+    || fail usage 'status must be verified|diverged|failed' 64
+  [[ -n $claim_token ]] || fail usage 'mirror-ack requires --claim-token' 64
+  validate_atom "$claim_token" claimToken
+
+  job_file=$(find_mirror_job_file "$job_id")
+  workflow_id=$(jq -r '.workflowId // empty' "$job_file")
+  project=$(jq -r '.project // empty' "$job_file")
+  wf_dir=$(workflow_path "$workflow_id")
+
+  acquire_lock "$wf_dir/lock" || fail busy 'workflow lock is busy' 75
+  trap release_lock EXIT HUP INT TERM
+  journal_broken_lock_locked "$wf_dir"
+  state=$(jq -r '.state // empty' "$job_file")
+  stored_token=$(jq -r '.claimToken // empty' "$job_file")
+  [[ $state == claimed ]] || fail invalid-state 'mirror job is not claimed' 65
+  [[ $stored_token == "$claim_token" ]] || fail cas-lost 'claim token does not match' 65
+
+  case $status in
+    diverged)
+      job_json=$(jq -c --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '.state = "diverged" | .finishedAt = $at' "$job_file")
+      atomic_json "$job_file" "$job_json"
+      seq=$(journal_append_locked "$wf_dir" mirror-diverged mirror "$job_id")
+      release_lock; trap - EXIT HUP INT TERM
+      feed_emit "$project" mirror-failed "$job_id" "$seq"
+      fail diverged 'mirror ack recorded diverged' 65
+      ;;
+    failed)
+      job_json=$(jq -c --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '.state = "failed" | .finishedAt = $at' "$job_file")
+      atomic_json "$job_file" "$job_json"
+      seq=$(journal_append_locked "$wf_dir" mirror-failed mirror "$job_id")
+      release_lock; trap - EXIT HUP INT TERM
+      feed_emit "$project" mirror-failed "$job_id" "$seq"
+      jq -cn --arg jobId "$job_id" '{ok:true,jobId:$jobId,status:"failed"}'
+      ;;
+    verified)
+      job_json=$(jq -c --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '.state = "done" | .finishedAt = $at' "$job_file")
+      atomic_json "$job_file" "$job_json"
+      mirror_json=$(jq -cn \
+        --arg jobId "$job_id" \
+        --arg fingerprint "$fingerprint" \
+        --arg branch "$branch" \
+        --arg head "$head" \
+        --arg updatedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        --arg lastSafeLabel "mirror-acked:$job_id" '
+          {
+            repoSync: "mirror-acked",
+            lastSafeLabel: $lastSafeLabel,
+            jobId: $jobId,
+            updatedAt: $updatedAt
+          }
+          + (if $fingerprint != "" then {fingerprint:$fingerprint} else {} end)
+          + (if $branch != "" then {branch:$branch} else {} end)
+          + (if $head != "" then {head:$head} else {} end)
+        ')
+      atomic_json "$wf_dir/mirror.json" "$mirror_json"
+      seq=$(journal_append_locked "$wf_dir" mirror-done mirror "$job_id")
+      release_lock; trap - EXIT HUP INT TERM
+      feed_emit "$project" mirror-done "$job_id" "$seq"
+      jq -cn --arg jobId "$job_id" '{ok:true,jobId:$jobId,status:"verified"}'
+      ;;
+  esac
 }
 
 require_jq
@@ -339,6 +2322,25 @@ case "$operation" in
   list) list_workflows "$@" ;;
   inspect) inspect_workflow "$@" ;;
   phase-set) set_phase "$@" ;;
+  project-event) project_event "$@" ;;
+  wait) wait_workflow "$@" ;;
+  send) send_workflow "$@" ;;
+  deliver-queue) deliver_queue "$@" ;;
+  feed-append) feed_append "$@" ;;
+  device-register) device_register "$@" ;;
+  device-revoke) device_revoke "$@" ;;
+  outbox-fetch) outbox_fetch "$@" ;;
+  outbox-ack) outbox_ack "$@" ;;
+  outbox-mark-failed) outbox_mark_failed "$@" ;;
+  start-conductor) start_conductor "$@" ;;
+  resume-scan) resume_scan "$@" ;;
+  install-launchagent) install_launchagent "$@" ;;
+  kill) kill_workflow "$@" ;;
+  release) release_workflow "$@" ;;
+  request-mirror-sync) request_mirror_sync "$@" ;;
+  mirror-next) mirror_next "$@" ;;
+  mirror-cancel) mirror_cancel "$@" ;;
+  mirror-ack) mirror_ack "$@" ;;
   '') fail usage 'operation is required' 64 ;;
   *) fail unknown-operation 'unknown or unsupported operation' 64 ;;
 esac

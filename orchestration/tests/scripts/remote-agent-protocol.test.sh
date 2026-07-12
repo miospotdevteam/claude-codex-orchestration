@@ -440,7 +440,57 @@ test_exact_session_atoms_only() {
   expect_success capture remote-agent--orchestration--codex || return 1
   expect_failure capture remote-agent--orchestration || return 1
   expect_failure capture remote-agent--orchestration--codex-extra || return 1
-  expect_failure capture 'remote-agent--miospot--claude;touch-pwned'
+  expect_failure capture 'remote-agent--miospot--claude;touch-pwned' || return 1
+  # Chat writer atoms are pattern-validated: closed project, literal chat
+  # slot, chatid of lowercase alphanumerics joined by single hyphens, 1-63
+  # bytes, anchored. Nothing outside that exact shape is a session.
+  local max_chatid over_chatid
+  max_chatid=$(printf 'a%.0s' {1..32})
+  over_chatid=$(printf 'a%.0s' {1..33})
+  expect_success capture remote-agent--miospot--chat--planning-1 || return 1
+  expect_success capture remote-agent--orchestration--chat--a || return 1
+  expect_success capture "remote-agent--miospot--chat--$max_chatid" || return 1
+  expect_success capture remote-agent--miospot--chat--550e8400-e29b-41d4-a716-446655440000 || return 1
+  expect_failure capture "remote-agent--miospot--chat--$over_chatid" || return 1
+  expect_failure capture remote-agent--miospot--chat-- || return 1
+  expect_failure capture remote-agent--miospot--chat--Planning-1 || return 1
+  expect_failure capture remote-agent--miospot--chat--plan_1 || return 1
+  expect_failure capture remote-agent--miospot--chat--plan.1 || return 1
+  expect_failure capture remote-agent--miospot--chat---plan || return 1
+  expect_failure capture remote-agent--miospot--chat--plan- || return 1
+  expect_failure capture remote-agent--miospot--chat--plan--1 || return 1
+  expect_failure capture remote-agent--home--chat--plan || return 1
+  expect_failure capture 'remote-agent--miospot--chat--ok;touch-pwned' || return 1
+  expect_failure capture 'remote-agent--miospot--chat--$(touch-pwned)' || return 1
+  expect_failure capture 'remote-agent--miospot--chat--ok touch-pwned' || return 1
+  expect_failure capture 'remote-agent--miospot--chat--../../pwn' || return 1
+  expect_failure capture 'remote-agent--miospot--chat--*' || return 1
+  expect_failure capture "$(printf 'remote-agent--miospot--chat--ok\nx')"
+}
+
+test_chat_writer_atom_holds_the_one_real_protocol_lease() {
+  local session=remote-agent--miospot--chat--planning-1 state=$AUTHORITY_PATH/projects/miospot
+  expect_success adopt miospot common || return 1
+  # Cross-project and malformed chat atoms never enter the lease vocabulary.
+  expect_failure lease-provisional temp-rename orchestration "$session" 0 chat-owner "$AUTHORITY_TOKEN" || return 1
+  expect_failure lease-provisional temp-rename miospot 'remote-agent--miospot--chat--ok;touch-pwned' 0 chat-owner "$AUTHORITY_TOKEN" || return 1
+  [[ ! -e $state/lease-state ]] || return 1
+  # The chat atom walks the one lease protocol end-to-end: provisional,
+  # commit, quiescent, release-only verification, release-last.
+  expect_success lease-provisional temp-rename miospot "$session" 0 chat-owner "$AUTHORITY_TOKEN" || return 1
+  expect_success probe manifest-nul miospot "$session" main head common "$AUTHORITY_TOKEN" || return 1
+  assert_contains "$STDOUT" '"writer":"provisional"' || return 1
+  expect_success lease-commit temp-rename miospot "$session" 0 "$AUTHORITY_TOKEN" || return 1
+  # A six-slot atom cannot verify against the chat-held lease: same single
+  # lease authority, no parallel chat lease logic anywhere.
+  expect_failure release-only-verify miospot remote-agent--miospot--claude "$AUTHORITY_TOKEN" || return 1
+  assert_contains "$STDERR" 'lease session mismatch' || return 1
+  expect_success quiescent "$session" "$AUTHORITY_TOKEN" || return 1
+  expect_success release-only-verify miospot "$session" "$AUTHORITY_TOKEN" || return 1
+  expect_success lease-release temp-rename miospot "$session" "$AUTHORITY_TOKEN" || return 1
+  [[ ! -e $state/lease-state && ! -e $state/lease-session ]] || return 1
+  expect_success probe manifest-nul miospot "$session" main head common "$AUTHORITY_TOKEN" || return 1
+  assert_contains "$STDOUT" '"writer":"none"'
 }
 
 test_lifecycle_wait_and_reveal_are_not_sync_protocol_operations() {
@@ -491,6 +541,7 @@ run_test 'quiescence and verification precede release-last' test_quiescence_prec
 run_test 'release-only verification preserves common and remote fingerprints' test_release_only_verification_preserves_common_and_remote
 run_test 'capture exposes only the newest 40 lines and 4 KiB' test_capture_is_exact_and_bounded
 run_test 'session controls accept only exact project/harness names' test_exact_session_atoms_only
+run_test 'a chat writer atom holds the one real protocol lease end-to-end' test_chat_writer_atom_holds_the_one_real_protocol_lease
 run_test 'wait, enqueue, and reveal never enter sync/lease authority' test_lifecycle_wait_and_reveal_are_not_sync_protocol_operations
 
 printf '%d tests passed, %d tests failed\n' "$PASS_COUNT" "$FAIL_COUNT"
