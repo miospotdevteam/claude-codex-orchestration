@@ -6,7 +6,7 @@ explicitly selectable host and optional worker family.
 It contains both the design spec (under `docs/`) and the plugin
 implementation that descends from it (under `orchestration/`:
 `.claude-plugin/plugin.json`, `codex-plugin/.codex-plugin/plugin.json`, `skills/`,
-`codex-skills/`, `external-skills/`, `config/`, `hooks/`,
+`codex-plugin/skills/`, `codex-skills/`, `external-skills/`, `config/`, `hooks/`,
 `scripts/`, `schemas/`, `templates/`, `tests/`). A routing-eval harness
 lives in the top-level `eval/` directory. See the layout block below.
 
@@ -73,9 +73,9 @@ claude-codex-orchestration/      ← repo root = marketplace root
 │   │   └── plugin.json          ← minimal plugin manifest (name, description)
 │   ├── codex-plugin/            ← Codex marketplace source
 │   │   ├── .codex-plugin/plugin.json
-│   │   └── skills/              ← conventional entrypoints to canonical bodies
+│   │   └── skills/              ← 4 canonical, self-contained Codex host skills
 │   ├── skills/                  ← 9 core + 9 auxiliary skills
-│   ├── codex-skills/            ← 4 Codex-host orchestration skills
+│   ├── codex-skills/            ← source-compatibility entrypoints to codex-plugin/skills
 │   ├── external-skills/         ← exact 13 portable Codex/Grok work skills
 │   ├── config/                  ← canonical Codex/Fable routing profiles
 │   ├── hooks/                   ← manifest + 2 read-only notice handlers +
@@ -322,7 +322,7 @@ quiesce and align the old session; never fall back to raw SSH, rsync, or tmux.
 
 ## Testing
 
-Run all 29 shipped plugin suites against installation, helpers, skills,
+Run all 30 shipped plugin suites against installation, helpers, skills,
 wrappers, Mini services, and hooks:
 
 ```bash
@@ -332,7 +332,7 @@ for test_file in tests/scripts/*.test.sh tests/hooks/*.test.sh; do
 done
 ```
 
-All 29 suites use shell test harnesses, sandbox under `mktemp -d`,
+All 30 suites use shell test harnesses, sandbox under `mktemp -d`,
 and clean up after themselves. Each exits non-zero on any failure.
 
 Syntax / lint checks for the shell scripts:
@@ -346,7 +346,7 @@ shellcheck scripts/*.sh hooks/*.sh    # optional but recommended
 JSON validity (from repo root):
 
 ```bash
-jq -e . .claude-plugin/marketplace.json orchestration/.claude-plugin/plugin.json orchestration/hooks/hooks.json orchestration/schemas/*.json
+jq -e . .agents/plugins/marketplace.json .claude-plugin/marketplace.json orchestration/.claude-plugin/plugin.json orchestration/codex-plugin/.codex-plugin/plugin.json orchestration/hooks/hooks.json orchestration/schemas/*.json
 ```
 
 ## Contributing / dev

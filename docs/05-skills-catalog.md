@@ -337,13 +337,20 @@ for authority.
 
 ### Codex host and portable skill bodies
 
-`codex-skills/` contains exactly the four canonical Codex-host orchestration
-bodies: `conductor`, `persistent-plans`, `writing-plans`, and
-`codex-dispatch`. Codex plugin ingestion requires a conventional `skills/`
-directory, so `codex-plugin/skills/` exposes four small entrypoints that load
-those canonical bodies from the parent package. The entrypoints are the plugin
-discovery surface; `codex-skills/` remains the single source of behavioral
-truth.
+`codex-plugin/skills/` contains exactly the four canonical, self-contained
+Codex-host orchestration bodies: `conductor`, `persistent-plans`,
+`writing-plans`, and `codex-dispatch`. This is both the conventional plugin
+discovery surface and the single source of behavioral truth in a versioned
+Codex artifact. `codex-skills/` contains only small source-compatibility
+entrypoints that delegate to those installed bodies.
+
+Each canonical body resolves helpers from the one enabled
+`orchestration@claude-codex-orchestration` source returned by
+`codex plugin list --json`. The normal source is the `codex-plugin`
+subdirectory, so its validated parent is the runtime package root; a future
+root source is accepted only when it contains the required runtime directories.
+Resolution never uses the selected skill's version-cache parent and fails
+closed for missing, ambiguous, relative, disabled, or malformed sources.
 
 `external-skills/` contains the exact 13 portable work-skill packages copied
 identically into `~/.codex/skills` and `~/.grok/skills` by `install.sh`. It

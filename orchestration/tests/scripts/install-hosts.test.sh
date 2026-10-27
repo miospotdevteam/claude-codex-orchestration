@@ -42,7 +42,7 @@ write_executable() {
 }
 
 setup_case() {
-  local name=$1
+  local name=$1 layout=${2:-nested}
   CASE_DIR="$TMP_DIR/$name"
   HOME_DIR="$CASE_DIR/home"
   BIN_DIR="$CASE_DIR/bin"
@@ -52,6 +52,9 @@ setup_case() {
   CODEX_INSTALL_MARKER="$CASE_DIR/codex-installed"
   CODEX_ARTIFACT="$CASE_DIR/codex-artifact"
   CODEX_PLUGIN_SOURCE="$CODEX_ARTIFACT/codex-plugin"
+  if [[ "$layout" == root ]]; then
+    CODEX_PLUGIN_SOURCE="$CODEX_ARTIFACT"
+  fi
   STDOUT_FILE="$CASE_DIR/stdout"
   STDERR_FILE="$CASE_DIR/stderr"
   mkdir -p "$HOME_DIR" "$BIN_DIR" \
@@ -225,6 +228,23 @@ test_missing_portable_skill_fails_before_cleanup() {
   fi
 }
 
+test_nested_codex_artifact_resolves_parent_package() {
+  local name='normal nested Codex marketplace artifact resolves its parent package'
+  setup_case nested-codex-layout
+  seed_lane_skills
+  run_installer --host codex
+
+  if [[ $STATUS -ne 0 ]]; then
+    fail "$name" "expected exit 0, got $STATUS; stderr=$(<"$STDERR_FILE")"
+  elif grep -Fq 'legacy' "$STDERR_FILE"; then
+    fail "$name" 'normal nested marketplace layout was mislabeled as legacy'
+  elif ! assert_portable_skills_synced; then
+    fail "$name" 'normal parent package was not used as the portable skill source'
+  else
+    pass "$name"
+  fi
+}
+
 test_invalid_host_fails_before_provider_calls() {
   local name='invalid host fails before invoking any provider CLI'
   setup_case invalid-host
@@ -243,6 +263,7 @@ test_codex_host_never_runs_claude
 test_default_host_is_codex
 test_missing_source_path_fails_before_cleanup
 test_missing_portable_skill_fails_before_cleanup
+test_nested_codex_artifact_resolves_parent_package
 test_invalid_host_fails_before_provider_calls
 
 printf 'TOTAL pass=%d fail=%d\n' "$PASS_COUNT" "$FAIL_COUNT"

@@ -10,8 +10,8 @@ under `.agents/plugins/marketplace.json` and points to
 `orchestration/codex-plugin/`; Claude metadata lives under
 `.claude-plugin/marketplace.json` and points to `orchestration/`. The Codex
 sub-root exists because Codex plugin ingestion requires the conventional
-`skills/` path, while the parent package holds the canonical host bodies and
-portable assets shared with the installer. This split
+`skills/` path. Its four complete skill bodies are canonical, while the parent
+package holds runtime helpers and source-compatibility entrypoints. This split
 matches Claude Code's plugin-source convention — the marketplace's
 `plugins[].source` is a relative path to a subdirectory (Claude Code
 does **not** accept `.` as a same-dir marker; it must be a real
@@ -74,9 +74,8 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │
     ├── codex-plugin/                    ← Codex source: "./orchestration/codex-plugin"
     │   ├── .codex-plugin/
-    │   │   └── plugin.json
-    │   └── skills/                      ← 4 conventional loader entrypoints
-    │       └── each delegates to ../../codex-skills/<name>/SKILL.md
+    │   │   └── plugin.json              ← discovers conventional ./skills/
+    │   └── skills/                      ← 4 complete canonical host bodies
     │
     ├── skills/                          ← one subdirectory per skill
     │   ├── conductor/                   ← core: top-level orchestrator
@@ -99,7 +98,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
     │   └── remote-agent-host/           ← auxiliary: guarded Mini handoff
     │       (each skill dir contains SKILL.md and optional references/, scripts/)
     │
-    ├── codex-skills/                    ← canonical Codex-host orchestration bodies
+    ├── codex-skills/                    ← source-compatibility entrypoints
     │   ├── conductor/
     │   ├── persistent-plans/
     │   ├── writing-plans/
@@ -163,6 +162,7 @@ claude-codex-orchestration/              ← repo root = marketplace root
             ├── plan-utils.test.sh
             ├── remote-agent-protocol.test.sh
             ├── remote-agent.test.sh
+            ├── codex-cache-artifact.test.sh
             ├── run-codex-impl.test.sh
             ├── run-codex-verify.test.sh
             ├── run-grok-impl.test.sh
@@ -193,14 +193,17 @@ repo root.
   repo root. This repo has two such directories: the repo-root
   `.claude-plugin/marketplace.json` and the plugin's own
   `orchestration/.claude-plugin/plugin.json`; Codex uses
-  `orchestration/codex-plugin/.codex-plugin/plugin.json`. Even in a single-plugin
+  `orchestration/codex-plugin/.codex-plugin/plugin.json`, whose conventional
+  `./skills/` path exposes only the four Codex-host bodies. Even in a single-plugin
   repo the marketplace `source` must point at a real subdirectory
   (`./orchestration`) — Claude Code does **not** accept `"."` as a
   same-dir marker — which is why the Claude plugin lives in its own subdir
   rather than sharing the root `.claude-plugin/` directory.
-- **Skills are auto-discovered.** There is no `skills` array in
-  `plugin.json`. The harness scans `skills/<name>/SKILL.md` from the
-  plugin root and loads whatever it finds.
+- **Skills use host-specific discovery.** Claude auto-discovers
+  `skills/<name>/SKILL.md`. The Codex sub-root manifest points at its
+  conventional `skills/` directory, limiting its plugin surface to four
+  complete canonical bodies. The parent `codex-skills/` files are only
+  source-compatibility entrypoints.
 - **One directory per skill.** Each skill is self-contained in its
   own folder. `SKILL.md` is the canonical file. References, scripts,
   and other supporting files live alongside it.

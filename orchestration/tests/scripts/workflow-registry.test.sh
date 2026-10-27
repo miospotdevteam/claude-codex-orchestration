@@ -64,14 +64,14 @@ host_boot_token() {
     awk '/^btime / { print $2; exit }' /proc/stat
     return 0
   fi
-  if command -v sysctl >/dev/null 2>&1; then
-    local raw
-    raw=$(sysctl -n kern.boottime 2>/dev/null || true)
+  if command -v sysctl >/dev/null 2>&1 || [[ -x /usr/sbin/sysctl ]]; then
+    local raw sysctl_bin
+    sysctl_bin=$(command -v sysctl 2>/dev/null || printf '%s\n' /usr/sbin/sysctl)
+    raw=$($sysctl_bin -n kern.boottime 2>/dev/null || true)
     printf '%s\n' "$raw" | awk -F'[=,{} \t]+' '{
       for (i = 1; i <= NF; i++)
         if ($i == "sec" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit }
     }'
-    return 0
   fi
   stat -c %W / 2>/dev/null || stat -f %B / 2>/dev/null || printf '0\n'
 }
@@ -97,6 +97,18 @@ case "${1:-}" in
     [[ -n $session ]] || exit 64
     printf '%%42\n' >"$STATE_ROOT/sessions/$session"
     ;;
+  display-message|list-panes) printf '%%42\n' ;;
+  respawn-pane)
+    printf 'RESPAWN' >>"${SUPERVISOR_LOG:?}"
+    for arg in "$@"; do printf '\t%s' "$arg" >>"$SUPERVISOR_LOG"; done
+    printf '\n' >>"$SUPERVISOR_LOG"
+    [[ ${WORKFLOW_REGISTRY_TEST_FAULT:-} != diagnostic-launch ]] || exit 1
+    ;;
+  load-buffer)
+    digest=$(if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi | awk '{print $1}')
+    printf 'STDIN-SHA256\t%s\n' "$digest" >>"${SUPERVISOR_LOG:?}"
+    ;;
+  paste-buffer|send-keys) : ;;
   kill-session)
     target=
     while [[ $# -gt 0 ]]; do [[ $1 == -t ]] && { target=${2:-}; break; }; shift; done
@@ -136,13 +148,15 @@ setup_case() {
   PROTOCOL_PROJECT_DIR="$AUTHORITY_PATH/projects/$PROJECT"
   SESSION="remote-agent--$PROJECT--claude"
   DIAG_SESSION="remote-agent--$PROJECT--codex"
+  SUPERVISOR_LOG="$CASE/supervisor.log"
   FAKE_BIN="$CASE/bin"
   STDOUT="$CASE/stdout"
   STDERR="$CASE/stderr"
   WORKFLOW_ID=
   LEASE_GENERATION=
   mkdir -p "$HOME_DIR" "$STATE_ROOT" "$CHECKOUT" "$CLIENT_CHECKOUT" \
-    "$PLAN_DIR" "$CLIENT_PLAN_DIR" "$FAKE_BIN"
+    "$PLAN_DIR" "$CLIENT_PLAN_DIR" "$FAKE_BIN" \
+    "$HOME_DIR/Projects/orchestration" "$HOME_DIR/Projects/miospot"
   chmod 700 "$HOME_DIR" "$STATE_ROOT" "$CHECKOUT" "$CLIENT_CHECKOUT"
   install_lifecycle_stubs "$FAKE_BIN"
   # Minimal plan trio so the Mini marker has a real plan dir to land in.
@@ -155,6 +169,7 @@ setup_case() {
   printf '# client plan\n' >"$CLIENT_PLAN_DIR/masterPlan.md"
   : >"$STDOUT"
   : >"$STDERR"
+  : >"$SUPERVISOR_LOG"
 }
 
 # PATH includes FAKE_BIN (tmux stubs) + SCRIPTS_DIR (remote-agent-v1 /
@@ -181,10 +196,11 @@ run_registry() {
     STATE_ROOT="$STATE_ROOT" \
     WORKFLOW_REGISTRY_TEST=1 \
     WORKFLOW_REGISTRY_TEST_FAULT="$fault" \
+    SUPERVISOR_LOG="$SUPERVISOR_LOG" \
     REMOTE_AGENT_ROOT_ORCHESTRATION="$CHECKOUT" \
     REMOTE_AGENT_ROOT_MIOSPOT="$CHECKOUT" \
     WORKFLOW_CLIENT_CHECKOUT="$CLIENT_CHECKOUT" \
-    "$REGISTRY" "$@" >"$STDOUT" 2>"$STDERR"
+    "$REGISTRY" "$@" <"${REGISTRY_STDIN_FILE:-/dev/null}" >"$STDOUT" 2>"$STDERR"
   STATUS=$?
   set -e
 }
@@ -2107,6 +2123,156 @@ test_diagnostic_held_refuses_start_conductor_boundedly() {
   return 0
 }
 
+test_diagnostic_full_lifecycle_and_start_replay() {
+  local request=req-diagnostic-start digest payload before after launches deliveries
+  local conflict_payload conflict_digest
+  payload="$CASE/diagnostic.prompt"
+  printf 'private diagnostic prompt bytes\n' >"$payload"
+  digest=$(sha256_of_file "$payload")
+
+  expect_success diagnostic-start "$PROJECT" codex --request-id "$request" || return 1
+  jq -e '.ok == true and .state == "active" and .harness == "codex"' "$STDOUT" >/dev/null || return 1
+  [[ $(tr -d '\n' <"$PROTOCOL_PROJECT_DIR/lease-state") == active ]] || return 1
+  [[ $(tr -d '\n' <"$PROTOCOL_PROJECT_DIR/lease-session") == "$DIAG_SESSION" ]] || return 1
+  grep -Fq $'RESPAWN\trespawn-pane\t-k\t-t\t%42\t-c' "$SUPERVISOR_LOG" || return 1
+  grep -Fq $'\t--\tcodex\t--yolo' "$SUPERVISOR_LOG" || return 1
+  ! grep -Eq -- '--model|--effort|private diagnostic' "$SUPERVISOR_LOG" || return 1
+
+  launches=$(grep -c '^RESPAWN' "$SUPERVISOR_LOG")
+  before=$(lifecycle_fingerprint)
+  expect_success diagnostic-start "$PROJECT" codex --request-id "$request" || return 1
+  [[ $(grep -c '^RESPAWN' "$SUPERVISOR_LOG") -eq $launches ]] || return 1
+  after=$(lifecycle_fingerprint)
+  [[ $after == "$before" ]] || return 1
+
+  before=$(lifecycle_fingerprint)
+  expect_failure diagnostic-start "$PROJECT" grok --request-id "$request" || return 1
+  assert_contains "$STDOUT" digest-conflict || return 1
+  after=$(lifecycle_fingerprint)
+  [[ $after == "$before" ]] || return 1
+  [[ $(tr -d '\n' <"$PROTOCOL_PROJECT_DIR/lease-session") == "$DIAG_SESSION" ]] || return 1
+
+  expect_success diagnostic-inspect "$PROJECT" codex || return 1
+  jq -e '.ok == true and .state == "active" and .session == "running"' "$STDOUT" >/dev/null || return 1
+
+  REGISTRY_STDIN_FILE="$payload" expect_success diagnostic-send "$PROJECT" codex \
+    --payload-sha256 "$digest" --request-id req-diagnostic-send || return 1
+  jq -e '.ok == true and .status == "sent" and .sha256 == $digest' \
+    --arg digest "$digest" "$STDOUT" >/dev/null || return 1
+  grep -q '^STDIN-SHA256[[:space:]][0-9a-f]\{64\}$' "$SUPERVISOR_LOG" || return 1
+  ! grep -R -Fq 'private diagnostic prompt bytes' "$WORKFLOWS_ROOT" "$AUTHORITY_PATH" || return 1
+  deliveries=$(grep -c '^STDIN-SHA256' "$SUPERVISOR_LOG")
+  REGISTRY_STDIN_FILE="$payload" expect_success diagnostic-send "$PROJECT" codex \
+    --payload-sha256 "$digest" --request-id req-diagnostic-send || return 1
+  [[ $(grep -c '^STDIN-SHA256' "$SUPERVISOR_LOG") -eq $deliveries ]] || return 1
+  conflict_payload="$CASE/diagnostic-conflict.prompt"
+  printf 'different private bytes\n' >"$conflict_payload"
+  conflict_digest=$(sha256_of_file "$conflict_payload")
+  REGISTRY_STDIN_FILE="$conflict_payload" expect_failure diagnostic-send "$PROJECT" codex \
+    --payload-sha256 "$conflict_digest" --request-id req-diagnostic-send || return 1
+  assert_contains "$STDOUT" digest-conflict || return 1
+
+  expect_success diagnostic-interrupt "$PROJECT" codex --request-id req-diagnostic-interrupt || return 1
+  expect_success diagnostic-interrupt "$PROJECT" codex --request-id req-diagnostic-interrupt || return 1
+  expect_failure diagnostic-release "$PROJECT" codex --request-id req-diagnostic-release-early || return 1
+  [[ $(tr -d '\n' <"$PROTOCOL_PROJECT_DIR/lease-state") == active ]] || return 1
+  expect_success diagnostic-kill "$PROJECT" codex --request-id req-diagnostic-kill || return 1
+  expect_success diagnostic-kill "$PROJECT" codex --request-id req-diagnostic-kill || return 1
+  expect_success diagnostic-inspect "$PROJECT" codex || return 1
+  jq -e '.state == "quiescent" and .session == "absent"' "$STDOUT" >/dev/null || return 1
+  expect_success diagnostic-release "$PROJECT" codex --request-id req-diagnostic-release || return 1
+  expect_success diagnostic-release "$PROJECT" codex --request-id req-diagnostic-release || return 1
+  jq -e '.state == "released"' "$STDOUT" >/dev/null || return 1
+  [[ ! -e $PROTOCOL_PROJECT_DIR/lease-state ]] || return 1
+}
+
+test_diagnostic_chunked_stdin_cannot_truncate() {
+  local fifo prefix prefix_digest writer
+  fifo="$CASE/diagnostic-chunked.fifo"
+  prefix="$CASE/diagnostic-prefix.prompt"
+  printf 'first private chunk' >"$prefix"
+  prefix_digest=$(sha256_of_file "$prefix")
+  mkfifo "$fifo"
+  {
+    cat "$prefix"
+    sleep 0.2
+    printf ' delayed trailing chunk'
+  } >"$fifo" &
+  writer=$!
+
+  expect_success diagnostic-start "$PROJECT" codex \
+    --request-id req-diagnostic-chunked-start || return 1
+  REGISTRY_STDIN_FILE="$fifo" expect_failure diagnostic-send "$PROJECT" codex \
+    --payload-sha256 "$prefix_digest" --request-id req-diagnostic-chunked-send || return 1
+  wait "$writer" 2>/dev/null || true
+  assert_contains "$STDOUT" digest-mismatch
+}
+
+test_diagnostic_fingerprint_matches_transferable_checkout_state() {
+  local checkout first second third
+  checkout="$HOME_DIR/Projects/$PROJECT"
+  git -C "$checkout" init -q
+  printf 'ignored-cache/\n' >"$checkout/.gitignore"
+  printf 'tracked source\n' >"$checkout/tracked.txt"
+  printf 'visible untracked source\n' >"$checkout/visible-untracked.txt"
+  mkdir -p "$checkout/ignored-cache"
+  printf 'ignored v1\n' >"$checkout/ignored-cache/artifact.bin"
+  git -C "$checkout" add .gitignore tracked.txt
+
+  expect_success diagnostic-start "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-1 || return 1
+  first=$(head -n 1 "$PROTOCOL_PROJECT_DIR/common")
+  expect_success diagnostic-kill "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-kill-1 || return 1
+  expect_success diagnostic-release "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-release-1 || return 1
+
+  printf 'ignored v2\n' >"$checkout/ignored-cache/artifact.bin"
+  expect_success diagnostic-start "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-2 || return 1
+  second=$(head -n 1 "$PROTOCOL_PROJECT_DIR/common")
+  [[ $second == "$first" ]] || return 1
+  expect_success diagnostic-kill "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-kill-2 || return 1
+  expect_success diagnostic-release "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-release-2 || return 1
+
+  printf 'visible untracked source changed\n' >"$checkout/visible-untracked.txt"
+  expect_success diagnostic-start "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-3 || return 1
+  third=$(head -n 1 "$PROTOCOL_PROJECT_DIR/common")
+  [[ $third != "$second" ]] || return 1
+  expect_success diagnostic-kill "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-kill-3 || return 1
+  expect_success diagnostic-release "$PROJECT" codex \
+    --request-id req-diagnostic-fingerprint-release-3 || return 1
+}
+
+test_diagnostic_excludes_resident_workflow() {
+  expect_success diagnostic-start "$PROJECT" claude --request-id req-diagnostic-exclusive || return 1
+  expect_failure start-conductor "$PROJECT" "$PLAN_ID" "$CHECKOUT" "$HOSTNAME_FIXTURE" || return 1
+  assert_contains "$STDOUT" diagnostic-held || return 1
+  expect_failure mint "$PROJECT" "$PLAN_ID" "$CHECKOUT" "$HOSTNAME_FIXTURE" || return 1
+  assert_contains "$STDOUT" diagnostic-held
+}
+
+test_diagnostic_closed_vocabulary_rejections() {
+  expect_failure diagnostic-unknown "$PROJECT" codex --request-id req-invalid-action || return 1
+  expect_failure diagnostic-start outside codex --request-id req-invalid-project || return 1
+  expect_failure diagnostic-start "$PROJECT" outside --request-id req-invalid-harness || return 1
+  [[ ! -e $WORKFLOWS_ROOT/diagnostics ]] || return 1
+  [[ ! -e $AUTHORITY_PATH/projects/outside ]] || return 1
+}
+
+test_diagnostic_launch_failure_rolls_back_lease_and_holder() {
+  run_registry_with_fault diagnostic-launch diagnostic-start "$PROJECT" grok \
+    --request-id req-diagnostic-launch-failure
+  [[ $STATUS -ne 0 ]] || return 1
+  [[ ! -e $PROTOCOL_PROJECT_DIR/lease-state ]] || return 1
+  [[ ! -e $STATE_ROOT/sessions/remote-agent--$PROJECT--grok ]] || return 1
+  [[ ! -e $WORKFLOWS_ROOT/diagnostics/$PROJECT.json ]] || return 1
+}
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -2176,6 +2342,12 @@ run_test 'kill records quiescent without release; release clears lease and bypro
 run_test 'release refuses without quiescence and leaves the live bind intact' test_release_refuses_without_quiescence
 run_test 'existing remote-agent-v1 refusals surface unchanged through registry ops' test_existing_protocol_refusals_surface_through_registry
 run_test 'diagnostic-held refuses start-conductor boundedly' test_diagnostic_held_refuses_start_conductor_boundedly
+run_test 'diagnostic full lifecycle uses guarded lease, private stdin, and exact start replay' test_diagnostic_full_lifecycle_and_start_replay
+run_test 'diagnostic send consumes chunked stdin before digest validation' test_diagnostic_chunked_stdin_cannot_truncate
+run_test 'diagnostic fingerprint matches transferable checkout state' test_diagnostic_fingerprint_matches_transferable_checkout_state
+run_test 'diagnostic full lease excludes resident start and mint' test_diagnostic_excludes_resident_workflow
+run_test 'diagnostic family rejects invalid action, project, and harness atoms' test_diagnostic_closed_vocabulary_rejections
+run_test 'diagnostic launch failure rolls back provisional lease and holder' test_diagnostic_launch_failure_rolls_back_lease_and_holder
 
 printf '%d tests passed, %d tests failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ $FAIL_COUNT -eq 0 ]]

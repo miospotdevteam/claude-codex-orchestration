@@ -9,7 +9,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILLS_DIR="$SCRIPT_DIR/../../skills"
-CODEX_SKILLS_DIR="$SCRIPT_DIR/../../codex-skills"
+CODEX_SKILLS_DIR="$SCRIPT_DIR/../../codex-plugin/skills"
+CODEX_COMPATIBILITY_DIR="$SCRIPT_DIR/../../codex-skills"
 EXTERNAL_SKILLS_DIR="$SCRIPT_DIR/../../external-skills"
 REMOTE_AGENT_HOST_SKILL="$SKILLS_DIR/remote-agent-host/SKILL.md"
 CONDUCTOR_SKILL="$SKILLS_DIR/conductor/SKILL.md"
@@ -18,11 +19,11 @@ CONDUCTOR_SKILL="$SKILLS_DIR/conductor/SKILL.md"
 # the Claude-side skills/, Codex host skills, and provider-portable lane).
 SKILL_FILES=()
 for f in "$SKILLS_DIR"/*/SKILL.md "$CODEX_SKILLS_DIR"/*/SKILL.md \
-  "$EXTERNAL_SKILLS_DIR"/*/SKILL.md; do
+  "$CODEX_COMPATIBILITY_DIR"/*/SKILL.md "$EXTERNAL_SKILLS_DIR"/*/SKILL.md; do
   [[ -f "$f" ]] && SKILL_FILES+=("$f")
 done
 
-# Valid skill-route targets: every shipped skill (skills/ + codex-skills/)
+# Valid skill-route targets: every shipped skill, including canonical Codex skills.
 # plus the harness built-in sub-agents the orchestrator dispatches.
 VALID_SKILLS=(Explore general-purpose Plan)
 for d in "$SKILLS_DIR"/*/; do VALID_SKILLS+=("$(basename "$d")"); done
@@ -85,7 +86,7 @@ test_scripts_are_plugin_root_prefixed() {
   local name="scripts/*.sh calls resolve from a plugin or selected-skill root"
   local hits
   hits="$(grep_files 'scripts/[A-Za-z0-9._-]+\.sh' \
-    | grep -vE 'CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|SKILL_ROOT' || true)"
+    | grep -vE 'CLAUDE_PLUGIN_ROOT|PLUGIN_ROOT|SKILL_ROOT|RUNTIME_PACKAGE_ROOT' || true)"
   if [[ -n "$hits" ]]; then
     fail "$name" "$hits"
   else

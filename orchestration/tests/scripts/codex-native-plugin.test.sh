@@ -5,10 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PACKAGE_ROOT="$SCRIPT_DIR/../.."
 PLUGIN_ROOT="$PACKAGE_ROOT/codex-plugin"
 MANIFEST="$PLUGIN_ROOT/.codex-plugin/plugin.json"
-ENTRYPOINT_SKILLS="$PLUGIN_ROOT/skills"
-CODEX_SKILLS="$PACKAGE_ROOT/codex-skills"
+CODEX_SKILLS="$PLUGIN_ROOT/skills"
+COMPATIBILITY_SKILLS="$PACKAGE_ROOT/codex-skills"
 EXTERNAL_SKILLS="$PACKAGE_ROOT/external-skills"
 EXPECTED_CODEX_SKILLS=(codex-dispatch conductor persistent-plans writing-plans)
+VERSION_RE='^2\.0\.0(\+codex\.[a-z0-9]+(-[a-z0-9]+)*)?$'
 
 fail() {
   printf 'FAIL %s\n' "$1" >&2
@@ -21,35 +22,31 @@ assert_contains() {
 }
 
 [[ -f "$MANIFEST" ]] || fail 'Codex plugin manifest is missing'
-jq -e '
+jq -e --arg version_re "$VERSION_RE" '
   .name == "orchestration"
-  and .version == "2.0.0"
+  and (.version | test($version_re))
   and .skills == "./skills/"
   and (.description | type == "string" and length > 0)
   and (.author.name == "Miospot Dev Team")
   and (.interface.displayName == "Orchestration")
   and (.interface.capabilities | index("Write") != null)
 ' "$MANIFEST" >/dev/null || fail 'Codex plugin manifest contract is invalid'
+jq -en --arg version_re "$VERSION_RE" '
+  (["2.0.0", "2.0.0+codex.20260712174544", "2.0.0+codex.local-20260712"]
+    | all(.[]; test($version_re)))
+  and (["2.0.0+codex.BAD", "2.0.0+codex.a.b", "2.0.0+codex.-", "2.0.0+codex.a-"]
+    | all(.[]; (test($version_re) | not)))
+' >/dev/null || fail 'Codex plugin version contract accepts an invalid cachebuster shape'
 
 actual_codex_skills=()
 for skill_dir in "$CODEX_SKILLS"/*/; do
   [[ -d "$skill_dir" ]] && actual_codex_skills+=("$(basename "$skill_dir")")
 done
 
-actual_entrypoints=()
-for skill_dir in "$ENTRYPOINT_SKILLS"/*/; do
-  [[ -d "$skill_dir" ]] && actual_entrypoints+=("$(basename "$skill_dir")")
-done
-
-if [[ "$(printf '%s\n' "${actual_entrypoints[@]}" | sort)" != \
-  "$(printf '%s\n' "${EXPECTED_CODEX_SKILLS[@]}" | sort)" ]]; then
-  fail "Codex plugin entrypoints are not exactly: ${EXPECTED_CODEX_SKILLS[*]}"
-fi
-
 for skill in "${EXPECTED_CODEX_SKILLS[@]}"; do
-  entrypoint="$ENTRYPOINT_SKILLS/$skill/SKILL.md"
-  [[ -f "$entrypoint" ]] || fail "missing Codex plugin entrypoint: $skill"
-  assert_contains "$entrypoint" "../../../codex-skills/$skill/SKILL.md"
+  compatibility="$COMPATIBILITY_SKILLS/$skill/SKILL.md"
+  [[ -f "$compatibility" ]] || fail "missing Codex source-compatibility entrypoint: $skill"
+  assert_contains "$compatibility" "../../codex-plugin/skills/$skill/SKILL.md"
 done
 
 # Codex rejects skill metadata descriptions longer than 1024 characters.
@@ -74,6 +71,17 @@ for skill in "${EXPECTED_CODEX_SKILLS[@]}"; do
   [[ "$(sed -n '1p' "$skill_file")" == '---' ]] \
     || fail "$skill does not start with frontmatter"
   assert_contains "$skill_file" "name: $skill"
+  assert_contains "$skill_file" 'codex plugin list --json'
+  assert_contains "$skill_file" 'orchestration@claude-codex-orchestration'
+  assert_contains "$skill_file" 'enabled'
+  assert_contains "$skill_file" 'source.path'
+  assert_contains "$skill_file" 'RUNTIME_PACKAGE_ROOT'
+  assert_contains "$skill_file" 'scripts schemas templates config'
+  assert_contains "$skill_file" 'Never infer the runtime package root from this SKILL.md'
+  assert_contains "$skill_file" 'Never invoke `codex exec`, `grok`, or `claude` directly.'
+  if grep -Fq '../../../codex-skills' "$skill_file"; then
+    fail "$skill depends on the source compatibility tree"
+  fi
 done
 
 PERSISTENT_PLANS="$CODEX_SKILLS/persistent-plans/SKILL.md"
@@ -113,6 +121,79 @@ assert_contains "$DISPATCH" 'scripts/plan-utils.sh'
 assert_contains "$DISPATCH" 'Never invoke `codex exec`, `grok`, or `claude` directly.'
 assert_contains "$DISPATCH" 'Grok 4.5 is unavailable'
 assert_contains "$DISPATCH" 'blocked'
+
+test_runtime_root_resolution() {
+  local tmp_dir bin_dir listing resolver nested_root plugin_source root_source resolved
+  tmp_dir="$(mktemp -d)"
+  bin_dir="$tmp_dir/bin"
+  listing="$tmp_dir/listing.json"
+  nested_root="$tmp_dir/package"
+  plugin_source="$nested_root/codex-plugin"
+  root_source="$tmp_dir/future-root"
+  mkdir -p "$bin_dir" "$plugin_source/.codex-plugin" "$root_source/.codex-plugin"
+  for directory in scripts schemas templates config; do
+    mkdir -p "$nested_root/$directory" "$root_source/$directory"
+  done
+  nested_root="$(cd "$nested_root" && pwd -P)"
+  plugin_source="$nested_root/codex-plugin"
+  root_source="$(cd "$root_source" && pwd -P)"
+  printf '{"name":"orchestration","skills":"./skills/"}\n' \
+    >"$plugin_source/.codex-plugin/plugin.json"
+  printf '{"name":"orchestration","skills":"./skills/"}\n' \
+    >"$root_source/.codex-plugin/plugin.json"
+  printf '%s\n' '#!/usr/bin/env bash' 'cat "$CODEX_LISTING"' >"$bin_dir/codex"
+  chmod +x "$bin_dir/codex"
+  resolver="$(awk '
+    /^resolve_orchestration_runtime_root\(\) \{/ { copying = 1 }
+    copying { print }
+    copying && /^}$/ { exit }
+  ' "$CONDUCTOR")"
+
+  jq -n --arg path "$plugin_source" \
+    '{installed:[{pluginId:"orchestration@claude-codex-orchestration",enabled:true,source:{path:$path}}]}' \
+    >"$listing"
+  resolved="$(PATH="$bin_dir:/usr/bin:/bin" CODEX_LISTING="$listing" \
+    bash -c "$resolver; resolve_orchestration_runtime_root")" \
+    || fail 'normal nested Codex source did not resolve'
+  [[ "$resolved" == "$nested_root" ]] \
+    || fail 'normal nested Codex source did not resolve its package parent'
+
+  jq -n --arg path "$root_source" \
+    '{plugins:[{id:"orchestration@claude-codex-orchestration",enabled:true,source:{path:$path}}]}' \
+    >"$listing"
+  resolved="$(PATH="$bin_dir:/usr/bin:/bin" CODEX_LISTING="$listing" \
+    bash -c "$resolver; resolve_orchestration_runtime_root")" \
+    || fail 'future root Codex source did not resolve'
+  [[ "$resolved" == "$root_source" ]] \
+    || fail 'future root Codex source did not remain the package root'
+
+  jq -n --arg path "$plugin_source" \
+    '{installed:[
+      {pluginId:"orchestration@claude-codex-orchestration",enabled:true,source:{path:$path}},
+      {pluginId:"orchestration@claude-codex-orchestration",enabled:true,source:{path:$path}}
+    ]}' >"$listing"
+  if PATH="$bin_dir:/usr/bin:/bin" CODEX_LISTING="$listing" \
+    bash -c "$resolver; resolve_orchestration_runtime_root" >/dev/null 2>&1; then
+    fail 'ambiguous enabled Codex sources did not fail closed'
+  fi
+
+  printf '{"installed":[{"pluginId":"orchestration@claude-codex-orchestration","enabled":true,"source":{"path":"relative"}}]}\n' \
+    >"$listing"
+  if PATH="$bin_dir:/usr/bin:/bin" CODEX_LISTING="$listing" \
+    bash -c "$resolver; resolve_orchestration_runtime_root" >/dev/null 2>&1; then
+    fail 'relative Codex source did not fail closed'
+  fi
+
+  printf '{"installed":"malformed"}\n' >"$listing"
+  if PATH="$bin_dir:/usr/bin:/bin" CODEX_LISTING="$listing" \
+    bash -c "$resolver; resolve_orchestration_runtime_root" >/dev/null 2>&1; then
+    fail 'malformed Codex listing did not fail closed'
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
+test_runtime_root_resolution
 
 if rg -n 'Agent\(|model:[[:space:]]*"?(fable|opus|sonnet)|claude[[:space:]]+--yolo' \
   "$CODEX_SKILLS"; then

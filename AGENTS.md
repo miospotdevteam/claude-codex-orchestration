@@ -134,15 +134,16 @@ below are relative to `orchestration/` unless noted):
 - **Manifests and host install** — `.agents/plugins/marketplace.json` exposes
   `./orchestration/codex-plugin` to `codex plugin marketplace add`, while
   `.claude-plugin/marketplace.json` exposes `./orchestration` to Claude Code.
-  The Codex sub-root uses the required conventional `skills/` entrypoints,
-  which delegate to the canonical bodies in the parent package's
-  `codex-skills/`. `install.sh --host codex|claude|both` defaults to the no-Claude
+  The Codex sub-root uses the required conventional `skills/` entrypoints as
+  complete canonical bodies; the parent package's `codex-skills/` files are
+  source-compatibility entrypoints. `install.sh --host codex|claude|both` defaults to the no-Claude
   Codex host; `--host codex` must never require or invoke Claude. Use
   `--host both` once when both subscription hosts should remain available, then
   switch orchestration authority atomically with
   `scripts/orchestration-routing.sh activate codex-primary|fable-primary`.
   `orchestration/.claude-plugin/plugin.json` is the Claude manifest;
-  `orchestration/codex-plugin/.codex-plugin/plugin.json` is the Codex manifest.
+  `orchestration/codex-plugin/.codex-plugin/plugin.json` is the Codex manifest
+  and discovers only `codex-plugin/skills/`.
   Claude Code
   requires the plugin to live in a real subdirectory — `"source": "."`
   in marketplace.json is rejected as "unsupported".
@@ -152,9 +153,11 @@ below are relative to `orchestration/` unless noted):
   `webapp-testing`, `skill-review-standard`, `remote-agent-host`). The
   conductor invokes them via the `Skill` tool; the harness auto-discovers
   them by scanning `skills/<name>/SKILL.md` (no manifest list needed).
-- **Host and portable skill bodies** — `codex-skills/<skill>/SKILL.md` contains
-  the four Codex-host orchestration skills (`conductor`, `persistent-plans`,
-  `writing-plans`, `codex-dispatch`). `external-skills/<skill>/SKILL.md`
+- **Host and portable skill bodies** — `codex-plugin/skills/<skill>/SKILL.md`
+  contains the four canonical Codex-host orchestration skills (`conductor`,
+  `persistent-plans`, `writing-plans`, `codex-dispatch`);
+  `codex-skills/<skill>/SKILL.md` delegates to those bodies for source-tree
+  compatibility. `external-skills/<skill>/SKILL.md`
   contains the exact 13 work skills copied to both Codex and Grok. Claude loads
   its host and work skills directly from `skills/`. The active routing profile
   decides which host owns orchestration and which model lanes execute each
@@ -196,8 +199,8 @@ below are relative to `orchestration/` unless noted):
   state.
 - **Templates** — `templates/masterPlan.template.md` is the starter
   for `writing-plans`.
-- **Tests** — 29 shipped plugin suites under `tests/scripts/*.test.sh` and
-  `tests/hooks/*.test.sh` (26 script plus 3 hook suites). The repo-root routing
+- **Tests** — 30 shipped plugin suites under `tests/scripts/*.test.sh` and
+  `tests/hooks/*.test.sh` (27 script plus 3 hook suites). The repo-root routing
   eval adds 5 suites under `eval/tests/` but is not shipped with the plugin.
 
 The full design spec sits under `docs/01-philosophy.md` …

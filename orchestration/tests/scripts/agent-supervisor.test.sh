@@ -312,14 +312,14 @@ host_boot_token() {
     awk '/^btime / { print $2; exit }' /proc/stat
     return 0
   fi
-  if command -v sysctl >/dev/null 2>&1; then
-    local raw
-    raw=$(sysctl -n kern.boottime 2>/dev/null || true)
+  if command -v sysctl >/dev/null 2>&1 || [[ -x /usr/sbin/sysctl ]]; then
+    local raw sysctl_bin
+    sysctl_bin=$(command -v sysctl 2>/dev/null || printf '%s\n' /usr/sbin/sysctl)
+    raw=$($sysctl_bin -n kern.boottime 2>/dev/null || true)
     printf '%s\n' "$raw" | awk -F'[=,{} \t]+' '{
       for (i = 1; i <= NF; i++)
         if ($i == "sec" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit }
     }'
-    return 0
   fi
   stat -c %W / 2>/dev/null || stat -f %B / 2>/dev/null || printf '0\n'
 }

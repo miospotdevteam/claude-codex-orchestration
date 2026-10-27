@@ -9,6 +9,7 @@ LOCK_BOOT=
 LOCK_BROKEN_PID=
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 PROTOCOL_BIN="$SCRIPT_DIR/remote-agent-v1"
+SUPERVISOR_BIN="${WORKFLOW_REGISTRY_SUPERVISOR:-$SCRIPT_DIR/agent-supervisor}"
 PROTOCOL_AUTHORITY=authority-root-v1
 PROTOCOL_OWNER=workflow-registry-v1
 PROTOCOL_MUTEX_PROJECT=
@@ -103,6 +104,8 @@ acquire_lock() {
 state_home=${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}
 registry_root="$state_home/orchestration/workflows"
 byproject_root="$registry_root/byproject"
+diagnostic_root="$registry_root/diagnostics"
+diagnostic_requests_root="$diagnostic_root/requests"
 
 validate_atom() {
   local value=$1 kind=$2
@@ -449,9 +452,16 @@ mint_workflow() {
 
   mkdir -p -m 700 -- "$registry_root" "$byproject_root"
   chmod 700 "$state_home/orchestration" "$registry_root" "$byproject_root" 2>/dev/null || true
-  acquire_lock "$registry_root/.registry-$project.lock" \
+  # Diagnostic lease acquisition uses this same authority lock, closing the
+  # check-to-bind race between resident mint and full-project diagnostics.
+  acquire_lock "$registry_root/.diagnostic.lock" \
     || fail busy 'registry lock is busy' 75
   trap release_lock EXIT HUP INT TERM
+
+  if [[ -f $diagnostic_root/$project.json ]] \
+      && [[ $(jq -r '.state // empty' "$diagnostic_root/$project.json" 2>/dev/null || true) =~ ^(active|quiescent)$ ]]; then
+    fail diagnostic-held 'diagnostic-held lease blocks resident workflow mint' 73
+  fi
 
   binding="$byproject_root/$project"
   if [[ -f $binding ]]; then
@@ -1171,7 +1181,15 @@ checkout_fingerprint() {
     rel=${path#"$checkout"/}
     digest=$(sha256_file "$path")
     printf '%s\0%s\0' "$rel" "$digest" >>"$inventory"
-  done < <(find "$checkout" -path "$checkout/.git" -prune -o -type f -print0 | LC_ALL=C sort -z)
+  done < <(
+    if git -C "$checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      while IFS= read -r -d '' rel; do
+        printf '%s/%s\0' "$checkout" "$rel"
+      done < <(git -C "$checkout" ls-files -z --cached --others --exclude-standard)
+    else
+      find "$checkout" -path "$checkout/.git" -prune -o -type f -print0
+    fi | LC_ALL=C sort -z
+  )
   digest=$(sha256_stream <"$inventory")
   rm -f -- "$inventory"
   printf '%s\n' "$digest"
@@ -1388,7 +1406,7 @@ start_conductor() {
     fail claude-only 'start-conductor is Claude-only and accepts no harness selector' 64
   fi
   local project=$1 plan_id=$2 checkout_arg=$3 resident_host=$4 binding workflow_id wf_dir
-  local session lease_session lease_state checkout digest expected mint_json phase status
+  local session lease_session lease_state lease_owner checkout digest expected mint_json phase status
   validate_lifecycle_project "$project"
   validate_atom "$plan_id" planId
   validate_atom "$resident_host" residentHost
@@ -1399,7 +1417,9 @@ start_conductor() {
 
   lease_state=$(head -n 1 "$(protocol_project_dir "$project")/lease-state" 2>/dev/null || true)
   lease_session=$(head -n 1 "$(protocol_project_dir "$project")/lease-session" 2>/dev/null || true)
-  if [[ $lease_state == active && -n $lease_session && $lease_session != "$session" ]]; then
+  lease_owner=$(head -n 1 "$(protocol_project_dir "$project")/lease-owner" 2>/dev/null || true)
+  if [[ $lease_state == active && -n $lease_session \
+      && ( $lease_session != "$session" || $lease_owner == diagnostic ) ]]; then
     fail diagnostic-held "diagnostic-held lease blocks start-conductor: $lease_session" 73
   fi
 
@@ -1824,6 +1844,292 @@ release_workflow() {
   protocol_mutex_release_quiet
   feed_emit "$project" released "$workflow_id" "$seq"
   jq -cn --arg workflowId "$workflow_id" '{ok:true,workflowId:$workflowId,phase:"released"}'
+}
+
+# ── Closed full-project diagnostic lifecycle ───────────────────────────────
+
+validate_diagnostic_harness() {
+  case $1 in
+    claude|codex|grok) ;;
+    *) fail invalid-harness 'diagnostic harness is outside the closed vocabulary' 64 ;;
+  esac
+}
+
+diagnostic_session() {
+  printf 'remote-agent--%s--%s\n' "$1" "$2"
+}
+
+diagnostic_digest() {
+  printf '%s' "$1" | sha256_stream
+}
+
+diagnostic_parse_request_id() {
+  DIAGNOSTIC_REQUEST_ID=
+  while (( $# )); do
+    case $1 in
+      --request-id)
+        (( $# >= 2 )) || fail usage 'missing requestId' 64
+        DIAGNOSTIC_REQUEST_ID=$2
+        shift 2
+        ;;
+      *) fail usage 'unknown diagnostic option' 64 ;;
+    esac
+  done
+  [[ -n $DIAGNOSTIC_REQUEST_ID ]] || fail usage 'diagnostic mutation requires --request-id' 64
+  validate_atom "$DIAGNOSTIC_REQUEST_ID" requestId
+}
+
+diagnostic_prepare_locked() {
+  mkdir -p -- "$registry_root" "$diagnostic_root" "$diagnostic_requests_root"
+  chmod 700 "$state_home/orchestration" "$registry_root" "$diagnostic_root" \
+    "$diagnostic_requests_root" 2>/dev/null || true
+  acquire_lock "$registry_root/.diagnostic.lock" || fail busy 'diagnostic registry lock is busy' 75
+  trap '[[ -z ${DIAGNOSTIC_TEMP:-} ]] || rm -f -- "$DIAGNOSTIC_TEMP"; protocol_mutex_release_quiet; release_lock' EXIT HUP INT TERM
+}
+
+diagnostic_replay_locked() {
+  local request_id=$1 digest=$2 record="$diagnostic_requests_root/$1.json" recorded
+  DIAGNOSTIC_REPLAY=
+  [[ -f $record ]] || return 1
+  recorded=$(jq -r '.sha256 // empty' "$record" 2>/dev/null || true)
+  [[ $recorded == "$digest" ]] || fail digest-conflict 'requestId diagnostic parameter digest conflict' 65
+  DIAGNOSTIC_REPLAY=$(jq -c '.outcome' "$record")
+  return 0
+}
+
+diagnostic_record_locked() {
+  local request_id=$1 digest=$2 outcome=$3 record
+  record=$(jq -cn --arg requestId "$request_id" --arg sha256 "$digest" \
+    --argjson outcome "$outcome" '{requestId:$requestId,sha256:$sha256,outcome:$outcome}')
+  atomic_json "$diagnostic_requests_root/$request_id.json" "$record"
+}
+
+diagnostic_state_file() {
+  printf '%s/%s.json\n' "$diagnostic_root" "$1"
+}
+
+diagnostic_require_holder() {
+  local project=$1 harness=$2 state_file state stored_harness
+  state_file=$(diagnostic_state_file "$project")
+  [[ -f $state_file ]] || fail not-found 'diagnostic holder not found' 66
+  state=$(jq -r '.state // empty' "$state_file")
+  stored_harness=$(jq -r '.harness // empty' "$state_file")
+  [[ $stored_harness == "$harness" ]] || fail holder-mismatch 'diagnostic harness does not match holder' 65
+  [[ $state =~ ^(active|quiescent|released)$ ]] || fail invalid-state 'diagnostic holder state is invalid' 65
+  DIAGNOSTIC_STATE_FILE=$state_file
+  DIAGNOSTIC_STATE=$state
+}
+
+diagnostic_start() {
+  (( $# >= 2 )) || fail usage 'diagnostic-start requires PROJECT HARNESS --request-id ID' 64
+  local project=$1 harness=$2 session request_digest state_file lease_state expected next
+  local checkout checkout_digest outcome status
+  shift 2
+  validate_lifecycle_project "$project"
+  validate_diagnostic_harness "$harness"
+  diagnostic_parse_request_id "$@"
+  request_digest=$(diagnostic_digest "diagnostic-start|$project|$harness")
+  diagnostic_prepare_locked
+  if diagnostic_replay_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest"; then
+    release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$DIAGNOSTIC_REPLAY"
+    return
+  fi
+
+  state_file=$(diagnostic_state_file "$project")
+  if [[ -f $state_file ]] && [[ $(jq -r '.state // empty' "$state_file") =~ ^(active|quiescent)$ ]]; then
+    fail diagnostic-held 'project already has a diagnostic full-lease holder' 73
+  fi
+  if [[ -f $byproject_root/$project ]]; then
+    fail active-workflow 'resident workflow blocks diagnostic full lease' 73
+  fi
+  lease_state=$(head -n 1 "$(protocol_project_dir "$project")/lease-state" 2>/dev/null || true)
+  [[ -z $lease_state ]] || fail active-workflow 'remote-agent-v1: lease already exists' 73
+
+  checkout="${HOME:?HOME is required}/Projects/$project"
+  [[ -d $checkout && ! -L $checkout ]] || fail invalid-checkout 'diagnostic project checkout is unavailable' 66
+  checkout=$(cd "$checkout" && pwd -P)
+  [[ -x $SUPERVISOR_BIN ]] || fail missing-dependency 'agent-supervisor is unavailable' 69
+  session=$(diagnostic_session "$project" "$harness")
+  protocol_mutex_acquire "$project" || return $?
+  expected=$(head -n 1 "$(protocol_project_dir "$project")/generation" 2>/dev/null || printf 0)
+  [[ $expected =~ ^[0-9]+$ ]] || fail invalid-state 'protocol generation is invalid' 65
+  next=$((expected + 1))
+  checkout_digest=$(checkout_fingerprint "$checkout")
+  if protocol_call common-state-cas temp-rename "$project" "$expected" "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+    status=$?; protocol_refusal_envelope; return "$status"
+  fi
+  if protocol_call adopt "$project" "$checkout_digest" >/dev/null; then :; else
+    status=$?; protocol_refusal_envelope; return "$status"
+  fi
+  if protocol_call lease-provisional temp-rename "$project" "$session" "$next" \
+      diagnostic "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+    status=$?; protocol_refusal_envelope; return "$status"
+  fi
+  if "$SUPERVISOR_BIN" start "$session" "$harness" "project-root-v1:$project" --yolo >/dev/null; then :; else
+    status=$?
+    protocol_call lease-abort temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    protocol_mutex_release_quiet
+    release_lock; trap - EXIT HUP INT TERM
+    fail launch-failed 'diagnostic supervisor launch failed' "$status"
+  fi
+  if protocol_call lease-commit temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+    status=$?
+    "$SUPERVISOR_BIN" kill "$session" >/dev/null 2>&1 || true
+    protocol_call lease-abort temp-rename "$project" "$session" "$next" \
+      "$PROTOCOL_AUTHORITY" >/dev/null 2>&1 || true
+    protocol_refusal_envelope
+    return "$status"
+  fi
+  outcome=$(jq -cn --arg project "$project" --arg harness "$harness" --arg session "$session" \
+    --arg requestId "$DIAGNOSTIC_REQUEST_ID" --argjson leaseGeneration "$next" \
+    '{ok:true,project:$project,harness:$harness,session:$session,state:"active",leaseGeneration:$leaseGeneration,requestId:$requestId}')
+  atomic_json "$state_file" "$outcome"
+  diagnostic_record_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest" "$outcome"
+  protocol_mutex_release_quiet
+  release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
+}
+
+diagnostic_inspect() {
+  [[ $# -eq 2 ]] || fail usage 'diagnostic-inspect requires PROJECT HARNESS' 64
+  local project=$1 harness=$2 session supervisor_json session_state state_file state generation output
+  validate_lifecycle_project "$project"
+  validate_diagnostic_harness "$harness"
+  diagnostic_require_holder "$project" "$harness"
+  state_file=$DIAGNOSTIC_STATE_FILE
+  state=$DIAGNOSTIC_STATE
+  session=$(diagnostic_session "$project" "$harness")
+  supervisor_json=$($SUPERVISOR_BIN status "$session" 2>/dev/null) \
+    || fail supervisor-failure 'diagnostic supervisor status failed' 70
+  session_state=$(jq -r '.session // "unknown"' <<<"$supervisor_json")
+  generation=$(jq -r '.leaseGeneration // 0' "$state_file")
+  output=$(jq -cn --arg project "$project" --arg harness "$harness" --arg sessionName "$session" \
+    --arg state "$state" --arg session "$session_state" --argjson leaseGeneration "$generation" \
+    '{ok:true,project:$project,harness:$harness,sessionName:$sessionName,state:$state,session:$session,leaseGeneration:$leaseGeneration}')
+  (( ${#output} + 1 <= MAX_OUTPUT_BYTES )) || fail output-too-large 'diagnostic inspect output exceeded bound' 70
+  printf '%s\n' "$output"
+}
+
+diagnostic_send() {
+  (( $# >= 4 )) || fail usage 'diagnostic-send requires PROJECT HARNESS payload digest and requestId' 64
+  local project=$1 harness=$2 supplied_digest='' request_digest input actual bytes outcome status
+  shift 2
+  while (( $# )); do
+    case $1 in
+      --payload-sha256) (( $# >= 2 )) || fail usage 'missing payload digest' 64; supplied_digest=$2; shift 2 ;;
+      --request-id) (( $# >= 2 )) || fail usage 'missing requestId' 64; DIAGNOSTIC_REQUEST_ID=$2; shift 2 ;;
+      *) fail usage 'unknown diagnostic-send option' 64 ;;
+    esac
+  done
+  validate_lifecycle_project "$project"
+  validate_diagnostic_harness "$harness"
+  validate_atom "${DIAGNOSTIC_REQUEST_ID:-}" requestId
+  [[ $supplied_digest =~ ^[0-9a-fA-F]{64}$ ]] || fail usage 'payload-sha256 must be 64 hexadecimal characters' 64
+  input=$(mktemp "${TMPDIR:-/tmp}/diagnostic-send.XXXXXX")
+  chmod 600 "$input"
+  DIAGNOSTIC_TEMP=$input
+  trap 'rm -f -- "$DIAGNOSTIC_TEMP"' EXIT HUP INT TERM
+  # Consume through EOF or one byte beyond the public bound. Unlike a single
+  # dd block, head does not treat a short pipe read as the complete payload.
+  head -c 65537 >"$input"
+  bytes=$(wc -c <"$input" | tr -d ' ')
+  (( bytes > 0 && bytes <= 65536 )) || fail invalid-payload 'diagnostic prompt must contain 1 through 65536 bytes' 65
+  actual=$(sha256_file "$input" | tr '[:upper:]' '[:lower:]')
+  supplied_digest=$(printf '%s' "$supplied_digest" | tr '[:upper:]' '[:lower:]')
+  [[ $actual == "$supplied_digest" ]] || fail digest-mismatch 'payload-sha256 does not match buffered stdin' 65
+  request_digest=$(diagnostic_digest "diagnostic-send|$project|$harness|$actual")
+  diagnostic_prepare_locked
+  if diagnostic_replay_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest"; then
+    rm -f -- "$input"; release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$DIAGNOSTIC_REPLAY"
+    return
+  fi
+  diagnostic_require_holder "$project" "$harness"
+  [[ $DIAGNOSTIC_STATE == active ]] || fail invalid-state 'diagnostic send requires an active holder' 65
+  if "$SUPERVISOR_BIN" send "$(diagnostic_session "$project" "$harness")" <"$input" >/dev/null; then :; else
+    status=$?; fail supervisor-failure 'diagnostic supervisor send failed' "$status"
+  fi
+  outcome=$(jq -cn --arg project "$project" --arg harness "$harness" \
+    --arg requestId "$DIAGNOSTIC_REQUEST_ID" --arg sha256 "$actual" \
+    '{ok:true,project:$project,harness:$harness,requestId:$requestId,status:"sent",sha256:$sha256}')
+  diagnostic_record_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest" "$outcome"
+  rm -f -- "$input"; release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
+}
+
+diagnostic_control() {
+  local action=$1
+  shift
+  (( $# >= 2 )) || fail usage "diagnostic-$action requires PROJECT HARNESS --request-id ID" 64
+  local project=$1 harness=$2 session request_digest outcome status supervisor_json
+  shift 2
+  validate_lifecycle_project "$project"
+  validate_diagnostic_harness "$harness"
+  diagnostic_parse_request_id "$@"
+  request_digest=$(diagnostic_digest "diagnostic-$action|$project|$harness")
+  diagnostic_prepare_locked
+  if diagnostic_replay_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest"; then
+    release_lock; trap - EXIT HUP INT TERM
+    printf '%s\n' "$DIAGNOSTIC_REPLAY"
+    return
+  fi
+  diagnostic_require_holder "$project" "$harness"
+  session=$(diagnostic_session "$project" "$harness")
+  case $action in
+    interrupt)
+      [[ $DIAGNOSTIC_STATE == active ]] || fail invalid-state 'diagnostic interrupt requires an active holder' 65
+      "$SUPERVISOR_BIN" interrupt "$session" >/dev/null \
+        || fail supervisor-failure 'diagnostic supervisor interrupt failed' 70
+      outcome=$(jq -cn --arg project "$project" --arg harness "$harness" \
+        --arg requestId "$DIAGNOSTIC_REQUEST_ID" \
+        '{ok:true,project:$project,harness:$harness,requestId:$requestId,status:"interrupted"}')
+      ;;
+    kill)
+      if [[ $DIAGNOSTIC_STATE == active ]]; then
+        supervisor_json=$($SUPERVISOR_BIN status "$session" 2>/dev/null) \
+          || fail supervisor-failure 'diagnostic supervisor status failed' 70
+        if [[ $(jq -r '.session // empty' <<<"$supervisor_json") == running ]]; then
+          "$SUPERVISOR_BIN" kill "$session" >/dev/null \
+            || fail supervisor-failure 'diagnostic supervisor kill failed' 70
+        fi
+        protocol_mutex_acquire "$project" || return $?
+        if protocol_call quiescent "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+          status=$?; protocol_refusal_envelope; return "$status"
+        fi
+        if protocol_call release-only-verify "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+          status=$?; protocol_refusal_envelope; return "$status"
+        fi
+        atomic_json "$DIAGNOSTIC_STATE_FILE" "$(jq -c '.state="quiescent"' "$DIAGNOSTIC_STATE_FILE")"
+        protocol_mutex_release_quiet
+      fi
+      outcome=$(jq -cn --arg project "$project" --arg harness "$harness" \
+        --arg requestId "$DIAGNOSTIC_REQUEST_ID" \
+        '{ok:true,project:$project,harness:$harness,requestId:$requestId,state:"quiescent"}')
+      ;;
+    release)
+      [[ $DIAGNOSTIC_STATE == quiescent ]] || fail quiescence-required 'diagnostic release requires prior quiescence' 65
+      supervisor_json=$($SUPERVISOR_BIN status "$session" 2>/dev/null) \
+        || fail supervisor-failure 'diagnostic supervisor status failed' 70
+      [[ $(jq -r '.session // empty' <<<"$supervisor_json") == absent ]] \
+        || fail quiescence-required 'diagnostic session is still running' 65
+      protocol_mutex_acquire "$project" || return $?
+      if protocol_call lease-release temp-rename "$project" "$session" "$PROTOCOL_AUTHORITY" >/dev/null; then :; else
+        status=$?; protocol_refusal_envelope; return "$status"
+      fi
+      atomic_json "$DIAGNOSTIC_STATE_FILE" "$(jq -c '.state="released"' "$DIAGNOSTIC_STATE_FILE")"
+      protocol_mutex_release_quiet
+      outcome=$(jq -cn --arg project "$project" --arg harness "$harness" \
+        --arg requestId "$DIAGNOSTIC_REQUEST_ID" \
+        '{ok:true,project:$project,harness:$harness,requestId:$requestId,state:"released"}')
+      ;;
+    *) fail unknown-operation 'unknown or unsupported diagnostic operation' 64 ;;
+  esac
+  diagnostic_record_locked "$DIAGNOSTIC_REQUEST_ID" "$request_digest" "$outcome"
+  release_lock; trap - EXIT HUP INT TERM
+  printf '%s\n' "$outcome"
 }
 
 # ── Mirror queue (D6+D9): request / next / cancel / ack ────────────────────
@@ -2337,6 +2643,12 @@ case "$operation" in
   install-launchagent) install_launchagent "$@" ;;
   kill) kill_workflow "$@" ;;
   release) release_workflow "$@" ;;
+  diagnostic-start) diagnostic_start "$@" ;;
+  diagnostic-inspect) diagnostic_inspect "$@" ;;
+  diagnostic-send) diagnostic_send "$@" ;;
+  diagnostic-interrupt) diagnostic_control interrupt "$@" ;;
+  diagnostic-kill) diagnostic_control kill "$@" ;;
+  diagnostic-release) diagnostic_control release "$@" ;;
   request-mirror-sync) request_mirror_sync "$@" ;;
   mirror-next) mirror_next "$@" ;;
   mirror-cancel) mirror_cancel "$@" ;;
